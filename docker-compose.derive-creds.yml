@@ -1,0 +1,8 @@
+services:
+  derive-credentials:
+    build: .
+    container_name: polymarket-derive-creds
+    stdin_open: true
+    tty: true
+    entrypoint: python
+    command: scripts/derive_credentials.py
