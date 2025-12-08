@@ -15,6 +15,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy source code
 COPY src/ ./src/
 
+# Copy scripts
+COPY scripts/ ./scripts/
+
 # Create non-root user
 RUN useradd -m -u 1000 botuser && chown -R botuser:botuser /app
 USER botuser
