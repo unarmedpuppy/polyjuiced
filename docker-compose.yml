@@ -13,7 +13,7 @@ services:
       - "8500:8000"  # Prometheus metrics
       - "8501:8080"  # Dashboard UI
     volumes:
-      - ./data:/app/data
+      - polymarket-data:/app/data
     networks:
       - my-network
     labels:
@@ -54,6 +54,10 @@ services:
       - "homepage.icon=si-polymarket"
       - "homepage.href=https://polymarket.server.unarmedpuppy.com/dashboard"
       - "homepage.description=Gabagool arbitrage strategy dashboard"
+
+volumes:
+  polymarket-data:
+    # Named volume for database persistence (avoids host permission issues)
 
 networks:
   my-network:

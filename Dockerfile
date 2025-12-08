@@ -18,8 +18,10 @@ COPY src/ ./src/
 # Copy scripts
 COPY scripts/ ./scripts/
 
-# Create non-root user
-RUN useradd -m -u 1000 botuser && chown -R botuser:botuser /app
+# Create non-root user and data directory
+RUN useradd -m -u 1000 botuser && \
+    mkdir -p /app/data && \
+    chown -R botuser:botuser /app
 USER botuser
 
 # Set Python path
