@@ -1,0 +1,22 @@
+services:
+  polymarket-bot:
+    build: .
+    container_name: polymarket-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - TZ=UTC
+    volumes:
+      - ./data:/app/data
+    networks:
+      - traefik
+    labels:
+      - "homepage.group=Trading"
+      - "homepage.name=Polymarket Bot"
+      - "homepage.icon=chart-line"
+      - "homepage.description=Gabagool arbitrage strategy"
+
+networks:
+  traefik:
+    external: true
