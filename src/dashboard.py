@@ -4,13 +4,13 @@ import asyncio
 import json
 from collections import deque
 from datetime import datetime
-from typing import Deque, Dict, Any
+from typing import Deque, Dict, Any, List
 
 from aiohttp import web
-import aiohttp_sse
 
-# Store recent logs and stats
+# Store recent logs, stats, and trades
 log_buffer: Deque[Dict[str, Any]] = deque(maxlen=100)
+trade_history: Deque[Dict[str, Any]] = deque(maxlen=50)
 stats: Dict[str, Any] = {
     "daily_pnl": 0.0,
     "daily_trades": 0,
@@ -20,6 +20,9 @@ stats: Dict[str, Any] = {
     "websocket": "DISCONNECTED",
     "opportunities_detected": 0,
     "opportunities_executed": 0,
+    "wins": 0,
+    "losses": 0,
+    "pending": 0,
     "last_trade": None,
     "uptime_start": datetime.utcnow().isoformat(),
 }
@@ -46,11 +49,7 @@ DASHBOARD_HTML = """
             --border: #1a3a1a;
         }
 
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
 
         body {
             background: var(--bg);
@@ -64,10 +63,8 @@ DASHBOARD_HTML = """
         body::before {
             content: "";
             position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
             pointer-events: none;
             background: repeating-linear-gradient(
                 0deg,
@@ -79,7 +76,6 @@ DASHBOARD_HTML = """
             z-index: 1000;
         }
 
-        /* Subtle flicker */
         @keyframes flicker {
             0%, 100% { opacity: 1; }
             92% { opacity: 1; }
@@ -88,13 +84,12 @@ DASHBOARD_HTML = """
         }
 
         .container {
-            max-width: 1400px;
+            max-width: 1600px;
             margin: 0 auto;
             padding: 20px;
             animation: flicker 4s infinite;
         }
 
-        /* Header */
         .header {
             text-align: center;
             padding: 20px 0;
@@ -147,15 +142,20 @@ DASHBOARD_HTML = """
             50% { opacity: 0.5; }
         }
 
-        /* Grid layout */
         .grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            grid-template-columns: repeat(4, 1fr);
             gap: 20px;
             margin-bottom: 20px;
         }
 
-        /* Panels */
+        .grid-2col {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+
         .panel {
             background: var(--panel-bg);
             border: 1px solid var(--border);
@@ -178,11 +178,8 @@ DASHBOARD_HTML = """
             color: var(--green);
         }
 
-        .panel-body {
-            padding: 15px;
-        }
+        .panel-body { padding: 15px; }
 
-        /* Stats */
         .stat-grid {
             display: grid;
             grid-template-columns: repeat(2, 1fr);
@@ -215,9 +212,87 @@ DASHBOARD_HTML = """
             margin-top: 5px;
         }
 
+        /* Trade history */
+        .trade-list {
+            max-height: 400px;
+            overflow-y: auto;
+        }
+
+        .trade-item {
+            padding: 12px;
+            border-bottom: 1px solid var(--border);
+            display: grid;
+            grid-template-columns: 70px 1fr 100px 80px;
+            gap: 15px;
+            align-items: center;
+        }
+
+        .trade-item:last-child { border-bottom: none; }
+        .trade-item.win { border-left: 3px solid var(--green); }
+        .trade-item.loss { border-left: 3px solid var(--red); }
+        .trade-item.pending { border-left: 3px solid var(--amber); }
+
+        .trade-time {
+            font-size: 0.75rem;
+            color: var(--dim-green);
+        }
+
+        .trade-info { }
+
+        .trade-asset {
+            font-weight: bold;
+            color: var(--cyan);
+            font-size: 1rem;
+        }
+
+        .trade-details {
+            font-size: 0.75rem;
+            color: var(--dim-green);
+            margin-top: 3px;
+        }
+
+        .trade-result {
+            text-align: center;
+        }
+
+        .trade-status {
+            font-family: 'VT323', monospace;
+            font-size: 1rem;
+            padding: 4px 8px;
+            border-radius: 3px;
+        }
+
+        .trade-status.win {
+            color: var(--green);
+            background: rgba(0, 255, 65, 0.1);
+            border: 1px solid var(--green);
+        }
+
+        .trade-status.loss {
+            color: var(--red);
+            background: rgba(255, 0, 64, 0.1);
+            border: 1px solid var(--red);
+        }
+
+        .trade-status.pending {
+            color: var(--amber);
+            background: rgba(255, 176, 0, 0.1);
+            border: 1px solid var(--amber);
+            animation: pulse 2s infinite;
+        }
+
+        .trade-profit {
+            font-family: 'VT323', monospace;
+            font-size: 1.3rem;
+            text-align: right;
+        }
+
+        .trade-profit.positive { color: var(--green); }
+        .trade-profit.negative { color: var(--red); }
+
         /* Log terminal */
         .log-terminal {
-            height: 400px;
+            height: 300px;
             overflow-y: auto;
             font-size: 0.8rem;
             line-height: 1.6;
@@ -226,28 +301,16 @@ DASHBOARD_HTML = """
             border: 1px solid var(--border);
         }
 
-        .log-terminal::-webkit-scrollbar {
-            width: 8px;
-        }
-
-        .log-terminal::-webkit-scrollbar-track {
-            background: var(--bg);
-        }
-
-        .log-terminal::-webkit-scrollbar-thumb {
-            background: var(--dark-green);
-            border-radius: 4px;
-        }
+        .log-terminal::-webkit-scrollbar { width: 8px; }
+        .log-terminal::-webkit-scrollbar-track { background: var(--bg); }
+        .log-terminal::-webkit-scrollbar-thumb { background: var(--dark-green); border-radius: 4px; }
 
         .log-line {
             padding: 2px 0;
             border-bottom: 1px solid rgba(0, 255, 65, 0.05);
         }
 
-        .log-time {
-            color: var(--dim-green);
-            margin-right: 10px;
-        }
+        .log-time { color: var(--dim-green); margin-right: 10px; }
 
         .log-level {
             display: inline-block;
@@ -261,53 +324,14 @@ DASHBOARD_HTML = """
         .log-level.info { color: var(--cyan); }
         .log-level.warning { color: var(--amber); }
         .log-level.error { color: var(--red); }
-        .log-level.debug { color: var(--dim-green); }
+        .log-level.trade { color: var(--green); }
+        .log-level.resolution { color: #ff00ff; }
 
         .log-msg { color: #ccc; }
         .log-extra { color: var(--dim-green); font-size: 0.75rem; }
 
-        /* Trade feed */
-        .trade-list {
-            max-height: 300px;
-            overflow-y: auto;
-        }
-
-        .trade-item {
-            padding: 10px;
-            border-bottom: 1px solid var(--border);
-            display: grid;
-            grid-template-columns: auto 1fr auto;
-            gap: 10px;
-            align-items: center;
-        }
-
-        .trade-item:last-child {
-            border-bottom: none;
-        }
-
-        .trade-asset {
-            font-weight: bold;
-            color: var(--cyan);
-        }
-
-        .trade-details {
-            font-size: 0.8rem;
-            color: var(--dim-green);
-        }
-
-        .trade-profit {
-            font-family: 'VT323', monospace;
-            font-size: 1.2rem;
-        }
-
-        .trade-profit.positive { color: var(--green); }
-        .trade-profit.negative { color: var(--red); }
-
         /* Circuit breaker */
-        .circuit-status {
-            text-align: center;
-            padding: 20px;
-        }
+        .circuit-status { text-align: center; padding: 20px; }
 
         .circuit-level {
             font-family: 'VT323', monospace;
@@ -343,23 +367,32 @@ DASHBOARD_HTML = """
         .circuit-segment.warning { background: var(--amber); box-shadow: 0 0 10px var(--amber); }
         .circuit-segment.halt { background: var(--red); box-shadow: 0 0 10px var(--red); }
 
-        /* Market prices */
-        .market-row {
-            display: grid;
-            grid-template-columns: 80px 1fr 1fr 80px;
-            gap: 10px;
-            padding: 10px 0;
-            border-bottom: 1px solid var(--border);
-            align-items: center;
+        /* Win/Loss stats */
+        .winloss {
+            display: flex;
+            justify-content: center;
+            gap: 30px;
+            margin-top: 10px;
         }
 
-        .market-asset { color: var(--cyan); font-weight: bold; }
-        .market-price { text-align: center; }
-        .market-spread { text-align: right; }
-        .market-spread.good { color: var(--green); }
-        .market-spread.low { color: var(--amber); }
+        .winloss-item {
+            text-align: center;
+        }
 
-        /* Footer */
+        .winloss-value {
+            font-family: 'VT323', monospace;
+            font-size: 1.5rem;
+        }
+
+        .winloss-value.wins { color: var(--green); }
+        .winloss-value.losses { color: var(--red); }
+        .winloss-value.pending { color: var(--amber); }
+
+        .winloss-label {
+            font-size: 0.7rem;
+            color: var(--dim-green);
+        }
+
         .footer {
             text-align: center;
             padding: 20px;
@@ -368,7 +401,6 @@ DASHBOARD_HTML = """
             border-top: 1px solid var(--border);
         }
 
-        /* Dry run banner */
         .dry-run-banner {
             background: linear-gradient(90deg, var(--amber), transparent);
             color: #000;
@@ -377,6 +409,11 @@ DASHBOARD_HTML = """
             font-weight: bold;
             letter-spacing: 2px;
             animation: blink 2s infinite;
+        }
+
+        @media (max-width: 1200px) {
+            .grid { grid-template-columns: repeat(2, 1fr); }
+            .grid-2col { grid-template-columns: 1fr; }
         }
     </style>
 </head>
@@ -409,26 +446,48 @@ DASHBOARD_HTML = """
             <!-- Daily Stats -->
             <div class="panel">
                 <div class="panel-header">
-                    <span class="panel-title">[ DAILY STATS ]</span>
+                    <span class="panel-title">[ P&L ]</span>
                 </div>
                 <div class="panel-body">
-                    <div class="stat-grid">
-                        <div class="stat">
-                            <div id="daily-pnl" class="stat-value">$0.00</div>
-                            <div class="stat-label">P&L</div>
+                    <div style="text-align: center;">
+                        <div id="daily-pnl" class="stat-value" style="font-size: 2.5rem;">$0.00</div>
+                        <div class="stat-label">DAILY P&L</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Win/Loss Record -->
+            <div class="panel">
+                <div class="panel-header">
+                    <span class="panel-title">[ RECORD ]</span>
+                </div>
+                <div class="panel-body">
+                    <div class="winloss">
+                        <div class="winloss-item">
+                            <div id="wins" class="winloss-value wins">0</div>
+                            <div class="winloss-label">WINS</div>
                         </div>
-                        <div class="stat">
-                            <div id="daily-trades" class="stat-value">0</div>
-                            <div class="stat-label">TRADES</div>
+                        <div class="winloss-item">
+                            <div id="losses" class="winloss-value losses">0</div>
+                            <div class="winloss-label">LOSSES</div>
                         </div>
-                        <div class="stat">
-                            <div id="daily-exposure" class="stat-value">$0.00</div>
-                            <div class="stat-label">EXPOSURE</div>
+                        <div class="winloss-item">
+                            <div id="pending" class="winloss-value pending">0</div>
+                            <div class="winloss-label">PENDING</div>
                         </div>
-                        <div class="stat">
-                            <div id="active-markets" class="stat-value">0</div>
-                            <div class="stat-label">MARKETS</div>
-                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Exposure -->
+            <div class="panel">
+                <div class="panel-header">
+                    <span class="panel-title">[ EXPOSURE ]</span>
+                </div>
+                <div class="panel-body">
+                    <div style="text-align: center;">
+                        <div id="daily-exposure" class="stat-value" style="font-size: 2.5rem;">$0.00</div>
+                        <div class="stat-label">DAILY EXPOSURE</div>
                     </div>
                 </div>
             </div>
@@ -436,54 +495,51 @@ DASHBOARD_HTML = """
             <!-- Circuit Breaker -->
             <div class="panel">
                 <div class="panel-header">
-                    <span class="panel-title">[ CIRCUIT BREAKER ]</span>
+                    <span class="panel-title">[ CIRCUIT ]</span>
                 </div>
                 <div class="panel-body">
-                    <div class="circuit-status">
-                        <div id="circuit-level" class="circuit-level normal">NORMAL</div>
+                    <div class="circuit-status" style="padding: 10px;">
+                        <div id="circuit-level" class="circuit-level normal" style="font-size: 1.8rem;">NORMAL</div>
                         <div class="circuit-bar">
                             <div id="cb-0" class="circuit-segment active"></div>
                             <div id="cb-1" class="circuit-segment"></div>
                             <div id="cb-2" class="circuit-segment"></div>
                             <div id="cb-3" class="circuit-segment"></div>
                         </div>
-                        <div style="margin-top: 15px; font-size: 0.8rem; color: var(--dim-green);">
-                            NORMAL → WARNING → CAUTION → HALT
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Opportunities -->
-            <div class="panel">
-                <div class="panel-header">
-                    <span class="panel-title">[ OPPORTUNITIES ]</span>
-                </div>
-                <div class="panel-body">
-                    <div class="stat-grid">
-                        <div class="stat">
-                            <div id="opps-detected" class="stat-value">0</div>
-                            <div class="stat-label">DETECTED</div>
-                        </div>
-                        <div class="stat">
-                            <div id="opps-executed" class="stat-value">0</div>
-                            <div class="stat-label">EXECUTED</div>
-                        </div>
                     </div>
                 </div>
             </div>
         </div>
 
-        <!-- Log Terminal -->
-        <div class="panel" style="grid-column: 1 / -1;">
-            <div class="panel-header">
-                <span class="panel-title">[ SYSTEM LOG ]</span>
-                <span style="color: var(--dim-green); font-size: 0.8rem;">
-                    <span id="log-count">0</span> entries
-                </span>
+        <div class="grid-2col">
+            <!-- Trade History -->
+            <div class="panel">
+                <div class="panel-header">
+                    <span class="panel-title">[ TRADE HISTORY ]</span>
+                    <span style="color: var(--dim-green); font-size: 0.8rem;">
+                        <span id="trade-count">0</span> trades
+                    </span>
+                </div>
+                <div class="panel-body" style="padding: 0;">
+                    <div id="trade-list" class="trade-list">
+                        <div style="padding: 20px; text-align: center; color: var(--dim-green);">
+                            No trades yet...
+                        </div>
+                    </div>
+                </div>
             </div>
-            <div class="panel-body" style="padding: 0;">
-                <div id="log-terminal" class="log-terminal"></div>
+
+            <!-- Log Terminal -->
+            <div class="panel">
+                <div class="panel-header">
+                    <span class="panel-title">[ SYSTEM LOG ]</span>
+                    <span style="color: var(--dim-green); font-size: 0.8rem;">
+                        <span id="log-count">0</span> entries
+                    </span>
+                </div>
+                <div class="panel-body" style="padding: 0;">
+                    <div id="log-terminal" class="log-terminal"></div>
+                </div>
             </div>
         </div>
 
@@ -507,28 +563,23 @@ DASHBOARD_HTML = """
         };
 
         function updateDashboard(data) {
-            // Update stats
             if (data.stats) {
                 const s = data.stats;
 
-                // P&L with color
                 const pnlEl = document.getElementById('daily-pnl');
                 pnlEl.textContent = '$' + s.daily_pnl.toFixed(2);
                 pnlEl.className = 'stat-value ' + (s.daily_pnl >= 0 ? 'positive' : 'negative');
 
-                document.getElementById('daily-trades').textContent = s.daily_trades;
                 document.getElementById('daily-exposure').textContent = '$' + s.daily_exposure.toFixed(2);
-                document.getElementById('active-markets').textContent = s.active_markets;
-                document.getElementById('opps-detected').textContent = s.opportunities_detected;
-                document.getElementById('opps-executed').textContent = s.opportunities_executed;
+                document.getElementById('wins').textContent = s.wins || 0;
+                document.getElementById('losses').textContent = s.losses || 0;
+                document.getElementById('pending').textContent = s.pending || 0;
 
-                // Circuit breaker
                 const cbLevel = s.circuit_breaker.toUpperCase();
                 const cbEl = document.getElementById('circuit-level');
                 cbEl.textContent = cbLevel;
                 cbEl.className = 'circuit-level ' + cbLevel.toLowerCase();
 
-                // Update circuit bar
                 const levels = ['NORMAL', 'WARNING', 'CAUTION', 'HALT'];
                 const currentIdx = levels.indexOf(cbLevel);
                 for (let i = 0; i < 4; i++) {
@@ -541,17 +592,14 @@ DASHBOARD_HTML = """
                     }
                 }
 
-                // WebSocket status
                 const wsEl = document.getElementById('ws-status');
                 wsEl.className = 'status-dot ' + (s.websocket === 'CONNECTED' ? '' : 'error');
 
-                // Dry run banner
                 if (s.dry_run) {
                     document.getElementById('dry-run-banner').style.display = 'block';
                 }
             }
 
-            // Update logs
             if (data.logs) {
                 const terminal = document.getElementById('log-terminal');
                 data.logs.forEach(log => {
@@ -569,20 +617,80 @@ DASHBOARD_HTML = """
                     terminal.appendChild(line);
                 });
 
-                // Auto-scroll to bottom
                 terminal.scrollTop = terminal.scrollHeight;
                 document.getElementById('log-count').textContent = terminal.children.length;
             }
+
+            if (data.trades) {
+                const tradeList = document.getElementById('trade-list');
+
+                // Clear placeholder if present
+                if (tradeList.children.length === 1 && tradeList.children[0].style.padding) {
+                    tradeList.innerHTML = '';
+                }
+
+                data.trades.forEach(trade => {
+                    const item = document.createElement('div');
+                    const status = trade.status || 'pending';
+                    item.className = 'trade-item ' + status;
+                    item.id = 'trade-' + trade.id;
+
+                    const profitClass = (trade.actual_profit || trade.expected_profit) >= 0 ? 'positive' : 'negative';
+                    const profitValue = trade.actual_profit !== null ? trade.actual_profit : trade.expected_profit;
+                    const profitLabel = trade.actual_profit !== null ? '' : '(est)';
+
+                    let statusLabel = 'PENDING';
+                    if (status === 'win') statusLabel = 'WIN';
+                    else if (status === 'loss') statusLabel = 'LOSS';
+
+                    item.innerHTML = `
+                        <div class="trade-time">${trade.time}<br>${trade.market_time || ''}</div>
+                        <div class="trade-info">
+                            <div class="trade-asset">${trade.asset}</div>
+                            <div class="trade-details">
+                                YES: $${trade.yes_cost.toFixed(2)} @ ${(trade.yes_price * 100).toFixed(1)}¢ |
+                                NO: $${trade.no_cost.toFixed(2)} @ ${(trade.no_price * 100).toFixed(1)}¢ |
+                                Spread: ${trade.spread.toFixed(1)}¢
+                            </div>
+                        </div>
+                        <div class="trade-result">
+                            <span class="trade-status ${status}">${statusLabel}</span>
+                        </div>
+                        <div class="trade-profit ${profitClass}">
+                            ${profitValue >= 0 ? '+' : ''}$${profitValue.toFixed(2)}${profitLabel}
+                        </div>
+                    `;
+
+                    // Insert at top
+                    tradeList.insertBefore(item, tradeList.firstChild);
+                });
+
+                document.getElementById('trade-count').textContent = tradeList.children.length;
+            }
+
+            // Update existing trade status
+            if (data.trade_update) {
+                const t = data.trade_update;
+                const item = document.getElementById('trade-' + t.id);
+                if (item) {
+                    item.className = 'trade-item ' + t.status;
+                    const statusEl = item.querySelector('.trade-status');
+                    statusEl.className = 'trade-status ' + t.status;
+                    statusEl.textContent = t.status.toUpperCase();
+
+                    const profitEl = item.querySelector('.trade-profit');
+                    profitEl.className = 'trade-profit ' + (t.actual_profit >= 0 ? 'positive' : 'negative');
+                    profitEl.textContent = (t.actual_profit >= 0 ? '+' : '') + '$' + t.actual_profit.toFixed(2);
+                }
+            }
         }
 
-        // Update time
         function updateTime() {
             document.getElementById('current-time').textContent = new Date().toISOString();
         }
         setInterval(updateTime, 1000);
         updateTime();
 
-        // Calculate uptime
         let uptimeStart = null;
         function updateUptime() {
             if (!uptimeStart) return;
@@ -594,12 +702,15 @@ DASHBOARD_HTML = """
         }
         setInterval(updateUptime, 1000);
 
-        // Initial load
         fetch('/dashboard/state')
             .then(r => r.json())
             .then(data => {
                 uptimeStart = new Date(data.stats.uptime_start).getTime();
                 updateDashboard(data);
+                // Load existing trades
+                if (data.trades && data.trades.length > 0) {
+                    updateDashboard({trades: data.trades});
+                }
             });
     </script>
 </body>
@@ -652,6 +763,7 @@ class DashboardServer:
         return web.json_response({
             "stats": stats,
             "logs": list(log_buffer),
+            "trades": list(trade_history),
         })
 
     async def _handle_events(self, request: web.Request) -> web.StreamResponse:
@@ -686,6 +798,9 @@ class DashboardServer:
 # Global dashboard instance
 dashboard: DashboardServer = None
 
+# Trade ID counter
+_trade_id_counter = 0
+
 
 def add_log(level: str, message: str, **extra) -> None:
     """Add a log entry to the buffer."""
@@ -697,7 +812,6 @@ def add_log(level: str, message: str, **extra) -> None:
     }
     log_buffer.append(entry)
 
-    # Broadcast to clients
     if dashboard:
         asyncio.create_task(dashboard.broadcast({"logs": [entry]}))
 
@@ -706,6 +820,93 @@ def update_stats(**kwargs) -> None:
     """Update dashboard stats."""
     stats.update(kwargs)
 
-    # Broadcast to clients
     if dashboard:
         asyncio.create_task(dashboard.broadcast({"stats": stats}))
+
+
+def add_trade(
+    asset: str,
+    yes_price: float,
+    no_price: float,
+    yes_cost: float,
+    no_cost: float,
+    spread: float,
+    expected_profit: float,
+    market_end_time: str = None,
+    dry_run: bool = False,
+) -> str:
+    """Add a new trade to history.
+
+    Returns:
+        Trade ID for later updates
+    """
+    global _trade_id_counter
+    _trade_id_counter += 1
+    trade_id = f"trade-{_trade_id_counter}"
+
+    trade = {
+        "id": trade_id,
+        "time": datetime.utcnow().strftime("%H:%M:%S"),
+        "market_time": market_end_time,
+        "asset": asset,
+        "yes_price": yes_price,
+        "no_price": no_price,
+        "yes_cost": yes_cost,
+        "no_cost": no_cost,
+        "spread": spread,
+        "expected_profit": expected_profit,
+        "actual_profit": None,
+        "status": "pending",
+        "dry_run": dry_run,
+    }
+
+    trade_history.append(trade)
+    stats["pending"] = stats.get("pending", 0) + 1
+
+    if dashboard:
+        asyncio.create_task(dashboard.broadcast({
+            "trades": [trade],
+            "stats": stats,
+        }))
+
+    return trade_id
+
+
+def resolve_trade(trade_id: str, won: bool, actual_profit: float) -> None:
+    """Update a trade with its resolution result.
+
+    Args:
+        trade_id: The trade ID returned from add_trade
+        won: Whether the trade was profitable
+        actual_profit: Actual profit/loss amount
+    """
+    for trade in trade_history:
+        if trade["id"] == trade_id:
+            trade["status"] = "win" if won else "loss"
+            trade["actual_profit"] = actual_profit
+            break
+
+    # Update win/loss/pending counts
+    if won:
+        stats["wins"] = stats.get("wins", 0) + 1
+    else:
+        stats["losses"] = stats.get("losses", 0) + 1
+    stats["pending"] = max(0, stats.get("pending", 0) - 1)
+
+    if dashboard:
+        asyncio.create_task(dashboard.broadcast({
+            "trade_update": {
+                "id": trade_id,
+                "status": "win" if won else "loss",
+                "actual_profit": actual_profit,
+            },
+            "stats": stats,
+        }))
+
+    # Log resolution
+    status_str = "WIN" if won else "LOSS"
+    add_log(
+        "resolution",
+        f"Market resolved: {status_str} ${abs(actual_profit):.2f}",
+        trade_id=trade_id,
+    )

@@ -368,3 +368,76 @@ class PolymarketClient:
         except Exception as e:
             log.error("Failed to derive API credentials", error=str(e))
             return None
+
+    # =========================================================================
+    # Market Resolution
+    # =========================================================================
+
+    def get_market_resolution(self, condition_id: str) -> Optional[Dict[str, Any]]:
+        """Get resolution status for a market.
+
+        Args:
+            condition_id: The market condition ID
+
+        Returns:
+            Resolution data if resolved, None if not yet resolved
+        """
+        self._ensure_connected()
+        try:
+            market = self._client.get_market(condition_id)
+            # Check if market has resolution data
+            if market.get("resolved") or market.get("resolution_source"):
+                return {
+                    "resolved": True,
+                    "outcome": market.get("outcome"),
+                    "resolution_time": market.get("resolution_time"),
+                }
+            return None
+        except Exception as e:
+            log.error("Failed to get market resolution", error=str(e))
+            return None
+
+    # =========================================================================
+    # Async wrappers for main.py compatibility
+    # =========================================================================
+
+    async def connect(self) -> bool:
+        """Async wrapper for connect."""
+        return await asyncio.to_thread(self._connect_sync)
+
+    def _connect_sync(self) -> bool:
+        """Synchronous connect implementation."""
+        try:
+            self._client = ClobClient(
+                host=self.settings.clob_http_url,
+                key=self.settings.private_key,
+                chain_id=137,  # Polygon Mainnet
+                signature_type=self.settings.signature_type,
+                funder=self.settings.proxy_wallet or None,
+            )
+
+            # Set API credentials if available
+            if self.settings.api_key:
+                creds = ApiCreds(
+                    api_key=self.settings.api_key,
+                    api_secret=self.settings.api_secret,
+                    api_passphrase=self.settings.api_passphrase,
+                )
+                self._client.set_api_creds(creds)
+
+            # Test connection
+            self._client.get_ok()
+            self._connected = True
+            log.info("Connected to Polymarket CLOB")
+            return True
+
+        except Exception as e:
+            log.error("Failed to connect to Polymarket", error=str(e))
+            self._connected = False
+            return False
+
+    async def disconnect(self) -> None:
+        """Disconnect from Polymarket."""
+        self._connected = False
+        self._client = None
+        log.info("Disconnected from Polymarket CLOB")

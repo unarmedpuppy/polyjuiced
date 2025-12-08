@@ -18,7 +18,7 @@ import structlog
 from ..client.polymarket import PolymarketClient
 from ..client.websocket import PolymarketWebSocket
 from ..config import AppConfig, GabagoolConfig
-from ..dashboard import add_log, update_stats
+from ..dashboard import add_log, add_trade, resolve_trade, update_stats
 from ..metrics import (
     ACTIVE_MARKETS,
     DAILY_EXPOSURE_USD,
@@ -62,6 +62,7 @@ class TradeResult:
     dry_run: bool = False
     success: bool = True
     error: Optional[str] = None
+    trade_id: Optional[str] = None  # Dashboard trade ID for resolution tracking
 
 
 class GabagoolStrategy(BaseStrategy):
@@ -101,6 +102,8 @@ class GabagoolStrategy(BaseStrategy):
         self._daily_exposure: float = 0.0
         self._opportunities_detected: int = 0
         self._last_reset: datetime = datetime.utcnow()
+        # Track pending trades for resolution: {trade_id: TradeResult}
+        self._pending_trades: Dict[str, TradeResult] = {}
 
     async def start(self) -> None:
         """Start the Gabagool strategy."""
@@ -140,6 +143,9 @@ class GabagoolStrategy(BaseStrategy):
             try:
                 # Reset daily counters if new day
                 self._check_daily_reset()
+
+                # Check for resolved markets and update dashboard
+                await self._check_resolved_trades()
 
                 # Check if we've hit daily limits
                 if self._is_daily_limit_reached():
@@ -417,6 +423,11 @@ class GabagoolStrategy(BaseStrategy):
         min_shares = min(yes_shares, no_shares)
         expected_profit = min_shares - total_cost
 
+        # Get market end time for dashboard display
+        market_end_time = None
+        if hasattr(market, "end_time") and market.end_time:
+            market_end_time = market.end_time.strftime("%H:%M")
+
         if self.gabagool_config.dry_run:
             # Simulate trade
             log.info(
@@ -427,7 +438,20 @@ class GabagoolStrategy(BaseStrategy):
                 expected_profit=f"${expected_profit:.2f}",
             )
 
-            return TradeResult(
+            # Add to dashboard trade history
+            trade_id = add_trade(
+                asset=market.asset,
+                yes_price=opportunity.yes_price,
+                no_price=opportunity.no_price,
+                yes_cost=yes_amount,
+                no_cost=no_amount,
+                spread=opportunity.spread_cents,
+                expected_profit=expected_profit,
+                market_end_time=market_end_time,
+                dry_run=True,
+            )
+
+            result = TradeResult(
                 market=market,
                 yes_shares=yes_shares,
                 no_shares=no_shares,
@@ -439,11 +463,16 @@ class GabagoolStrategy(BaseStrategy):
                 executed_at=datetime.utcnow(),
                 dry_run=True,
                 success=True,
+                trade_id=trade_id,
             )
+
+            # Track for resolution
+            self._pending_trades[trade_id] = result
+            return result
 
         # Execute real trade
         try:
-            result = await self.client.execute_dual_leg_order(
+            api_result = await self.client.execute_dual_leg_order(
                 yes_token_id=market.yes_token_id,
                 no_token_id=market.no_token_id,
                 yes_amount_usd=yes_amount,
@@ -451,7 +480,7 @@ class GabagoolStrategy(BaseStrategy):
                 timeout_seconds=self.gabagool_config.order_timeout_seconds,
             )
 
-            if not result.get("success"):
+            if not api_result.get("success"):
                 return TradeResult(
                     market=market,
                     yes_shares=0,
@@ -464,10 +493,23 @@ class GabagoolStrategy(BaseStrategy):
                     executed_at=datetime.utcnow(),
                     dry_run=False,
                     success=False,
-                    error=result.get("error", "Unknown error"),
+                    error=api_result.get("error", "Unknown error"),
                 )
 
-            return TradeResult(
+            # Add to dashboard trade history
+            trade_id = add_trade(
+                asset=market.asset,
+                yes_price=opportunity.yes_price,
+                no_price=opportunity.no_price,
+                yes_cost=yes_amount,
+                no_cost=no_amount,
+                spread=opportunity.spread_cents,
+                expected_profit=expected_profit,
+                market_end_time=market_end_time,
+                dry_run=False,
+            )
+
+            result = TradeResult(
                 market=market,
                 yes_shares=yes_shares,
                 no_shares=no_shares,
@@ -479,7 +521,12 @@ class GabagoolStrategy(BaseStrategy):
                 executed_at=datetime.utcnow(),
                 dry_run=False,
                 success=True,
+                trade_id=trade_id,
             )
+
+            # Track for resolution
+            self._pending_trades[trade_id] = result
+            return result
 
         except Exception as e:
             log.error("Trade execution failed", error=str(e))
@@ -497,6 +544,83 @@ class GabagoolStrategy(BaseStrategy):
                 success=False,
                 error=str(e),
             )
+
+    async def _check_resolved_trades(self) -> None:
+        """Check for resolved markets and update dashboard with results.
+
+        For 15-minute markets, we check if the market has ended and
+        then query for the resolution to determine win/loss.
+        """
+        if not self._pending_trades:
+            return
+
+        now = datetime.utcnow()
+        resolved_ids = []
+
+        for trade_id, trade_result in self._pending_trades.items():
+            market = trade_result.market
+
+            # Check if market has ended (give a 30-second buffer)
+            if not hasattr(market, "end_time") or market.end_time is None:
+                # For dry run simulations without end_time, auto-resolve after 15 mins
+                if trade_result.dry_run:
+                    elapsed = (now - trade_result.executed_at).total_seconds()
+                    if elapsed > 900:  # 15 minutes
+                        # Simulate a win (arbitrage should always profit if executed correctly)
+                        actual_profit = trade_result.expected_profit
+                        resolve_trade(trade_id, won=True, actual_profit=actual_profit)
+                        resolved_ids.append(trade_id)
+                        log.info(
+                            "DRY RUN: Simulated resolution",
+                            asset=market.asset,
+                            profit=f"${actual_profit:.2f}",
+                        )
+                continue
+
+            # Market has end_time - check if resolved
+            if now < market.end_time:
+                continue
+
+            # Market ended - query for resolution
+            try:
+                # Get market resolution from API
+                resolution = await self.client.get_market_resolution(
+                    condition_id=market.condition_id
+                )
+
+                if resolution is None:
+                    # Not yet resolved, wait
+                    continue
+
+                # Calculate actual profit based on resolution
+                # In arbitrage, we hold both YES and NO
+                # One side pays $1, the other pays $0
+                # Profit = $1 * min(yes_shares, no_shares) - total_cost
+                actual_profit = min(trade_result.yes_shares, trade_result.no_shares) - trade_result.total_cost
+
+                # We "win" if we made profit (which should always happen in arbitrage)
+                won = actual_profit > 0
+
+                resolve_trade(trade_id, won=won, actual_profit=actual_profit)
+                resolved_ids.append(trade_id)
+
+                log.info(
+                    "Market resolved",
+                    asset=market.asset,
+                    won=won,
+                    profit=f"${actual_profit:.2f}",
+                )
+
+            except Exception as e:
+                log.error(
+                    "Error checking resolution",
+                    trade_id=trade_id,
+                    error=str(e),
+                )
+
+        # Remove resolved trades from tracking
+        for trade_id in resolved_ids:
+            del self._pending_trades[trade_id]
 
     def _check_daily_reset(self) -> None:
         """Reset daily counters if it's a new day."""

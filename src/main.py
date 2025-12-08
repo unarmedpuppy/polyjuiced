@@ -140,7 +140,7 @@ class GabagoolBot:
     async def _init_components(self) -> None:
         """Initialize all bot components."""
         # Create Polymarket client
-        self._client = PolymarketClient(self.config)
+        self._client = PolymarketClient(self.config.polymarket)
         await self._client.connect()
 
         # Create WebSocket client
