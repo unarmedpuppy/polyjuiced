@@ -7,6 +7,8 @@ services:
       - .env
     environment:
       - TZ=UTC
+    ports:
+      - "8000:8000"  # Prometheus metrics
     volumes:
       - ./data:/app/data
     networks:

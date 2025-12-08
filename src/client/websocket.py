@@ -10,6 +10,8 @@ import structlog
 import websockets
 from websockets.exceptions import ConnectionClosed
 
+from ..metrics import WEBSOCKET_CONNECTED, WEBSOCKET_RECONNECTS
+
 log = structlog.get_logger()
 
 
@@ -101,6 +103,7 @@ class PolymarketWebSocket:
                 ping_timeout=10,
             )
             self._connected = True
+            WEBSOCKET_CONNECTED.set(1)
             log.info("WebSocket connected", url=self.ws_url)
 
             if self._on_connect:
@@ -111,12 +114,14 @@ class PolymarketWebSocket:
         except Exception as e:
             log.error("WebSocket connection failed", error=str(e))
             self._connected = False
+            WEBSOCKET_CONNECTED.set(0)
             return False
 
     async def disconnect(self) -> None:
         """Close WebSocket connection."""
         self._running = False
         self._connected = False
+        WEBSOCKET_CONNECTED.set(0)
 
         if self._ws:
             await self._ws.close()
@@ -176,6 +181,7 @@ class PolymarketWebSocket:
         while self._running:
             try:
                 if not self.is_connected:
+                    WEBSOCKET_RECONNECTS.inc()
                     connected = await self.connect()
                     if not connected:
                         log.warning(

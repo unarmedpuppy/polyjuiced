@@ -18,6 +18,22 @@ import structlog
 from ..client.polymarket import PolymarketClient
 from ..client.websocket import PolymarketWebSocket
 from ..config import AppConfig, GabagoolConfig
+from ..metrics import (
+    ACTIVE_MARKETS,
+    DAILY_EXPOSURE_USD,
+    DAILY_PNL_USD,
+    DAILY_TRADES,
+    OPPORTUNITIES_DETECTED,
+    OPPORTUNITIES_EXECUTED,
+    OPPORTUNITIES_SKIPPED,
+    SPREAD_CENTS,
+    TRADE_AMOUNT_USD,
+    TRADE_ERRORS_TOTAL,
+    TRADE_PROFIT_USD,
+    TRADES_TOTAL,
+    YES_PRICE,
+    NO_PRICE,
+)
 from ..monitoring.market_finder import Market15Min, MarketFinder
 from ..monitoring.order_book import (
     ArbitrageOpportunity,
@@ -167,6 +183,9 @@ class GabagoolStrategy(BaseStrategy):
         for cid in to_remove:
             del self._active_markets[cid]
 
+        # Update active markets metric
+        ACTIVE_MARKETS.set(len(self._active_markets))
+
     async def on_opportunity(
         self,
         opportunity: ArbitrageOpportunity,
@@ -179,8 +198,29 @@ class GabagoolStrategy(BaseStrategy):
         Returns:
             Trade result or None
         """
+        # Record opportunity detection
+        OPPORTUNITIES_DETECTED.labels(market=opportunity.market.asset).inc()
+
+        # Update price metrics
+        YES_PRICE.labels(
+            market=opportunity.market.condition_id,
+            asset=opportunity.market.asset,
+        ).set(opportunity.yes_price)
+        NO_PRICE.labels(
+            market=opportunity.market.condition_id,
+            asset=opportunity.market.asset,
+        ).set(opportunity.no_price)
+        SPREAD_CENTS.labels(
+            market=opportunity.market.condition_id,
+            asset=opportunity.market.asset,
+        ).set(opportunity.spread_cents)
+
         # Validate opportunity
         if not self._validate_opportunity(opportunity):
+            OPPORTUNITIES_SKIPPED.labels(
+                market=opportunity.market.asset,
+                reason="validation_failed",
+            ).inc()
             return None
 
         # Calculate position sizes
@@ -194,6 +234,10 @@ class GabagoolStrategy(BaseStrategy):
         total_cost = yes_amount + no_amount
         if self._daily_exposure + total_cost > self.gabagool_config.max_daily_exposure_usd:
             log.warning("Would exceed daily exposure limit")
+            OPPORTUNITIES_SKIPPED.labels(
+                market=opportunity.market.asset,
+                reason="exposure_limit",
+            ).inc()
             return None
 
         # Execute or simulate trade
@@ -209,6 +253,31 @@ class GabagoolStrategy(BaseStrategy):
             self._daily_exposure += result.total_cost
             self._daily_pnl += result.expected_profit
 
+            # Record metrics
+            dry_run_str = str(result.dry_run).lower()
+            TRADES_TOTAL.labels(
+                market=opportunity.market.asset,
+                side="both",
+                dry_run=dry_run_str,
+            ).inc()
+            OPPORTUNITIES_EXECUTED.labels(market=opportunity.market.asset).inc()
+            TRADE_AMOUNT_USD.labels(
+                market=opportunity.market.asset,
+                side="yes",
+            ).observe(result.yes_cost)
+            TRADE_AMOUNT_USD.labels(
+                market=opportunity.market.asset,
+                side="no",
+            ).observe(result.no_cost)
+            TRADE_PROFIT_USD.labels(
+                market=opportunity.market.asset,
+            ).observe(result.expected_profit)
+
+            # Update gauges
+            DAILY_PNL_USD.set(self._daily_pnl)
+            DAILY_TRADES.set(self._daily_trades)
+            DAILY_EXPOSURE_USD.set(self._daily_exposure)
+
             self.log_trade(
                 action="ARBITRAGE",
                 details={
@@ -220,6 +289,11 @@ class GabagoolStrategy(BaseStrategy):
                     "dry_run": result.dry_run,
                 },
             )
+        elif result and not result.success:
+            TRADE_ERRORS_TOTAL.labels(
+                market=opportunity.market.asset,
+                error_type=result.error or "unknown",
+            ).inc()
 
         return result.__dict__ if result else None
 

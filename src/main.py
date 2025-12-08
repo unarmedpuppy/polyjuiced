@@ -11,6 +11,8 @@ import structlog
 from .client.polymarket import PolymarketClient
 from .client.websocket import PolymarketWebSocket
 from .config import AppConfig
+from .metrics import init_metrics
+from .metrics_server import MetricsServer
 from .monitoring.market_finder import MarketFinder
 from .risk import CircuitBreaker, PositionSizer
 from .strategies.gabagool import GabagoolStrategy
@@ -57,6 +59,7 @@ class GabagoolBot:
         self._circuit_breaker: Optional[CircuitBreaker] = None
         self._position_sizer: Optional[PositionSizer] = None
         self._strategy: Optional[GabagoolStrategy] = None
+        self._metrics_server: Optional[MetricsServer] = None
 
     async def start(self) -> None:
         """Start the bot and all components."""
@@ -67,6 +70,13 @@ class GabagoolBot:
         )
 
         self._running = True
+
+        # Initialize metrics
+        init_metrics(version="0.1.0", dry_run=self.config.gabagool.dry_run)
+
+        # Start metrics server
+        self._metrics_server = MetricsServer(port=8000)
+        await self._metrics_server.start()
 
         # Initialize components
         await self._init_components()
@@ -105,6 +115,10 @@ class GabagoolBot:
 
         if self._client:
             await self._client.disconnect()
+
+        # Stop metrics server
+        if self._metrics_server:
+            await self._metrics_server.stop()
 
         log.info("Gabagool Bot stopped")
 

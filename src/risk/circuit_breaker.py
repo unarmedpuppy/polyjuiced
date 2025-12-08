@@ -8,6 +8,12 @@ from typing import List, Optional
 import structlog
 
 from ..config import GabagoolConfig
+from ..metrics import (
+    CIRCUIT_BREAKER_LEVEL,
+    CIRCUIT_BREAKER_TRIPS,
+    POSITION_SIZE_MULTIPLIER,
+    UNHEDGED_EXPOSURE_USD,
+)
 
 log = structlog.get_logger()
 
@@ -192,6 +198,9 @@ class CircuitBreaker:
         hedged_value = min_shares * 1.0  # Each hedged pair is worth $1
         self._unhedged_exposure = abs(total_cost - hedged_value)
 
+        # Update metric
+        UNHEDGED_EXPOSURE_USD.set(self._unhedged_exposure)
+
         # Check if this created concerning unhedged exposure
         if self._unhedged_exposure > self.config.max_unhedged_exposure_usd:
             log.warning(
@@ -246,6 +255,11 @@ class CircuitBreaker:
         self._state.tripped_at = datetime.utcnow()
         self._state.cooldown_until = datetime.utcnow() + self._cooldown_duration
 
+        # Update metrics
+        CIRCUIT_BREAKER_LEVEL.set(int(level))
+        CIRCUIT_BREAKER_TRIPS.labels(level=level.name).inc()
+        POSITION_SIZE_MULTIPLIER.set(self._state.size_multiplier)
+
         log.warning(
             "Circuit breaker tripped",
             level=level.name,
@@ -260,6 +274,11 @@ class CircuitBreaker:
 
         self._state = CircuitBreakerState()
         self._consecutive_failures = 0
+
+        # Update metrics
+        CIRCUIT_BREAKER_LEVEL.set(0)
+        POSITION_SIZE_MULTIPLIER.set(1.0)
+
         log.info("Circuit breaker reset")
 
     def reset_daily(self) -> None:
