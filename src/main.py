@@ -205,7 +205,7 @@ class GabagoolBot:
 async def run_bot() -> None:
     """Run the Gabagool bot."""
     # Load configuration
-    config = AppConfig()
+    config = AppConfig.load()
 
     # Create and start bot
     bot = GabagoolBot(config)
