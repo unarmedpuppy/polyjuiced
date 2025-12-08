@@ -11,9 +11,10 @@ from aiohttp import web
 if TYPE_CHECKING:
     from .persistence import Database
 
-# Store recent logs, stats, and trades (in-memory cache, backed by SQLite)
+# Store recent logs, stats, trades, and markets (in-memory cache, backed by SQLite)
 log_buffer: Deque[Dict[str, Any]] = deque(maxlen=100)
 trade_history: Deque[Dict[str, Any]] = deque(maxlen=50)
+active_markets: Dict[str, Dict[str, Any]] = {}  # condition_id -> market info
 stats: Dict[str, Any] = {
     "daily_pnl": 0.0,
     "daily_trades": 0,
@@ -523,6 +524,23 @@ DASHBOARD_HTML = """
             </div>
         </div>
 
+        <!-- Active Markets Panel -->
+        <div class="panel" style="margin-bottom: 20px;">
+            <div class="panel-header">
+                <span class="panel-title">[ ACTIVE MARKETS ]</span>
+                <span style="color: var(--dim-green); font-size: 0.8rem;">
+                    <span id="market-count">0</span> found / <span id="tradeable-count">0</span> tradeable
+                </span>
+            </div>
+            <div class="panel-body" style="padding: 0;">
+                <div id="markets-list" style="max-height: 200px; overflow-y: auto;">
+                    <div style="padding: 20px; text-align: center; color: var(--dim-green);">
+                        Searching for markets...
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <div class="grid-2col">
             <!-- Trade History -->
             <div class="panel">
@@ -695,6 +713,58 @@ DASHBOARD_HTML = """
                     profitEl.textContent = (t.actual_profit >= 0 ? '+' : '') + '$' + t.actual_profit.toFixed(2);
                 }
             }
+
+            // Update markets list
+            if (data.markets) {
+                const marketsList = document.getElementById('markets-list');
+                const markets = data.markets;
+
+                let foundCount = 0;
+                let tradeableCount = 0;
+                let html = '';
+
+                if (Object.keys(markets).length === 0) {
+                    html = '<div style="padding: 20px; text-align: center; color: var(--dim-green);">No markets found. Waiting for next 15-minute window...</div>';
+                } else {
+                    html = '<table style="width: 100%; border-collapse: collapse; font-size: 0.85rem;">';
+                    html += '<tr style="background: var(--dark-green); color: var(--green);">';
+                    html += '<th style="padding: 8px; text-align: left;">Asset</th>';
+                    html += '<th style="padding: 8px; text-align: left;">End Time</th>';
+                    html += '<th style="padding: 8px; text-align: right;">Time Left</th>';
+                    html += '<th style="padding: 8px; text-align: right;">Up Price</th>';
+                    html += '<th style="padding: 8px; text-align: right;">Down Price</th>';
+                    html += '<th style="padding: 8px; text-align: center;">Status</th>';
+                    html += '</tr>';
+
+                    for (const [id, m] of Object.entries(markets)) {
+                        foundCount++;
+                        const isTradeable = m.seconds_remaining > 60;
+                        if (isTradeable) tradeableCount++;
+
+                        const statusColor = isTradeable ? 'var(--green)' : 'var(--red)';
+                        const statusText = isTradeable ? 'TRADEABLE' : 'EXPIRED';
+                        const rowBg = isTradeable ? 'rgba(0, 255, 65, 0.05)' : 'rgba(255, 0, 64, 0.05)';
+
+                        const mins = Math.floor(m.seconds_remaining / 60);
+                        const secs = Math.floor(m.seconds_remaining % 60);
+                        const timeLeft = m.seconds_remaining > 0 ? `${mins}m ${secs}s` : 'ENDED';
+
+                        html += `<tr style="border-bottom: 1px solid var(--border); background: ${rowBg};">`;
+                        html += `<td style="padding: 8px; color: var(--cyan); font-weight: bold;">${m.asset}</td>`;
+                        html += `<td style="padding: 8px; color: var(--dim-green);">${m.end_time || 'N/A'}</td>`;
+                        html += `<td style="padding: 8px; text-align: right; color: ${m.seconds_remaining > 60 ? 'var(--green)' : 'var(--red)'};">${timeLeft}</td>`;
+                        html += `<td style="padding: 8px; text-align: right;">${m.up_price ? (m.up_price * 100).toFixed(1) + '¢' : 'N/A'}</td>`;
+                        html += `<td style="padding: 8px; text-align: right;">${m.down_price ? (m.down_price * 100).toFixed(1) + '¢' : 'N/A'}</td>`;
+                        html += `<td style="padding: 8px; text-align: center; color: ${statusColor};">${statusText}</td>`;
+                        html += '</tr>';
+                    }
+                    html += '</table>';
+                }
+
+                marketsList.innerHTML = html;
+                document.getElementById('market-count').textContent = foundCount;
+                document.getElementById('tradeable-count').textContent = tradeableCount;
+            }
         }
 
         function updateTime() {
@@ -776,6 +846,7 @@ class DashboardServer:
             "stats": stats,
             "logs": list(log_buffer),
             "trades": list(trade_history),
+            "markets": active_markets,
         })
 
     async def _handle_events(self, request: web.Request) -> web.StreamResponse:
@@ -922,6 +993,25 @@ def update_stats(**kwargs) -> None:
 
     if dashboard:
         asyncio.create_task(dashboard.broadcast({"stats": stats}))
+
+
+def update_markets(markets_data: Dict[str, Dict[str, Any]]) -> None:
+    """Update active markets display.
+
+    Args:
+        markets_data: Dict of condition_id -> market info with:
+            - asset: Asset symbol (BTC, ETH)
+            - end_time: Market end time string (HH:MM UTC)
+            - seconds_remaining: Seconds until market ends
+            - up_price: Current UP/YES price
+            - down_price: Current DOWN/NO price
+            - is_tradeable: Whether market is tradeable
+    """
+    global active_markets
+    active_markets = markets_data
+
+    if dashboard:
+        asyncio.create_task(dashboard.broadcast({"markets": active_markets}))
 
 
 def add_trade(

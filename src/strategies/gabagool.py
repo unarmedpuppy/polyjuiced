@@ -18,7 +18,7 @@ import structlog
 from ..client.polymarket import PolymarketClient
 from ..client.websocket import PolymarketWebSocket
 from ..config import AppConfig, GabagoolConfig
-from ..dashboard import add_log, add_trade, resolve_trade, update_stats
+from ..dashboard import add_log, add_trade, resolve_trade, update_stats, update_markets
 from ..metrics import (
     ACTIVE_MARKETS,
     DAILY_EXPOSURE_USD,
@@ -203,6 +203,31 @@ class GabagoolStrategy(BaseStrategy):
         # Update active markets metric
         ACTIVE_MARKETS.set(len(self._active_markets))
         update_stats(active_markets=len(self._active_markets))
+
+        # Build market data for dashboard display
+        # Include ALL discovered markets (not just tradeable) so dashboard shows status
+        markets_data = {}
+        for market in markets:
+            # Get current prices from tracker if available
+            up_price = None
+            down_price = None
+            tracker = self._tracker._trackers.get(market.condition_id)
+            if tracker:
+                up_price = tracker.yes_price
+                down_price = tracker.no_price
+
+            markets_data[market.condition_id] = {
+                "asset": market.asset,
+                "end_time": market.end_time.strftime("%H:%M UTC") if market.end_time else "N/A",
+                "seconds_remaining": market.seconds_remaining,
+                "up_price": up_price,
+                "down_price": down_price,
+                "is_tradeable": market.is_tradeable,
+                "question": market.question[:60] + "..." if len(market.question) > 60 else market.question,
+            }
+
+        # Send to dashboard
+        update_markets(markets_data)
 
         # Log status periodically
         if new_count > 0 or len(to_remove) > 0:
