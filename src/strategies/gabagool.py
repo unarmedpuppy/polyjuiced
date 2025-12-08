@@ -176,10 +176,18 @@ class GabagoolStrategy(BaseStrategy):
         )
 
         # Add new markets
+        new_count = 0
         for market in markets:
             if market.condition_id not in self._active_markets:
                 await self._tracker.add_market(market)
                 self._active_markets[market.condition_id] = market
+                new_count += 1
+                add_log(
+                    "info",
+                    f"Found new market: {market.asset}",
+                    question=market.question[:50] + "..." if len(market.question) > 50 else market.question,
+                    seconds_remaining=int(market.seconds_remaining),
+                )
 
         # Remove expired markets
         to_remove = []
@@ -187,6 +195,7 @@ class GabagoolStrategy(BaseStrategy):
             if not market.is_tradeable:
                 to_remove.append(cid)
                 await self._tracker.remove_market(market)
+                add_log("info", f"Market expired: {market.asset}")
 
         for cid in to_remove:
             del self._active_markets[cid]
@@ -194,6 +203,15 @@ class GabagoolStrategy(BaseStrategy):
         # Update active markets metric
         ACTIVE_MARKETS.set(len(self._active_markets))
         update_stats(active_markets=len(self._active_markets))
+
+        # Log status periodically
+        if new_count > 0 or len(to_remove) > 0:
+            log.info(
+                "Market update",
+                active=len(self._active_markets),
+                new=new_count,
+                expired=len(to_remove),
+            )
 
     async def on_opportunity(
         self,

@@ -8,6 +8,7 @@ from typing import Optional
 
 import structlog
 
+from .client.gamma import GammaClient
 from .client.polymarket import PolymarketClient
 from .client.websocket import PolymarketWebSocket
 from .config import AppConfig
@@ -57,6 +58,7 @@ class GabagoolBot:
 
         # Components (initialized in start)
         self._client: Optional[PolymarketClient] = None
+        self._gamma_client: Optional[GammaClient] = None
         self._ws_client: Optional[PolymarketWebSocket] = None
         self._market_finder: Optional[MarketFinder] = None
         self._circuit_breaker: Optional[CircuitBreaker] = None
@@ -124,6 +126,9 @@ class GabagoolBot:
         if self._ws_client:
             await self._ws_client.disconnect()
 
+        if self._gamma_client:
+            await self._gamma_client.close()
+
         if self._client:
             await self._client.disconnect()
 
@@ -146,8 +151,11 @@ class GabagoolBot:
         # Create WebSocket client
         self._ws_client = PolymarketWebSocket(self.config)
 
+        # Create Gamma client for market discovery
+        self._gamma_client = GammaClient(self.config.polymarket.gamma_api_url)
+
         # Create market finder
-        self._market_finder = MarketFinder(self.config.polymarket)
+        self._market_finder = MarketFinder(self._gamma_client)
 
         # Create risk management components
         self._circuit_breaker = CircuitBreaker(self.config.gabagool)
