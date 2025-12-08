@@ -37,8 +37,14 @@ services:
       - "traefik.http.routers.polymarket.service=polymarket"
       # Service and auth middleware
       - "traefik.http.services.polymarket.loadbalancer.server.port=8080"
+      - "traefik.http.services.polymarket-metrics.loadbalancer.server.port=8000"
       - "traefik.http.middlewares.polymarket-auth.basicauth.users=unarmedpuppy:$$apr1$$yE.A6vVX$$p7.fpGKw5Unp0UW6H/2c.0"
       - "traefik.http.middlewares.polymarket-auth.basicauth.realm=polymarket"
+      # Metrics endpoint (path-based routing)
+      - "traefik.http.routers.polymarket-metrics.rule=Host(`polymarket.server.unarmedpuppy.com`) && PathPrefix(`/metrics`)"
+      - "traefik.http.routers.polymarket-metrics.entrypoints=websecure"
+      - "traefik.http.routers.polymarket-metrics.tls.certresolver=myresolver"
+      - "traefik.http.routers.polymarket-metrics.service=polymarket-metrics"
       # Homepage integration
       - "homepage.group=Trading"
       - "homepage.name=Polymarket Bot"
