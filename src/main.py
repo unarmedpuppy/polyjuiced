@@ -1,6 +1,7 @@
 """Main entry point for Polymarket Gabagool Trading Bot."""
 
 import asyncio
+import logging
 import signal
 import sys
 from datetime import datetime
@@ -20,6 +21,13 @@ from .metrics_server import MetricsServer
 from .monitoring.market_finder import MarketFinder
 from .risk import CircuitBreaker, PositionSizer
 from .strategies.gabagool import GabagoolStrategy
+
+# Configure stdlib logging level (required for structlog filter_by_level)
+logging.basicConfig(
+    format="%(message)s",
+    stream=sys.stdout,
+    level=logging.INFO,
+)
 
 # Configure structured logging
 structlog.configure(
