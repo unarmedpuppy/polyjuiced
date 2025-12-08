@@ -68,6 +68,7 @@ class GabagoolBot:
         self._client: Optional[PolymarketClient] = None
         self._gamma_client: Optional[GammaClient] = None
         self._ws_client: Optional[PolymarketWebSocket] = None
+        self._ws_task: Optional[asyncio.Task] = None
         self._market_finder: Optional[MarketFinder] = None
         self._circuit_breaker: Optional[CircuitBreaker] = None
         self._position_sizer: Optional[PositionSizer] = None
@@ -130,6 +131,14 @@ class GabagoolBot:
         if self._strategy:
             await self._strategy.stop()
 
+        # Cancel WebSocket task
+        if self._ws_task:
+            self._ws_task.cancel()
+            try:
+                await self._ws_task
+            except asyncio.CancelledError:
+                pass
+
         # Disconnect clients
         if self._ws_client:
             await self._ws_client.disconnect()
@@ -154,10 +163,42 @@ class GabagoolBot:
         """Initialize all bot components."""
         # Create Polymarket client
         self._client = PolymarketClient(self.config.polymarket)
-        await self._client.connect()
+        connected = await self._client.connect()
+        if connected:
+            update_stats(clob_status="CONNECTED")
+            add_log("info", "Connected to Polymarket CLOB API")
+        else:
+            update_stats(clob_status="ERROR")
+            add_log("error", "Failed to connect to Polymarket CLOB API")
+
+        # Verify API credentials work (try to get orders - requires auth)
+        if self.config.polymarket.api_key:
+            try:
+                orders = self._client.get_orders()
+                log.info("API credentials verified", order_count=len(orders))
+                add_log("info", "API credentials verified successfully")
+            except Exception as e:
+                log.warning("API credentials may be invalid", error=str(e))
+                add_log("warning", f"API credential check failed: {str(e)[:50]}")
 
         # Create WebSocket client
-        self._ws_client = PolymarketWebSocket(self.config)
+        self._ws_client = PolymarketWebSocket(
+            ws_url=self.config.polymarket.clob_ws_url
+        )
+
+        # Connect WebSocket in background (will auto-reconnect)
+        async def ws_runner():
+            await self._ws_client.run()
+
+        self._ws_task = asyncio.create_task(ws_runner())
+        # Give WebSocket time to connect
+        await asyncio.sleep(1)
+        if self._ws_client.is_connected:
+            update_stats(websocket="CONNECTED")
+            add_log("info", "WebSocket connected for real-time data")
+        else:
+            update_stats(websocket="CONNECTING")
+            add_log("warning", "WebSocket connecting (will retry automatically)")
 
         # Create Gamma client for market discovery
         self._gamma_client = GammaClient(self.config.polymarket.gamma_api_url)
