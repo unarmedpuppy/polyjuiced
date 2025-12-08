@@ -49,7 +49,7 @@ services:
       - "traefik.http.routers.polymarket-metrics.tls.certresolver=myresolver"
       - "traefik.http.routers.polymarket-metrics.service=polymarket-metrics"
       # Homepage integration
-      - "homepage.group=Trading"
+      - "homepage.group=Finance & Trading"
       - "homepage.name=Polymarket Bot"
       - "homepage.icon=si-polymarket"
       - "homepage.href=https://polymarket.server.unarmedpuppy.com/dashboard"
