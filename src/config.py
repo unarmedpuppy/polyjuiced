@@ -31,8 +31,8 @@ class PolymarketSettings(BaseSettings):
         description="CLOB HTTP API URL"
     )
     clob_ws_url: str = Field(
-        default="wss://ws-subscriptions-clob.polymarket.com/ws",
-        description="CLOB WebSocket URL"
+        default="wss://ws-live-data.polymarket.com",
+        description="CLOB WebSocket URL for live data streaming"
     )
     gamma_api_url: str = Field(
         default="https://gamma-api.polymarket.com",
