@@ -3,11 +3,14 @@
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import structlog
 
 from ..client.gamma import GammaClient
+
+if TYPE_CHECKING:
+    from ..persistence import Database
 
 log = structlog.get_logger()
 
@@ -44,13 +47,15 @@ class Market15Min:
 class MarketFinder:
     """Finds and tracks active 15-minute up/down markets."""
 
-    def __init__(self, gamma_client: GammaClient):
+    def __init__(self, gamma_client: GammaClient, db: Optional["Database"] = None):
         """Initialize market finder.
 
         Args:
             gamma_client: Gamma API client
+            db: Optional database for persisting market history
         """
         self.gamma = gamma_client
+        self._db = db
         self._cache: Dict[str, Market15Min] = {}
         self._last_refresh: Optional[datetime] = None
         self._cache_ttl = timedelta(minutes=1)
@@ -88,6 +93,22 @@ class MarketFinder:
         # Update cache
         self._cache = {m.condition_id: m for m in all_markets}
         self._last_refresh = now
+
+        # Persist newly discovered markets to database
+        if self._db:
+            for market in all_markets:
+                try:
+                    await self._db.save_market(
+                        condition_id=market.condition_id,
+                        question=market.question,
+                        asset=market.asset,
+                        start_time=market.start_time,
+                        end_time=market.end_time,
+                        yes_token_id=market.yes_token_id,
+                        no_token_id=market.no_token_id,
+                    )
+                except Exception as e:
+                    log.debug("Failed to save market to DB", error=str(e))
 
         log.info(
             "Refreshed market cache",

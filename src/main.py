@@ -13,12 +13,13 @@ from .client.gamma import GammaClient
 from .client.polymarket import PolymarketClient
 from .client.websocket import PolymarketWebSocket
 from .config import AppConfig
-from .dashboard import DashboardServer, add_log, update_stats
+from .dashboard import DashboardServer, add_log, update_stats, init_persistence
 from .dashboard import dashboard as dashboard_instance
 import src.dashboard as dashboard_module
 from .metrics import init_metrics
 from .metrics_server import MetricsServer
 from .monitoring.market_finder import MarketFinder
+from .persistence import get_database, close_database, Database
 from .risk import CircuitBreaker, PositionSizer
 from .strategies.gabagool import GabagoolStrategy
 
@@ -75,6 +76,7 @@ class GabagoolBot:
         self._strategy: Optional[GabagoolStrategy] = None
         self._metrics_server: Optional[MetricsServer] = None
         self._dashboard: Optional[DashboardServer] = None
+        self._db: Optional[Database] = None
 
     async def start(self) -> None:
         """Start the bot and all components."""
@@ -85,6 +87,10 @@ class GabagoolBot:
         )
 
         self._running = True
+
+        # Initialize database for persistence
+        self._db = await get_database()
+        log.info("Database initialized", path=str(self._db.db_path))
 
         # Initialize metrics
         init_metrics(version="0.1.0", dry_run=self.config.gabagool.dry_run)
@@ -97,6 +103,10 @@ class GabagoolBot:
         self._dashboard = DashboardServer(port=8080)
         dashboard_module.dashboard = self._dashboard
         await self._dashboard.start()
+
+        # Initialize persistence and load historical data
+        await init_persistence(self._db)
+
         update_stats(dry_run=self.config.gabagool.dry_run)
         add_log("info", "Dashboard started", url="http://localhost:8080/dashboard")
 
@@ -157,6 +167,9 @@ class GabagoolBot:
         if self._dashboard:
             await self._dashboard.stop()
 
+        # Close database
+        await close_database()
+
         log.info("Gabagool Bot stopped")
 
     async def _init_components(self) -> None:
@@ -206,8 +219,8 @@ class GabagoolBot:
             http_proxy=self.config.polymarket.http_proxy,
         )
 
-        # Create market finder
-        self._market_finder = MarketFinder(self._gamma_client)
+        # Create market finder (with database for persistence)
+        self._market_finder = MarketFinder(self._gamma_client, db=self._db)
 
         # Create risk management components
         self._circuit_breaker = CircuitBreaker(self.config.gabagool)

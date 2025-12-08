@@ -4,11 +4,14 @@ import asyncio
 import json
 from collections import deque
 from datetime import datetime
-from typing import Deque, Dict, Any, List
+from typing import Deque, Dict, Any, List, Optional, TYPE_CHECKING
 
 from aiohttp import web
 
-# Store recent logs, stats, and trades
+if TYPE_CHECKING:
+    from .persistence import Database
+
+# Store recent logs, stats, and trades (in-memory cache, backed by SQLite)
 log_buffer: Deque[Dict[str, Any]] = deque(maxlen=100)
 trade_history: Deque[Dict[str, Any]] = deque(maxlen=50)
 stats: Dict[str, Any] = {
@@ -18,6 +21,7 @@ stats: Dict[str, Any] = {
     "active_markets": 0,
     "circuit_breaker": "NORMAL",
     "websocket": "DISCONNECTED",
+    "clob_status": "DISCONNECTED",
     "opportunities_detected": 0,
     "opportunities_executed": 0,
     "wins": 0,
@@ -25,7 +29,15 @@ stats: Dict[str, Any] = {
     "pending": 0,
     "last_trade": None,
     "uptime_start": datetime.utcnow().isoformat(),
+    # All-time stats (loaded from DB)
+    "all_time_pnl": 0.0,
+    "all_time_trades": 0,
+    "all_time_wins": 0,
+    "all_time_losses": 0,
 }
+
+# Database reference (set during initialization)
+_db: Optional["Database"] = None
 
 DASHBOARD_HTML = """
 <!DOCTYPE html>
@@ -802,8 +814,92 @@ dashboard: DashboardServer = None
 _trade_id_counter = 0
 
 
-def add_log(level: str, message: str, **extra) -> None:
-    """Add a log entry to the buffer."""
+async def init_persistence(db: "Database") -> None:
+    """Initialize persistence and load historical data.
+
+    Args:
+        db: Database instance
+    """
+    global _db, _trade_id_counter
+    _db = db
+
+    # Load recent trades from database
+    try:
+        recent_trades = await db.get_recent_trades(limit=50)
+        for trade in reversed(recent_trades):  # oldest first
+            trade_dict = {
+                "id": trade["id"],
+                "time": trade["created_at"].split("T")[1][:8] if "T" in str(trade.get("created_at", "")) else "00:00:00",
+                "market_time": trade.get("market_end_time"),
+                "asset": trade["asset"],
+                "yes_price": trade["yes_price"],
+                "no_price": trade["no_price"],
+                "yes_cost": trade["yes_cost"],
+                "no_cost": trade["no_cost"],
+                "spread": trade["spread"],
+                "expected_profit": trade["expected_profit"],
+                "actual_profit": trade.get("actual_profit"),
+                "status": trade.get("status", "pending"),
+                "dry_run": trade.get("dry_run", False),
+            }
+            trade_history.append(trade_dict)
+
+        # Set trade ID counter to continue from last ID
+        if recent_trades:
+            last_id = recent_trades[0]["id"]  # Most recent
+            if last_id.startswith("trade-"):
+                _trade_id_counter = int(last_id.split("-")[1])
+
+        # Load today's stats
+        today_stats = await db.get_today_stats()
+        if today_stats:
+            stats["daily_pnl"] = today_stats.get("pnl") or 0.0
+            stats["daily_trades"] = today_stats.get("trades") or 0
+            stats["wins"] = today_stats.get("wins") or 0
+            stats["losses"] = today_stats.get("losses") or 0
+            stats["pending"] = today_stats.get("pending") or 0
+            stats["daily_exposure"] = today_stats.get("exposure") or 0.0
+
+        # Load all-time stats
+        all_time = await db.get_all_time_stats()
+        if all_time:
+            stats["all_time_pnl"] = all_time.get("total_pnl") or 0.0
+            stats["all_time_trades"] = all_time.get("total_trades") or 0
+            stats["all_time_wins"] = all_time.get("wins") or 0
+            stats["all_time_losses"] = all_time.get("losses") or 0
+
+        # Load recent logs
+        recent_logs = await db.get_recent_logs(limit=100)
+        for log_entry in reversed(recent_logs):  # oldest first
+            log_buffer.append({
+                "timestamp": log_entry["created_at"].split("T")[1][:8] if "T" in str(log_entry.get("created_at", "")) else "00:00:00",
+                "level": log_entry["level"],
+                "message": log_entry["message"],
+                "extra": log_entry.get("extra"),
+            })
+
+        import structlog
+        log = structlog.get_logger()
+        log.info(
+            "Loaded historical data from database",
+            trades=len(recent_trades),
+            logs=len(recent_logs),
+        )
+    except Exception as e:
+        import structlog
+        log = structlog.get_logger()
+        log.warning("Failed to load historical data", error=str(e))
+
+
+def add_log(level: str, message: str, persist: bool = True, **extra) -> None:
+    """Add a log entry to the buffer.
+
+    Args:
+        level: Log level (info, warning, error, trade, resolution)
+        message: Log message
+        persist: Whether to persist to database (default True)
+        **extra: Additional data to include
+    """
     entry = {
         "timestamp": datetime.utcnow().strftime("%H:%M:%S"),
         "level": level,
@@ -814,6 +910,10 @@ def add_log(level: str, message: str, **extra) -> None:
 
     if dashboard:
         asyncio.create_task(dashboard.broadcast({"logs": [entry]}))
+
+    # Persist important logs to database
+    if persist and _db and level in ("warning", "error", "trade", "resolution"):
+        asyncio.create_task(_db.save_log(level, message, extra if extra else None))
 
 
 def update_stats(**kwargs) -> None:
@@ -833,9 +933,24 @@ def add_trade(
     spread: float,
     expected_profit: float,
     market_end_time: str = None,
+    market_slug: str = None,
+    condition_id: str = None,
     dry_run: bool = False,
 ) -> str:
     """Add a new trade to history.
+
+    Args:
+        asset: Asset symbol (BTC, ETH)
+        yes_price: Price paid for YES
+        no_price: Price paid for NO
+        yes_cost: Cost of YES position
+        no_cost: Cost of NO position
+        spread: Spread in cents
+        expected_profit: Expected profit
+        market_end_time: Market resolution time
+        market_slug: Market slug for reference
+        condition_id: Market condition ID
+        dry_run: Whether this is a dry run trade
 
     Returns:
         Trade ID for later updates
@@ -862,12 +977,44 @@ def add_trade(
 
     trade_history.append(trade)
     stats["pending"] = stats.get("pending", 0) + 1
+    stats["daily_trades"] = stats.get("daily_trades", 0) + 1
+    stats["daily_exposure"] = stats.get("daily_exposure", 0.0) + yes_cost + no_cost
 
     if dashboard:
         asyncio.create_task(dashboard.broadcast({
             "trades": [trade],
             "stats": stats,
         }))
+
+    # Persist to database
+    if _db:
+        asyncio.create_task(_db.save_trade(
+            trade_id=trade_id,
+            asset=asset,
+            yes_price=yes_price,
+            no_price=no_price,
+            yes_cost=yes_cost,
+            no_cost=no_cost,
+            spread=spread,
+            expected_profit=expected_profit,
+            market_end_time=market_end_time,
+            market_slug=market_slug,
+            condition_id=condition_id,
+            dry_run=dry_run,
+        ))
+        # Update daily stats
+        asyncio.create_task(_db.update_daily_stats(
+            trades_delta=1,
+            exposure_delta=yes_cost + no_cost,
+        ))
+
+    # Log the trade
+    add_log(
+        "trade",
+        f"Trade opened: {asset} spread={spread:.1f}¢ exp_profit=${expected_profit:.2f}",
+        trade_id=trade_id,
+        dry_run=dry_run,
+    )
 
     return trade_id
 
@@ -892,6 +1039,7 @@ def resolve_trade(trade_id: str, won: bool, actual_profit: float) -> None:
     else:
         stats["losses"] = stats.get("losses", 0) + 1
     stats["pending"] = max(0, stats.get("pending", 0) - 1)
+    stats["daily_pnl"] = stats.get("daily_pnl", 0.0) + actual_profit
 
     if dashboard:
         asyncio.create_task(dashboard.broadcast({
@@ -902,6 +1050,16 @@ def resolve_trade(trade_id: str, won: bool, actual_profit: float) -> None:
             },
             "stats": stats,
         }))
+
+    # Persist to database
+    if _db:
+        asyncio.create_task(_db.resolve_trade(trade_id, won, actual_profit))
+        # Update daily stats
+        asyncio.create_task(_db.update_daily_stats(
+            pnl_delta=actual_profit,
+            wins_delta=1 if won else 0,
+            losses_delta=0 if won else 1,
+        ))
 
     # Log resolution
     status_str = "WIN" if won else "LOSS"
