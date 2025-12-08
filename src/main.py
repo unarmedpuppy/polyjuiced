@@ -11,6 +11,9 @@ import structlog
 from .client.polymarket import PolymarketClient
 from .client.websocket import PolymarketWebSocket
 from .config import AppConfig
+from .dashboard import DashboardServer, add_log, update_stats
+from .dashboard import dashboard as dashboard_instance
+import src.dashboard as dashboard_module
 from .metrics import init_metrics
 from .metrics_server import MetricsServer
 from .monitoring.market_finder import MarketFinder
@@ -60,6 +63,7 @@ class GabagoolBot:
         self._position_sizer: Optional[PositionSizer] = None
         self._strategy: Optional[GabagoolStrategy] = None
         self._metrics_server: Optional[MetricsServer] = None
+        self._dashboard: Optional[DashboardServer] = None
 
     async def start(self) -> None:
         """Start the bot and all components."""
@@ -77,6 +81,13 @@ class GabagoolBot:
         # Start metrics server
         self._metrics_server = MetricsServer(port=8000)
         await self._metrics_server.start()
+
+        # Start dashboard
+        self._dashboard = DashboardServer(port=8080)
+        dashboard_module.dashboard = self._dashboard
+        await self._dashboard.start()
+        update_stats(dry_run=self.config.gabagool.dry_run)
+        add_log("info", "Dashboard started", url="http://localhost:8080/dashboard")
 
         # Initialize components
         await self._init_components()
@@ -119,6 +130,10 @@ class GabagoolBot:
         # Stop metrics server
         if self._metrics_server:
             await self._metrics_server.stop()
+
+        # Stop dashboard
+        if self._dashboard:
+            await self._dashboard.stop()
 
         log.info("Gabagool Bot stopped")
 

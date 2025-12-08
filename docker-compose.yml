@@ -9,6 +9,7 @@ services:
       - TZ=UTC
     ports:
       - "8000:8000"  # Prometheus metrics
+      - "8080:8080"  # Dashboard UI
     volumes:
       - ./data:/app/data
     networks:

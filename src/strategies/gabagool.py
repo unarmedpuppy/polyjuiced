@@ -18,6 +18,7 @@ import structlog
 from ..client.polymarket import PolymarketClient
 from ..client.websocket import PolymarketWebSocket
 from ..config import AppConfig, GabagoolConfig
+from ..dashboard import add_log, update_stats
 from ..metrics import (
     ACTIVE_MARKETS,
     DAILY_EXPOSURE_USD,
@@ -98,6 +99,7 @@ class GabagoolStrategy(BaseStrategy):
         self._daily_pnl: float = 0.0
         self._daily_trades: int = 0
         self._daily_exposure: float = 0.0
+        self._opportunities_detected: int = 0
         self._last_reset: datetime = datetime.utcnow()
 
     async def start(self) -> None:
@@ -185,6 +187,7 @@ class GabagoolStrategy(BaseStrategy):
 
         # Update active markets metric
         ACTIVE_MARKETS.set(len(self._active_markets))
+        update_stats(active_markets=len(self._active_markets))
 
     async def on_opportunity(
         self,
@@ -200,6 +203,8 @@ class GabagoolStrategy(BaseStrategy):
         """
         # Record opportunity detection
         OPPORTUNITIES_DETECTED.labels(market=opportunity.market.asset).inc()
+        self._opportunities_detected += 1
+        update_stats(opportunities_detected=self._opportunities_detected)
 
         # Update price metrics
         YES_PRICE.labels(
@@ -278,6 +283,22 @@ class GabagoolStrategy(BaseStrategy):
             DAILY_TRADES.set(self._daily_trades)
             DAILY_EXPOSURE_USD.set(self._daily_exposure)
 
+            # Update dashboard
+            update_stats(
+                daily_pnl=self._daily_pnl,
+                daily_trades=self._daily_trades,
+                daily_exposure=self._daily_exposure,
+                opportunities_executed=self._daily_trades,
+            )
+            add_log(
+                "info",
+                f"TRADE: {opportunity.market.asset} +${result.expected_profit:.2f}",
+                spread=f"{opportunity.spread_cents:.1f}¢",
+                yes=f"${result.yes_cost:.2f}",
+                no=f"${result.no_cost:.2f}",
+                dry_run=result.dry_run,
+            )
+
             self.log_trade(
                 action="ARBITRAGE",
                 details={
@@ -290,6 +311,7 @@ class GabagoolStrategy(BaseStrategy):
                 },
             )
         elif result and not result.success:
+            add_log("error", f"Trade failed: {result.error}", market=opportunity.market.asset)
             TRADE_ERRORS_TOTAL.labels(
                 market=opportunity.market.asset,
                 error_type=result.error or "unknown",
