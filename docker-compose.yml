@@ -7,6 +7,8 @@ services:
       - .env
     environment:
       - TZ=UTC
+      # Route HTTP traffic through VPN (gluetun proxy in Switzerland)
+      - POLYMARKET_HTTP_PROXY=http://media-download-gluetun:8888
     ports:
       - "8500:8000"  # Prometheus metrics
       - "8501:8080"  # Dashboard UI

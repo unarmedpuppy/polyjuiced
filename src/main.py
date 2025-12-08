@@ -200,8 +200,11 @@ class GabagoolBot:
             update_stats(websocket="CONNECTING")
             add_log("warning", "WebSocket connecting (will retry automatically)")
 
-        # Create Gamma client for market discovery
-        self._gamma_client = GammaClient(self.config.polymarket.gamma_api_url)
+        # Create Gamma client for market discovery (with VPN proxy if configured)
+        self._gamma_client = GammaClient(
+            base_url=self.config.polymarket.gamma_api_url,
+            http_proxy=self.config.polymarket.http_proxy,
+        )
 
         # Create market finder
         self._market_finder = MarketFinder(self._gamma_client)

@@ -39,6 +39,12 @@ class PolymarketSettings(BaseSettings):
         description="Gamma API URL for market metadata"
     )
 
+    # HTTP Proxy (for routing through VPN)
+    http_proxy: Optional[str] = Field(
+        default=None,
+        description="HTTP proxy URL (e.g., http://gluetun:8888)"
+    )
+
     # Logging
     log_level: str = Field(default="INFO", description="Log level")
     log_json: bool = Field(default=False, description="Enable JSON structured logging")
