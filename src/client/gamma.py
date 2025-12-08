@@ -265,10 +265,24 @@ class GammaClient:
             seen_condition_ids = set()
 
             for query in queries:
-                pages = query.get("state", {}).get("data", {}).get("pages", [])
+                state = query.get("state", {})
+                if not isinstance(state, dict):
+                    continue
+                data_obj = state.get("data", {})
+                if not isinstance(data_obj, dict):
+                    continue
+                pages = data_obj.get("pages", [])
+                if not isinstance(pages, list):
+                    continue
                 for page in pages:
+                    if not isinstance(page, dict):
+                        continue
                     events = page.get("events", [])
+                    if not isinstance(events, list):
+                        continue
                     for event in events:
+                        if not isinstance(event, dict):
+                            continue
                         slug = event.get("slug", "")
 
                         # Filter for the requested asset's 15m markets
