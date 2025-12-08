@@ -151,7 +151,7 @@ class MarketFinder:
         """Parse raw market data into Market15Min.
 
         Args:
-            raw: Raw market data from Gamma API
+            raw: Raw market data from Gamma API / page scrape
             asset: Asset symbol
 
         Returns:
@@ -159,14 +159,19 @@ class MarketFinder:
         """
         try:
             question = raw.get("question", "")
+            end_timestamp = raw.get("end_timestamp")
 
-            # Parse time range from question
-            # Example: "Bitcoin Up or Down - December 7, 3:00AM-3:15AM ET"
-            times = self._parse_time_from_question(question)
-            if not times:
-                return None
-
-            start_time, end_time = times
+            # If we have an end_timestamp, use it directly
+            if end_timestamp:
+                end_time = datetime.utcfromtimestamp(end_timestamp)
+                # 15-minute markets start 15 minutes before end
+                start_time = end_time - timedelta(minutes=15)
+            else:
+                # Fall back to parsing from question string
+                times = self._parse_time_from_question(question)
+                if not times:
+                    return None
+                start_time, end_time = times
 
             return Market15Min(
                 condition_id=raw.get("condition_id", ""),
