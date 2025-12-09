@@ -159,6 +159,13 @@ class OrderBookTracker:
         self._token_side[market.yes_token_id] = "yes"
         self._token_side[market.no_token_id] = "no"
 
+        log.info(
+            "Token mapping registered",
+            yes_token=market.yes_token_id[:30] if market.yes_token_id else "N/A",
+            no_token=market.no_token_id[:30] if market.no_token_id else "N/A",
+            condition_id=condition_id[:20],
+        )
+
         # Register handler and subscribe
         self.ws.on_book_update(self._handle_book_update)
         await self.ws.subscribe([market.yes_token_id, market.no_token_id])
@@ -239,6 +246,19 @@ class OrderBookTracker:
         # Find the market this token belongs to
         condition_id = self._token_to_market.get(token_id)
         if not condition_id:
+            # Log first few misses to diagnose token ID format mismatch
+            if not hasattr(self, '_miss_count'):
+                self._miss_count = 0
+            self._miss_count += 1
+            if self._miss_count <= 5:
+                # Show what we're looking for vs what we got
+                sample_keys = list(self._token_to_market.keys())[:2]
+                log.warning(
+                    "Token ID not found in mapping",
+                    received_token=token_id[:30] if token_id else "N/A",
+                    sample_registered=sample_keys[0][:30] if sample_keys else "none",
+                    registered_count=len(self._token_to_market),
+                )
             return
 
         state = self._markets.get(condition_id)
