@@ -212,13 +212,11 @@ class GabagoolStrategy(BaseStrategy):
             # Get current prices from tracker if available (WebSocket real-time)
             up_price = None
             down_price = None
-            tracker = self._tracker._trackers.get(market.condition_id)
-            if tracker:
-                # Get market state which contains the prices
-                market_state = tracker.get_market_state(market.condition_id)
-                if market_state and not market_state.is_stale:
-                    up_price = market_state.yes_price
-                    down_price = market_state.no_price
+            # Use the shared tracker's get_market_state method
+            market_state = self._tracker.get_market_state(market.condition_id)
+            if market_state and not market_state.is_stale:
+                up_price = market_state.yes_price
+                down_price = market_state.no_price
 
             # Fall back to Gamma API prices if WebSocket prices not available
             if up_price is None or up_price >= 1.0:

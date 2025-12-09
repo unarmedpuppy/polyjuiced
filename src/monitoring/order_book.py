@@ -305,7 +305,7 @@ class OrderBookTracker:
 
 
 class MultiMarketTracker:
-    """Tracks multiple markets simultaneously."""
+    """Tracks multiple markets simultaneously with a single shared token mapping."""
 
     def __init__(
         self,
@@ -320,7 +320,16 @@ class MultiMarketTracker:
         """
         self.ws = ws_client
         self.min_spread_cents = min_spread_cents
+
+        # Use a single tracker that manages ALL markets
+        # This ensures one callback handles all token mappings
+        self._tracker = OrderBookTracker(ws_client, min_spread_cents)
+
+        # Legacy compatibility: expose trackers dict for existing code
         self._trackers: Dict[str, OrderBookTracker] = {}
+
+        # Track if we've registered the callback
+        self._callback_registered = False
 
     async def add_market(self, market: Market15Min) -> None:
         """Add a market to track.
@@ -331,9 +340,11 @@ class MultiMarketTracker:
         if market.condition_id in self._trackers:
             return
 
-        tracker = OrderBookTracker(self.ws, self.min_spread_cents)
-        await tracker.track_market(market)
-        self._trackers[market.condition_id] = tracker
+        # Use the shared tracker for all markets
+        await self._tracker.track_market(market)
+
+        # Store reference for compatibility
+        self._trackers[market.condition_id] = self._tracker
 
     async def remove_market(self, market: Market15Min) -> None:
         """Remove a market from tracking.
@@ -341,9 +352,11 @@ class MultiMarketTracker:
         Args:
             market: Market to remove
         """
-        tracker = self._trackers.pop(market.condition_id, None)
-        if tracker:
-            await tracker.untrack_market(market)
+        if market.condition_id not in self._trackers:
+            return
+
+        await self._tracker.untrack_market(market)
+        del self._trackers[market.condition_id]
 
     def get_best_opportunity(self) -> Optional[ArbitrageOpportunity]:
         """Get the best current opportunity across all markets.
@@ -351,11 +364,21 @@ class MultiMarketTracker:
         Returns:
             Best opportunity or None
         """
-        all_opportunities = []
-        for tracker in self._trackers.values():
-            all_opportunities.extend(tracker.get_all_opportunities())
+        # Use the shared tracker to get all opportunities
+        all_opportunities = self._tracker.get_all_opportunities()
 
         if not all_opportunities:
             return None
 
         return max(all_opportunities, key=lambda o: o.spread)
+
+    def get_market_state(self, condition_id: str):
+        """Get market state for a specific condition ID.
+
+        Args:
+            condition_id: Market condition ID
+
+        Returns:
+            MarketState or None
+        """
+        return self._tracker.get_market_state(condition_id)
