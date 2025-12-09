@@ -58,15 +58,21 @@ class MarketFinder:
         self._db = db
         self._cache: Dict[str, Market15Min] = {}
         self._last_refresh: Optional[datetime] = None
-        self._cache_ttl = timedelta(minutes=1)
+        self._cache_ttl = timedelta(seconds=30)  # Poll every 30s for faster market discovery
 
     @property
     def all_discovered_markets(self) -> List[Market15Min]:
-        """Return all discovered markets (including expired ones).
+        """Return all discovered markets (including recently expired ones).
 
         This is useful for dashboard display to show market status.
+        Markets expired more than 5 minutes ago are excluded.
         """
-        return list(self._cache.values())
+        now = datetime.utcnow()
+        # Include markets that are either active or expired within last 5 minutes
+        return [
+            m for m in self._cache.values()
+            if m.seconds_remaining > -300  # -300 = expired 5 min ago
+        ]
 
     async def find_active_markets(
         self,
