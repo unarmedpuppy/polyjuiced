@@ -43,7 +43,7 @@ class PolymarketWebSocket:
 
     def __init__(
         self,
-        ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/",
+        ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market",
         reconnect_delay: float = 1.0,
         max_reconnect_delay: float = 60.0,
     ):
@@ -55,8 +55,9 @@ class PolymarketWebSocket:
             max_reconnect_delay: Maximum delay between reconnection attempts
         """
         # Ensure we use the correct Polymarket WebSocket URL
-        if "ws-live-data" in ws_url:
-            ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/"
+        # The market channel endpoint is: wss://ws-subscriptions-clob.polymarket.com/ws/market
+        if "ws-live-data" in ws_url or ws_url.endswith("/ws/"):
+            ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
         self.ws_url = ws_url
         self.reconnect_delay = reconnect_delay
         self.max_reconnect_delay = max_reconnect_delay
