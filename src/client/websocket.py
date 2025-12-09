@@ -43,17 +43,20 @@ class PolymarketWebSocket:
 
     def __init__(
         self,
-        ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws",
+        ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/",
         reconnect_delay: float = 1.0,
         max_reconnect_delay: float = 60.0,
     ):
         """Initialize WebSocket client.
 
         Args:
-            ws_url: WebSocket server URL
+            ws_url: WebSocket server URL (Polymarket CLOB WebSocket)
             reconnect_delay: Initial delay between reconnection attempts
             max_reconnect_delay: Maximum delay between reconnection attempts
         """
+        # Ensure we use the correct Polymarket WebSocket URL
+        if "ws-live-data" in ws_url:
+            ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/"
         self.ws_url = ws_url
         self.reconnect_delay = reconnect_delay
         self.max_reconnect_delay = max_reconnect_delay
@@ -135,23 +138,33 @@ class PolymarketWebSocket:
     async def subscribe(self, token_ids: List[str]) -> None:
         """Subscribe to order book updates for specific tokens.
 
+        Uses the Polymarket market channel format:
+        {"assets_ids": ["token1", "token2"], "type": "market"}
+
         Args:
             token_ids: List of token IDs to subscribe to
         """
         if not self.is_connected:
             raise RuntimeError("WebSocket not connected")
 
-        for token_id in token_ids:
-            if token_id not in self._subscribed_tokens:
-                # Subscribe to market channel for this token
-                subscribe_msg = {
-                    "type": "subscribe",
-                    "channel": "market",
-                    "assets_id": token_id,
-                }
-                await self._ws.send(orjson.dumps(subscribe_msg).decode())
-                self._subscribed_tokens.add(token_id)
-                log.debug("Subscribed to token", token_id=token_id)
+        # Filter out already subscribed tokens
+        new_tokens = [t for t in token_ids if t not in self._subscribed_tokens]
+        if not new_tokens:
+            return
+
+        # Subscribe to market channel with all tokens at once
+        # Polymarket expects: {"assets_ids": [...], "type": "market"}
+        subscribe_msg = {
+            "type": "market",
+            "assets_ids": new_tokens,
+        }
+        await self._ws.send(orjson.dumps(subscribe_msg).decode())
+
+        for token_id in new_tokens:
+            self._subscribed_tokens.add(token_id)
+            log.debug("Subscribed to token", token_id=token_id)
+
+        log.info("Subscribed to market channel", token_count=len(new_tokens))
 
     async def unsubscribe(self, token_ids: List[str]) -> None:
         """Unsubscribe from token updates.
@@ -231,19 +244,32 @@ class PolymarketWebSocket:
     async def _handle_message(self, data: Dict[str, Any]) -> None:
         """Handle a parsed WebSocket message.
 
+        Polymarket uses "event_type" field for message types:
+        - "book": Order book snapshot
+        - "price_change": Price level changes
+        - "last_trade_price": Trade execution
+
         Args:
             data: Parsed JSON message
         """
-        msg_type = data.get("type", data.get("event_type"))
+        msg_type = data.get("event_type", data.get("type"))
 
         if msg_type == "book":
             await self._handle_book_update(data)
+            log.debug("Received book update", asset_id=data.get("asset_id"))
         elif msg_type == "price_change":
             await self._handle_price_change(data)
-        elif msg_type == "subscribed":
-            log.debug("Subscription confirmed", data=data)
+        elif msg_type == "last_trade_price":
+            log.debug("Trade executed", data=data)
+        elif msg_type == "tick_size_change":
+            log.debug("Tick size changed", data=data)
+        elif msg_type == "subscribed" or msg_type == "connected":
+            log.info("WebSocket subscription confirmed", data=data)
         elif msg_type == "error":
             log.error("WebSocket error message", data=data)
+        elif msg_type is None:
+            # Log raw message for debugging unknown formats
+            log.debug("Message without type", keys=list(data.keys())[:5])
         else:
             log.debug("Unknown message type", type=msg_type)
 
