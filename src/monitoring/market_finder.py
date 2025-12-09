@@ -27,6 +27,8 @@ class Market15Min:
     start_time: datetime
     end_time: datetime
     active: bool = True
+    up_price: Optional[float] = None  # Price from Gamma API (0-1)
+    down_price: Optional[float] = None  # Price from Gamma API (0-1)
 
     @property
     def time_remaining(self) -> timedelta:
@@ -196,6 +198,8 @@ class MarketFinder:
                 start_time=start_time,
                 end_time=end_time,
                 active=raw.get("active", True),
+                up_price=raw.get("up_price"),
+                down_price=raw.get("down_price"),
             )
 
         except Exception as e:
