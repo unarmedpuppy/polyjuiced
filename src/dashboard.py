@@ -11,9 +11,10 @@ from aiohttp import web
 if TYPE_CHECKING:
     from .persistence import Database
 
-# Store recent logs, stats, trades, and markets (in-memory cache, backed by SQLite)
+# Store recent logs, stats, trades, markets, and decisions (in-memory cache, backed by SQLite)
 log_buffer: Deque[Dict[str, Any]] = deque(maxlen=100)
 trade_history: Deque[Dict[str, Any]] = deque(maxlen=50)
+decisions_buffer: Deque[Dict[str, Any]] = deque(maxlen=20)  # Recent strategy decisions
 active_markets: Dict[str, Dict[str, Any]] = {}  # condition_id -> market info
 stats: Dict[str, Any] = {
     "daily_pnl": 0.0,
@@ -541,6 +542,23 @@ DASHBOARD_HTML = """
             </div>
         </div>
 
+        <!-- Strategy Decisions Panel -->
+        <div class="panel" style="margin-bottom: 20px;">
+            <div class="panel-header">
+                <span class="panel-title">[ STRATEGY DECISIONS ]</span>
+                <span style="color: var(--dim-green); font-size: 0.8rem;">
+                    Real-time evaluation
+                </span>
+            </div>
+            <div class="panel-body" style="padding: 0;">
+                <div id="decisions-list" style="max-height: 180px; overflow-y: auto; font-size: 0.85rem;">
+                    <div style="padding: 15px; text-align: center; color: var(--dim-green);">
+                        Waiting for market evaluation...
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <div class="grid-2col">
             <!-- Trade History -->
             <div class="panel">
@@ -765,6 +783,39 @@ DASHBOARD_HTML = """
                 document.getElementById('market-count').textContent = foundCount;
                 document.getElementById('tradeable-count').textContent = tradeableCount;
             }
+
+            // Update decisions list
+            if (data.decisions) {
+                const decisionsList = document.getElementById('decisions-list');
+                let html = '';
+
+                if (data.decisions.length === 0) {
+                    html = '<div style="padding: 15px; text-align: center; color: var(--dim-green);">Waiting for market evaluation...</div>';
+                } else {
+                    for (const d of data.decisions) {
+                        const actionColor = d.action === 'TRADE' ? 'var(--green)' :
+                                           d.action === 'SKIP' ? 'var(--amber)' : 'var(--dim-green)';
+                        const spreadColor = d.spread >= 2.0 ? 'var(--green)' :
+                                           d.spread >= 0 ? 'var(--amber)' : 'var(--red)';
+
+                        html += `<div style="padding: 8px 12px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center;">`;
+                        html += `<div style="flex: 1;">`;
+                        html += `<span style="color: var(--dim-green); font-size: 0.75rem;">${d.timestamp}</span> `;
+                        html += `<span style="color: var(--cyan); font-weight: bold;">${d.asset}</span> `;
+                        html += `<span style="color: ${actionColor}; font-weight: bold;">[${d.action}]</span> `;
+                        html += `<span style="color: var(--dim-green);">${d.reason}</span>`;
+                        html += `</div>`;
+                        html += `<div style="text-align: right; min-width: 180px;">`;
+                        html += `<span style="color: var(--dim-green);">Up:</span> <span>${d.up_price ? (d.up_price * 100).toFixed(1) + '¢' : 'N/A'}</span> `;
+                        html += `<span style="color: var(--dim-green);">Down:</span> <span>${d.down_price ? (d.down_price * 100).toFixed(1) + '¢' : 'N/A'}</span> `;
+                        html += `<span style="color: var(--dim-green);">Spread:</span> <span style="color: ${spreadColor}; font-weight: bold;">${d.spread.toFixed(1)}¢</span>`;
+                        html += `</div>`;
+                        html += `</div>`;
+                    }
+                }
+
+                decisionsList.innerHTML = html;
+            }
         }
 
         function updateTime() {
@@ -847,6 +898,7 @@ class DashboardServer:
             "logs": list(log_buffer),
             "trades": list(trade_history),
             "markets": active_markets,
+            "decisions": list(decisions_buffer),
         })
 
     async def _handle_events(self, request: web.Request) -> web.StreamResponse:
@@ -1012,6 +1064,40 @@ def update_markets(markets_data: Dict[str, Dict[str, Any]]) -> None:
 
     if dashboard:
         asyncio.create_task(dashboard.broadcast({"markets": active_markets}))
+
+
+def add_decision(
+    asset: str,
+    action: str,
+    reason: str,
+    up_price: Optional[float] = None,
+    down_price: Optional[float] = None,
+    spread: float = 0.0,
+) -> None:
+    """Add a strategy decision to the dashboard.
+
+    Args:
+        asset: Asset symbol (BTC, ETH)
+        action: Decision action (TRADE, SKIP, EVAL, etc.)
+        reason: Human-readable reason for the decision
+        up_price: Current UP/YES price (0-1)
+        down_price: Current DOWN/NO price (0-1)
+        spread: Current spread in cents
+    """
+    decision = {
+        "timestamp": datetime.utcnow().strftime("%H:%M:%S"),
+        "asset": asset,
+        "action": action,
+        "reason": reason,
+        "up_price": up_price,
+        "down_price": down_price,
+        "spread": spread,
+    }
+
+    decisions_buffer.appendleft(decision)  # Newest first
+
+    if dashboard:
+        asyncio.create_task(dashboard.broadcast({"decisions": list(decisions_buffer)}))
 
 
 def add_trade(

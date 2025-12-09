@@ -18,7 +18,7 @@ import structlog
 from ..client.polymarket import PolymarketClient
 from ..client.websocket import PolymarketWebSocket
 from ..config import AppConfig, GabagoolConfig
-from ..dashboard import add_log, add_trade, resolve_trade, update_stats, update_markets
+from ..dashboard import add_log, add_trade, add_decision, resolve_trade, update_stats, update_markets
 from ..metrics import (
     ACTIVE_MARKETS,
     DAILY_EXPOSURE_USD,
@@ -236,6 +236,23 @@ class GabagoolStrategy(BaseStrategy):
                 "question": market.question[:60] + "..." if len(market.question) > 60 else market.question,
             }
 
+            # Log evaluation for tradeable markets with valid prices
+            if market.is_tradeable and up_price and down_price:
+                spread_cents = (1.0 - up_price - down_price) * 100
+                min_spread = self.gabagool_config.min_spread_threshold * 100
+                if spread_cents >= min_spread:
+                    status = f"OPPORTUNITY! Spread {spread_cents:.1f}¢ >= {min_spread:.0f}¢"
+                else:
+                    status = f"Spread {spread_cents:.1f}¢ < {min_spread:.0f}¢ threshold"
+                add_decision(
+                    asset=market.asset,
+                    action="EVAL",
+                    reason=status,
+                    up_price=up_price,
+                    down_price=down_price,
+                    spread=spread_cents,
+                )
+
         # Send to dashboard
         update_markets(markets_data)
 
@@ -297,6 +314,14 @@ class GabagoolStrategy(BaseStrategy):
         # Check exposure limits
         total_cost = yes_amount + no_amount
         if self._daily_exposure + total_cost > self.gabagool_config.max_daily_exposure_usd:
+            add_decision(
+                asset=opportunity.market.asset,
+                action="SKIP",
+                reason=f"Exposure limit (${self._daily_exposure:.0f}+${total_cost:.0f} > ${self.gabagool_config.max_daily_exposure_usd:.0f})",
+                up_price=opportunity.yes_price,
+                down_price=opportunity.no_price,
+                spread=opportunity.spread_cents,
+            )
             log.warning("Would exceed daily exposure limit")
             OPPORTUNITIES_SKIPPED.labels(
                 market=opportunity.market.asset,
@@ -357,6 +382,14 @@ class GabagoolStrategy(BaseStrategy):
                 no=f"${result.no_cost:.2f}",
                 dry_run=result.dry_run,
             )
+            add_decision(
+                asset=opportunity.market.asset,
+                action="TRADE",
+                reason=f"Executed! +${result.expected_profit:.2f} profit {'(DRY RUN)' if result.dry_run else ''}",
+                up_price=opportunity.yes_price,
+                down_price=opportunity.no_price,
+                spread=opportunity.spread_cents,
+            )
 
             self.log_trade(
                 action="ARBITRAGE",
@@ -387,25 +420,67 @@ class GabagoolStrategy(BaseStrategy):
         Returns:
             True if opportunity is valid
         """
+        min_spread_cents = self.gabagool_config.min_spread_threshold * 100
+
         # Check minimum spread
-        if opportunity.spread_cents < self.gabagool_config.min_spread_threshold * 100:
+        if opportunity.spread_cents < min_spread_cents:
+            add_decision(
+                asset=opportunity.market.asset,
+                action="SKIP",
+                reason=f"Spread {opportunity.spread_cents:.1f}¢ < {min_spread_cents:.0f}¢ threshold",
+                up_price=opportunity.yes_price,
+                down_price=opportunity.no_price,
+                spread=opportunity.spread_cents,
+            )
             return False
 
         # Check market is still tradeable
         if not opportunity.market.is_tradeable:
+            add_decision(
+                asset=opportunity.market.asset,
+                action="SKIP",
+                reason="Market no longer tradeable",
+                up_price=opportunity.yes_price,
+                down_price=opportunity.no_price,
+                spread=opportunity.spread_cents,
+            )
             log.debug("Market no longer tradeable")
             return False
 
         # Check time remaining (at least 60 seconds)
         if opportunity.market.seconds_remaining < 60:
+            add_decision(
+                asset=opportunity.market.asset,
+                action="SKIP",
+                reason=f"Only {opportunity.market.seconds_remaining:.0f}s remaining",
+                up_price=opportunity.yes_price,
+                down_price=opportunity.no_price,
+                spread=opportunity.spread_cents,
+            )
             log.debug("Not enough time remaining")
             return False
 
         # Check that prices are valid (both > 0, sum < 1)
         if opportunity.yes_price <= 0 or opportunity.no_price <= 0:
+            add_decision(
+                asset=opportunity.market.asset,
+                action="SKIP",
+                reason="Invalid prices (zero or negative)",
+                up_price=opportunity.yes_price,
+                down_price=opportunity.no_price,
+                spread=opportunity.spread_cents,
+            )
             return False
 
         if opportunity.yes_price + opportunity.no_price >= 1.0:
+            add_decision(
+                asset=opportunity.market.asset,
+                action="SKIP",
+                reason=f"No arbitrage (sum={((opportunity.yes_price + opportunity.no_price) * 100):.1f}¢ >= 100¢)",
+                up_price=opportunity.yes_price,
+                down_price=opportunity.no_price,
+                spread=opportunity.spread_cents,
+            )
             return False
 
         return True
