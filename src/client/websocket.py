@@ -235,8 +235,19 @@ class PolymarketWebSocket:
         """Process incoming WebSocket messages."""
         async for message in self._ws:
             try:
+                # Handle PONG/PING text messages (not JSON)
+                if message in ("PONG", "PING"):
+                    continue
+
                 data = orjson.loads(message)
-                await self._handle_message(data)
+
+                # Polymarket sends arrays of events for batch updates
+                if isinstance(data, list):
+                    for item in data:
+                        if isinstance(item, dict):
+                            await self._handle_message(item)
+                else:
+                    await self._handle_message(data)
             except orjson.JSONDecodeError:
                 log.warning("Invalid JSON received", message=message[:100])
             except Exception as e:
