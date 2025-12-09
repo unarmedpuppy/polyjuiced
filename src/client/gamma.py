@@ -204,149 +204,139 @@ class GammaClient:
     ) -> List[Dict[str, Any]]:
         """Find active 15-minute up/down markets for an asset.
 
+        Uses direct Gamma API queries with calculated timestamps instead of
+        page scraping, providing real-time market data without lag.
+
         The 15-minute markets use time-based slugs like:
         - btc-updown-15m-{unix_timestamp}
         - eth-updown-15m-{unix_timestamp}
 
-        These markets are embedded in the Polymarket /crypto/15M page's
-        __NEXT_DATA__ JSON, not available through standard APIs.
-
         Args:
-            asset: Asset symbol (BTC, ETH, SOL, XRP)
+            asset: Asset symbol (BTC, ETH)
 
         Returns:
             List of 15-minute markets with UP/DOWN token IDs
         """
         import json
-        import re
+        import time
 
         fifteen_min_markets = []
         asset_lower = asset.lower()
 
         try:
-            # Fetch the crypto/15M page
-            response = await self._client.get(
-                "https://polymarket.com/crypto/15M",
-                headers={"User-Agent": "Mozilla/5.0 (compatible; PolymarketBot/1.0)"},
-                follow_redirects=True,
-            )
+            # Calculate current and upcoming market slots
+            # Markets are aligned to 15-minute boundaries (900 seconds)
+            current_ts = int(time.time())
+            slot_duration = 900  # 15 minutes in seconds
 
-            if response.status_code != 200:
-                log.warning(f"Failed to fetch /crypto/15M page: {response.status_code}")
-                return []
+            # Generate timestamps for current slot and next 3 slots
+            # This ensures we find upcoming tradeable markets
+            slot_timestamps = []
+            for i in range(4):  # Current + next 3 slots
+                slot_ts = ((current_ts // slot_duration) + i) * slot_duration
+                slot_timestamps.append(slot_ts)
 
-            html = response.text
-
-            # Extract __NEXT_DATA__ JSON from the page
-            next_data_match = re.search(
-                r'<script id="__NEXT_DATA__"[^>]*>([^<]+)</script>',
-                html
-            )
-
-            if not next_data_match:
-                log.warning("Could not find __NEXT_DATA__ in page")
-                return []
-
-            try:
-                next_data = json.loads(next_data_match.group(1))
-            except json.JSONDecodeError as e:
-                log.warning(f"Failed to parse __NEXT_DATA__: {e}")
-                return []
-
-            # Navigate to the queries containing market data
-            queries = (
-                next_data.get("props", {})
-                .get("pageProps", {})
-                .get("dehydratedState", {})
-                .get("queries", [])
-            )
-
-            # Track seen condition IDs to avoid duplicates
+            # Query each slot via Gamma API
             seen_condition_ids = set()
 
-            for query in queries:
-                state = query.get("state", {})
-                if not isinstance(state, dict):
-                    continue
-                data_obj = state.get("data", {})
-                if not isinstance(data_obj, dict):
-                    continue
-                pages = data_obj.get("pages", [])
-                if not isinstance(pages, list):
-                    continue
-                for page in pages:
-                    if not isinstance(page, dict):
+            for slot_ts in slot_timestamps:
+                slug = f"{asset_lower}-updown-15m-{slot_ts}"
+
+                try:
+                    response = await self._client.get(
+                        f"{self.base_url}/markets/slug/{slug}",
+                        timeout=10.0,
+                    )
+
+                    if response.status_code != 200:
+                        log.debug(f"Market not found for slot {slot_ts}", slug=slug)
                         continue
-                    events = page.get("events", [])
-                    if not isinstance(events, list):
+
+                    market = response.json()
+
+                    # Skip if we've seen this market
+                    condition_id = market.get("conditionId")
+                    if not condition_id or condition_id in seen_condition_ids:
                         continue
-                    for event in events:
-                        if not isinstance(event, dict):
-                            continue
-                        slug = event.get("slug", "")
+                    seen_condition_ids.add(condition_id)
 
-                        # Filter for the requested asset's 15m markets
-                        if not slug.startswith(f"{asset_lower}-updown-15m-"):
-                            continue
+                    # Parse clobTokenIds (JSON string)
+                    clob_token_ids_raw = market.get("clobTokenIds", "[]")
+                    if isinstance(clob_token_ids_raw, str):
+                        clob_token_ids = json.loads(clob_token_ids_raw)
+                    else:
+                        clob_token_ids = clob_token_ids_raw
 
-                        for market in event.get("markets", []):
-                            condition_id = market.get("conditionId")
+                    # Parse outcomes (JSON string)
+                    outcomes_raw = market.get("outcomes", "[]")
+                    if isinstance(outcomes_raw, str):
+                        outcomes = json.loads(outcomes_raw)
+                    else:
+                        outcomes = outcomes_raw
 
-                            # Skip duplicates
-                            if not condition_id or condition_id in seen_condition_ids:
-                                continue
-                            seen_condition_ids.add(condition_id)
+                    # Parse outcome prices (JSON string)
+                    prices_raw = market.get("outcomePrices", "[]")
+                    if isinstance(prices_raw, str):
+                        outcome_prices = json.loads(prices_raw)
+                    else:
+                        outcome_prices = prices_raw
 
-                            # Extract token IDs (Up, Down)
-                            clob_token_ids = market.get("clobTokenIds", [])
-                            outcomes = market.get("outcomes", [])
-                            outcome_prices = market.get("outcomePrices", [])
+                    if len(clob_token_ids) < 2 or len(outcomes) < 2:
+                        continue
 
-                            if len(clob_token_ids) < 2 or len(outcomes) < 2:
-                                continue
+                    # Map outcomes to token IDs ("Up" is index 0, "Down" is index 1)
+                    up_token = None
+                    down_token = None
+                    up_price = None
+                    down_price = None
 
-                            # Map outcomes to token IDs
-                            up_token = None
-                            down_token = None
-                            up_price = None
-                            down_price = None
+                    for i, outcome in enumerate(outcomes):
+                        outcome_lower = outcome.lower() if isinstance(outcome, str) else ""
+                        if outcome_lower == "up":
+                            up_token = clob_token_ids[i] if i < len(clob_token_ids) else None
+                            up_price = float(outcome_prices[i]) if i < len(outcome_prices) else None
+                        elif outcome_lower == "down":
+                            down_token = clob_token_ids[i] if i < len(clob_token_ids) else None
+                            down_price = float(outcome_prices[i]) if i < len(outcome_prices) else None
 
-                            for i, outcome in enumerate(outcomes):
-                                outcome_lower = outcome.lower()
-                                if outcome_lower == "up":
-                                    up_token = clob_token_ids[i]
-                                    up_price = float(outcome_prices[i]) if i < len(outcome_prices) else None
-                                elif outcome_lower == "down":
-                                    down_token = clob_token_ids[i]
-                                    down_price = float(outcome_prices[i]) if i < len(outcome_prices) else None
+                    if not up_token or not down_token:
+                        continue
 
-                            if not up_token or not down_token:
-                                continue
+                    # Parse end time
+                    end_date_str = market.get("endDate", "")
+                    end_ts = slot_ts  # Default to slot timestamp
+                    if end_date_str:
+                        try:
+                            from datetime import datetime
+                            # Parse ISO format: 2025-12-09T05:15:00Z
+                            end_dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                            end_ts = int(end_dt.timestamp())
+                        except Exception:
+                            pass
 
-                            # Extract timestamp from slug (e.g., btc-updown-15m-1765226700)
-                            try:
-                                end_ts = int(slug.split("-")[-1])
-                            except (ValueError, IndexError):
-                                end_ts = None
+                    market_data = {
+                        "condition_id": condition_id,
+                        "question": market.get("question", ""),
+                        "yes_token_id": up_token,  # "Up" maps to "Yes" for arbitrage
+                        "no_token_id": down_token,  # "Down" maps to "No"
+                        "up_price": up_price,
+                        "down_price": down_price,
+                        "end_timestamp": end_ts,
+                        "active": market.get("active", True),
+                        "accepting_orders": market.get("acceptingOrders", True),
+                        "market_slug": slug,
+                    }
+                    fifteen_min_markets.append(market_data)
 
-                            market_data = {
-                                "condition_id": condition_id,
-                                "question": market.get("question", event.get("title", "")),
-                                "yes_token_id": up_token,  # "Up" maps to "Yes" for arbitrage
-                                "no_token_id": down_token,  # "Down" maps to "No"
-                                "up_price": up_price,
-                                "down_price": down_price,
-                                "end_timestamp": end_ts,
-                                "active": True,
-                                "accepting_orders": True,  # Assume true if on page
-                                "market_slug": slug,
-                            }
-                            fifteen_min_markets.append(market_data)
+                except Exception as e:
+                    log.debug(f"Error fetching market slot {slot_ts}", error=str(e))
+                    continue
 
         except Exception as e:
             log.error(f"Error finding {asset} 15-min markets", error=str(e))
 
         log.info(
-            f"Found {len(fifteen_min_markets)} active 15-minute {asset} markets"
+            f"Found {len(fifteen_min_markets)} active 15-minute {asset} markets",
+            slots_checked=len(slot_timestamps) if 'slot_timestamps' in dir() else 0,
         )
         return fifteen_min_markets
