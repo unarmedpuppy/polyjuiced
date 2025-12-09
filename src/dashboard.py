@@ -851,11 +851,19 @@ DASHBOARD_HTML = """
                         if (d.action === 'YES' || d.action === 'TRADE') {
                             actionColor = 'var(--green)';
                             actionBg = 'rgba(0, 255, 65, 0.15)';
-                            decisionText = 'TRADE: YES';
+                            decisionText = 'ARB: YES';
                         } else if (d.action === 'NO' || d.action === 'SKIP') {
                             actionColor = 'var(--red)';
                             actionBg = 'rgba(255, 0, 64, 0.08)';
-                            decisionText = 'TRADE: NO';
+                            decisionText = 'ARB: NO';
+                        } else if (d.action === 'DIR_YES') {
+                            actionColor = 'var(--cyan)';
+                            actionBg = 'rgba(0, 255, 255, 0.15)';
+                            decisionText = 'DIR: YES';
+                        } else if (d.action === 'DIR_NO') {
+                            actionColor = 'var(--amber)';
+                            actionBg = 'rgba(255, 176, 0, 0.08)';
+                            decisionText = 'DIR: NO';
                         } else {
                             actionColor = 'var(--amber)';
                             actionBg = 'rgba(255, 176, 0, 0.08)';

@@ -18,7 +18,7 @@ import structlog
 from ..client.polymarket import PolymarketClient
 from ..client.websocket import PolymarketWebSocket
 from ..config import AppConfig, GabagoolConfig
-from ..dashboard import add_log, add_trade, add_decision, resolve_trade, update_stats, update_markets
+from ..dashboard import add_log, add_trade, add_decision, resolve_trade, update_stats, update_markets, stats
 from ..metrics import (
     ACTIVE_MARKETS,
     DAILY_EXPOSURE_USD,
@@ -65,6 +65,63 @@ class TradeResult:
     trade_id: Optional[str] = None  # Dashboard trade ID for resolution tracking
 
 
+@dataclass
+class DirectionalPosition:
+    """Tracks an open directional position."""
+
+    market: Market15Min
+    side: str  # "UP" or "DOWN"
+    entry_price: float
+    shares: float
+    cost: float
+    target_price: float  # Scaled take-profit target
+    stop_price: float  # Hard stop loss
+    entry_time: datetime
+    highest_price: float  # For trailing stop
+    trailing_active: bool = False
+    trade_id: Optional[str] = None
+
+    @property
+    def current_pnl_pct(self) -> float:
+        """Calculate current P&L percentage based on highest price seen."""
+        if self.entry_price <= 0:
+            return 0.0
+        return ((self.highest_price - self.entry_price) / self.entry_price) * 100
+
+    def update_price(self, current_price: float) -> None:
+        """Update highest price seen (for trailing stop)."""
+        if current_price > self.highest_price:
+            self.highest_price = current_price
+
+    def should_take_profit(self, current_price: float, trailing_distance: float) -> tuple:
+        """Check if we should take profit.
+
+        Returns:
+            Tuple of (should_exit, reason)
+        """
+        # Target hit
+        if current_price >= self.target_price:
+            return True, f"Target ${self.target_price:.2f} reached"
+
+        # Trailing stop triggered (once activated)
+        if self.trailing_active:
+            trailing_stop = self.highest_price - trailing_distance
+            if current_price <= trailing_stop:
+                return True, f"Trailing stop ${trailing_stop:.2f} triggered"
+
+        return False, ""
+
+    def should_stop_loss(self, current_price: float) -> tuple:
+        """Check if we should stop loss.
+
+        Returns:
+            Tuple of (should_exit, reason)
+        """
+        if current_price <= self.stop_price:
+            return True, f"Stop loss ${self.stop_price:.2f} hit"
+        return False, ""
+
+
 class GabagoolStrategy(BaseStrategy):
     """Gabagool asymmetric binary arbitrage strategy.
 
@@ -104,6 +161,9 @@ class GabagoolStrategy(BaseStrategy):
         self._last_reset: datetime = datetime.utcnow()
         # Track pending trades for resolution: {trade_id: TradeResult}
         self._pending_trades: Dict[str, TradeResult] = {}
+        # Track directional positions: {condition_id: DirectionalPosition}
+        self._directional_positions: Dict[str, DirectionalPosition] = {}
+        self._directional_daily_exposure: float = 0.0
 
     async def start(self) -> None:
         """Start the Gabagool strategy."""
@@ -156,11 +216,16 @@ class GabagoolStrategy(BaseStrategy):
                 # Find and track active markets
                 await self._update_active_markets()
 
-                # Get best opportunity
+                # Get best opportunity (arbitrage)
                 opportunity = self._tracker.get_best_opportunity()
 
                 if opportunity and opportunity.is_valid:
                     await self.on_opportunity(opportunity)
+
+                # Check directional strategy (runs alongside arbitrage)
+                if self.gabagool_config.directional_enabled:
+                    await self._check_directional_opportunities()
+                    await self._manage_directional_positions()
 
                 # Short sleep to prevent busy loop
                 await asyncio.sleep(0.1)
@@ -764,7 +829,401 @@ class GabagoolStrategy(BaseStrategy):
             self._daily_pnl = 0.0
             self._daily_trades = 0
             self._daily_exposure = 0.0
+            self._directional_daily_exposure = 0.0
             self._last_reset = now
+
+    async def _check_directional_opportunities(self) -> None:
+        """Check for directional trading opportunities on each market."""
+        cfg = self.gabagool_config
+
+        for condition_id, market in self._active_markets.items():
+            # Skip if already have a position in this market
+            if condition_id in self._directional_positions:
+                continue
+
+            # Get current prices from tracker
+            market_state = self._tracker.get_market_state(condition_id)
+            if not market_state or market_state.is_stale:
+                continue
+
+            up_price = market_state.yes_price
+            down_price = market_state.no_price
+
+            # Calculate time remaining percentage
+            total_duration = 15 * 60  # 15 minutes in seconds
+            time_remaining_pct = market.seconds_remaining / total_duration
+
+            # Check entry conditions
+            # 1. Must have > 80% time remaining
+            if time_remaining_pct < cfg.directional_time_threshold:
+                add_decision(
+                    asset=market.asset,
+                    action="DIR_NO",
+                    reason=f"Time {time_remaining_pct*100:.0f}% < {cfg.directional_time_threshold*100:.0f}% threshold",
+                    up_price=up_price,
+                    down_price=down_price,
+                    spread=(1.0 - up_price - down_price) * 100,
+                )
+                continue
+
+            # 2. Check if either side is cheap enough
+            cheaper_side = None
+            cheaper_price = None
+
+            if up_price < cfg.directional_entry_threshold and up_price <= down_price:
+                cheaper_side = "UP"
+                cheaper_price = up_price
+            elif down_price < cfg.directional_entry_threshold and down_price < up_price:
+                cheaper_side = "DOWN"
+                cheaper_price = down_price
+
+            if not cheaper_side:
+                add_decision(
+                    asset=market.asset,
+                    action="DIR_NO",
+                    reason=f"No side < ${cfg.directional_entry_threshold:.2f} (UP=${up_price:.2f}, DOWN=${down_price:.2f})",
+                    up_price=up_price,
+                    down_price=down_price,
+                    spread=(1.0 - up_price - down_price) * 100,
+                )
+                continue
+
+            # Calculate position size (1/3 of arb size)
+            directional_size = cfg.max_trade_size_usd * cfg.directional_size_ratio
+
+            # Check exposure limits
+            if self._directional_daily_exposure + directional_size > cfg.max_daily_exposure_usd * 0.5:
+                add_decision(
+                    asset=market.asset,
+                    action="DIR_NO",
+                    reason=f"Directional exposure limit reached",
+                    up_price=up_price,
+                    down_price=down_price,
+                    spread=(1.0 - up_price - down_price) * 100,
+                )
+                continue
+
+            # Calculate scaled target based on entry price
+            # Lower entry = higher target (better risk/reward)
+            target_price = self._calculate_scaled_target(cheaper_price)
+
+            # Entry conditions met - execute directional trade
+            add_decision(
+                asset=market.asset,
+                action="DIR_YES",
+                reason=f"{cheaper_side} ${cheaper_price:.2f} < ${cfg.directional_entry_threshold:.2f}, {time_remaining_pct*100:.0f}% time",
+                up_price=up_price,
+                down_price=down_price,
+                spread=(1.0 - up_price - down_price) * 100,
+            )
+
+            await self._execute_directional_trade(
+                market=market,
+                side=cheaper_side,
+                entry_price=cheaper_price,
+                size_usd=directional_size,
+                target_price=target_price,
+            )
+
+    def _calculate_scaled_target(self, entry_price: float) -> float:
+        """Calculate scaled take-profit target based on entry price.
+
+        Lower entry prices get more aggressive targets since risk/reward is better.
+
+        Args:
+            entry_price: Entry price (0-1)
+
+        Returns:
+            Target price for take-profit
+        """
+        cfg = self.gabagool_config
+
+        # Scale target: entry $0.20 -> target $0.40 (100% gain)
+        #               entry $0.25 -> target $0.45 (80% gain)
+        #               entry $0.30 -> target $0.50 (67% gain)
+        # Formula: target = entry * 2 (capped at base target)
+        scaled_target = entry_price * 2.0
+
+        # But don't go below base target
+        return max(scaled_target, cfg.directional_target_base)
+
+    async def _execute_directional_trade(
+        self,
+        market: Market15Min,
+        side: str,
+        entry_price: float,
+        size_usd: float,
+        target_price: float,
+    ) -> None:
+        """Execute a directional trade.
+
+        Args:
+            market: Market to trade
+            side: "UP" or "DOWN"
+            entry_price: Entry price
+            size_usd: Size in USD
+            target_price: Take-profit target
+        """
+        cfg = self.gabagool_config
+        shares = size_usd / entry_price
+
+        # Get market end time for display
+        market_end_time = None
+        if hasattr(market, "end_time") and market.end_time:
+            market_end_time = market.end_time.strftime("%H:%M")
+
+        if cfg.dry_run:
+            log.info(
+                "DRY RUN: Would execute directional trade",
+                asset=market.asset,
+                side=side,
+                entry_price=f"${entry_price:.2f}",
+                size=f"${size_usd:.2f}",
+                target=f"${target_price:.2f}",
+                stop=f"${cfg.directional_stop_loss:.2f}",
+            )
+
+            # Track the position
+            position = DirectionalPosition(
+                market=market,
+                side=side,
+                entry_price=entry_price,
+                shares=shares,
+                cost=size_usd,
+                target_price=target_price,
+                stop_price=cfg.directional_stop_loss,
+                entry_time=datetime.utcnow(),
+                highest_price=entry_price,
+            )
+            self._directional_positions[market.condition_id] = position
+            self._directional_daily_exposure += size_usd
+
+            # Log to dashboard
+            add_log(
+                "trade",
+                f"DIRECTIONAL: {market.asset} {side} @ ${entry_price:.2f}",
+                size=f"${size_usd:.2f}",
+                target=f"${target_price:.2f}",
+                stop=f"${cfg.directional_stop_loss:.2f}",
+                dry_run=True,
+            )
+            return
+
+        # Execute real trade
+        try:
+            token_id = market.yes_token_id if side == "UP" else market.no_token_id
+
+            api_result = await self.client.execute_single_order(
+                token_id=token_id,
+                side="BUY",
+                amount_usd=size_usd,
+                timeout_seconds=cfg.order_timeout_seconds,
+            )
+
+            if not api_result.get("success"):
+                add_log(
+                    "error",
+                    f"Directional trade failed: {api_result.get('error', 'Unknown')}",
+                    asset=market.asset,
+                    side=side,
+                )
+                return
+
+            # Track the position
+            position = DirectionalPosition(
+                market=market,
+                side=side,
+                entry_price=entry_price,
+                shares=shares,
+                cost=size_usd,
+                target_price=target_price,
+                stop_price=cfg.directional_stop_loss,
+                entry_time=datetime.utcnow(),
+                highest_price=entry_price,
+            )
+            self._directional_positions[market.condition_id] = position
+            self._directional_daily_exposure += size_usd
+
+            add_log(
+                "trade",
+                f"DIRECTIONAL: {market.asset} {side} @ ${entry_price:.2f}",
+                size=f"${size_usd:.2f}",
+                target=f"${target_price:.2f}",
+                stop=f"${cfg.directional_stop_loss:.2f}",
+                dry_run=False,
+            )
+
+        except Exception as e:
+            log.error("Directional trade execution failed", error=str(e))
+            add_log("error", f"Directional trade error: {str(e)}", asset=market.asset)
+
+    async def _manage_directional_positions(self) -> None:
+        """Manage open directional positions - check for exits."""
+        cfg = self.gabagool_config
+        positions_to_close = []
+
+        for condition_id, position in self._directional_positions.items():
+            market = position.market
+
+            # Get current price
+            market_state = self._tracker.get_market_state(condition_id)
+            if not market_state:
+                continue
+
+            current_price = market_state.yes_price if position.side == "UP" else market_state.no_price
+
+            # Update highest price seen
+            position.update_price(current_price)
+
+            # Check trailing stop activation
+            trailing_activation_price = position.target_price - cfg.directional_trailing_activation
+            if current_price >= trailing_activation_price and not position.trailing_active:
+                position.trailing_active = True
+                add_log(
+                    "info",
+                    f"Trailing stop activated for {market.asset} {position.side}",
+                    current=f"${current_price:.2f}",
+                    highest=f"${position.highest_price:.2f}",
+                )
+
+            # Calculate time remaining
+            total_duration = 15 * 60
+            time_remaining_pct = market.seconds_remaining / total_duration
+
+            # Check exit conditions
+            should_exit = False
+            exit_reason = ""
+            exit_profit = 0.0
+
+            # 1. Take profit check
+            take_profit, tp_reason = position.should_take_profit(
+                current_price, cfg.directional_trailing_distance
+            )
+            if take_profit:
+                should_exit = True
+                exit_reason = tp_reason
+                exit_profit = (current_price - position.entry_price) * position.shares
+
+            # 2. Stop loss check
+            if not should_exit:
+                stop_loss, sl_reason = position.should_stop_loss(current_price)
+                if stop_loss:
+                    should_exit = True
+                    exit_reason = sl_reason
+                    exit_profit = (current_price - position.entry_price) * position.shares
+
+            # 3. Time-based exit (< 20% time remaining)
+            if not should_exit and time_remaining_pct < 0.20:
+                # Check if profitable
+                current_pnl = (current_price - position.entry_price) * position.shares
+
+                if current_pnl > 0:
+                    # Profitable near expiry - HOLD TO RESOLUTION
+                    add_log(
+                        "info",
+                        f"HOLDING to resolution: {market.asset} {position.side}",
+                        pnl=f"+${current_pnl:.2f}",
+                        time_left=f"{time_remaining_pct*100:.0f}%",
+                    )
+                    # Don't exit - let it ride to resolution
+                else:
+                    # Unprofitable near expiry - cut losses
+                    should_exit = True
+                    exit_reason = f"Time exit (<20%), unprofitable"
+                    exit_profit = current_pnl
+
+            # 4. Market expired - force resolution
+            if not should_exit and market.seconds_remaining <= 0:
+                should_exit = True
+                exit_reason = "Market resolved"
+                # At resolution, price is either 1.00 or 0.00
+                # For dry run, simulate based on current price trend
+                if current_price > 0.5:
+                    exit_profit = (1.0 - position.entry_price) * position.shares
+                else:
+                    exit_profit = (0.0 - position.entry_price) * position.shares
+
+            if should_exit:
+                positions_to_close.append((condition_id, exit_reason, exit_profit, current_price))
+
+        # Close positions
+        for condition_id, reason, profit, exit_price in positions_to_close:
+            position = self._directional_positions[condition_id]
+            await self._close_directional_position(position, reason, profit, exit_price)
+            del self._directional_positions[condition_id]
+
+    async def _close_directional_position(
+        self,
+        position: DirectionalPosition,
+        reason: str,
+        profit: float,
+        exit_price: float,
+    ) -> None:
+        """Close a directional position.
+
+        Args:
+            position: Position to close
+            reason: Exit reason
+            profit: P&L amount
+            exit_price: Price at exit
+        """
+        cfg = self.gabagool_config
+        won = profit > 0
+
+        if cfg.dry_run:
+            log.info(
+                "DRY RUN: Would close directional position",
+                asset=position.market.asset,
+                side=position.side,
+                entry=f"${position.entry_price:.2f}",
+                exit=f"${exit_price:.2f}",
+                profit=f"${profit:.2f}",
+                reason=reason,
+            )
+        else:
+            # Execute real sell order
+            try:
+                token_id = (
+                    position.market.yes_token_id
+                    if position.side == "UP"
+                    else position.market.no_token_id
+                )
+
+                await self.client.execute_single_order(
+                    token_id=token_id,
+                    side="SELL",
+                    amount_shares=position.shares,
+                    timeout_seconds=cfg.order_timeout_seconds,
+                )
+            except Exception as e:
+                log.error("Failed to close directional position", error=str(e))
+
+        # Update P&L
+        self._daily_pnl += profit
+
+        # Log the exit
+        status = "WIN" if won else "LOSS"
+        add_log(
+            "resolution",
+            f"DIRECTIONAL {status}: {position.market.asset} {position.side}",
+            entry=f"${position.entry_price:.2f}",
+            exit=f"${exit_price:.2f}",
+            profit=f"${profit:+.2f}",
+            reason=reason,
+            dry_run=cfg.dry_run,
+        )
+
+        # Update dashboard stats
+        if won:
+            stats["wins"] = stats.get("wins", 0) + 1
+        else:
+            stats["losses"] = stats.get("losses", 0) + 1
+
+        update_stats(
+            daily_pnl=self._daily_pnl,
+            wins=stats.get("wins", 0),
+            losses=stats.get("losses", 0),
+        )
 
     def _is_daily_limit_reached(self) -> bool:
         """Check if daily limits have been reached."""

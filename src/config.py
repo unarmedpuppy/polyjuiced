@@ -76,7 +76,17 @@ class GabagoolConfig:
     ws_reconnect_delay_seconds: float = 1.0
 
     # Mode
-    dry_run: bool = True  # Start in dry-run mode
+    dry_run: bool = False  # LIVE mode enabled
+
+    # Directional trading settings
+    directional_enabled: bool = True
+    directional_entry_threshold: float = 0.25  # Max price to enter ($0.25)
+    directional_time_threshold: float = 0.80  # Min 80% time remaining
+    directional_size_ratio: float = 0.33  # 1/3 of arb trade size
+    directional_target_base: float = 0.45  # Base take-profit price
+    directional_stop_loss: float = 0.11  # Hard stop price
+    directional_trailing_activation: float = 0.05  # Trail starts when target - 5¢
+    directional_trailing_distance: float = 0.10  # 10¢ trailing stop
 
     @classmethod
     def from_env(cls) -> "GabagoolConfig":
@@ -93,7 +103,16 @@ class GabagoolConfig:
             max_slippage_cents=float(os.getenv("GABAGOOL_MAX_SLIPPAGE", "2.0")),
             order_timeout_seconds=float(os.getenv("GABAGOOL_ORDER_TIMEOUT", "0.5")),
             ws_reconnect_delay_seconds=float(os.getenv("GABAGOOL_WS_RECONNECT_DELAY", "1.0")),
-            dry_run=os.getenv("GABAGOOL_DRY_RUN", "true").lower() == "true",
+            dry_run=os.getenv("GABAGOOL_DRY_RUN", "false").lower() == "true",
+            # Directional trading
+            directional_enabled=os.getenv("GABAGOOL_DIRECTIONAL_ENABLED", "true").lower() == "true",
+            directional_entry_threshold=float(os.getenv("GABAGOOL_DIRECTIONAL_ENTRY_THRESHOLD", "0.25")),
+            directional_time_threshold=float(os.getenv("GABAGOOL_DIRECTIONAL_TIME_THRESHOLD", "0.80")),
+            directional_size_ratio=float(os.getenv("GABAGOOL_DIRECTIONAL_SIZE_RATIO", "0.33")),
+            directional_target_base=float(os.getenv("GABAGOOL_DIRECTIONAL_TARGET_BASE", "0.45")),
+            directional_stop_loss=float(os.getenv("GABAGOOL_DIRECTIONAL_STOP_LOSS", "0.11")),
+            directional_trailing_activation=float(os.getenv("GABAGOOL_DIRECTIONAL_TRAILING_ACTIVATION", "0.05")),
+            directional_trailing_distance=float(os.getenv("GABAGOOL_DIRECTIONAL_TRAILING_DISTANCE", "0.10")),
         )
 
 
