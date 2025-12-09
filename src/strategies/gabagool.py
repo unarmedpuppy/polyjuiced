@@ -207,7 +207,8 @@ class GabagoolStrategy(BaseStrategy):
         # Build market data for dashboard display
         # Include ALL discovered markets (not just tradeable) so dashboard shows status
         markets_data = {}
-        for market in markets:
+        all_markets = self.market_finder.all_discovered_markets
+        for market in all_markets:
             # Get current prices from tracker if available
             up_price = None
             down_price = None

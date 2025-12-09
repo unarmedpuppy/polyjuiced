@@ -60,6 +60,14 @@ class MarketFinder:
         self._last_refresh: Optional[datetime] = None
         self._cache_ttl = timedelta(minutes=1)
 
+    @property
+    def all_discovered_markets(self) -> List[Market15Min]:
+        """Return all discovered markets (including expired ones).
+
+        This is useful for dashboard display to show market status.
+        """
+        return list(self._cache.values())
+
     async def find_active_markets(
         self,
         assets: List[str] = None,
