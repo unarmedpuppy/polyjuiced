@@ -214,8 +214,11 @@ class GabagoolStrategy(BaseStrategy):
             down_price = None
             tracker = self._tracker._trackers.get(market.condition_id)
             if tracker:
-                up_price = tracker.yes_price
-                down_price = tracker.no_price
+                # Get market state which contains the prices
+                market_state = tracker.get_market_state(market.condition_id)
+                if market_state:
+                    up_price = market_state.yes_price
+                    down_price = market_state.no_price
 
             markets_data[market.condition_id] = {
                 "asset": market.asset,
