@@ -610,6 +610,53 @@ DASHBOARD_HTML = """
             document.getElementById('ws-status').classList.add('error');
         };
 
+        // Convert UTC timestamp to CST (UTC-6) for display
+        function utcToCst(utcTimeStr) {
+            // If already formatted as HH:MM:SS, convert it
+            if (!utcTimeStr) return 'N/A';
+
+            // Handle HH:MM:SS format (from server)
+            if (/^\\d{2}:\\d{2}:\\d{2}$/.test(utcTimeStr)) {
+                const [h, m, s] = utcTimeStr.split(':').map(Number);
+                const now = new Date();
+                const utcDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), h, m, s));
+                return utcDate.toLocaleTimeString('en-US', {
+                    timeZone: 'America/Chicago',
+                    hour12: false,
+                    hour: '2-digit',
+                    minute: '2-digit',
+                    second: '2-digit'
+                });
+            }
+
+            // Handle HH:MM UTC format (market end times)
+            if (/^\\d{2}:\\d{2} UTC$/.test(utcTimeStr)) {
+                const [timepart] = utcTimeStr.split(' ');
+                const [h, m] = timepart.split(':').map(Number);
+                const now = new Date();
+                const utcDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), h, m, 0));
+                return utcDate.toLocaleTimeString('en-US', {
+                    timeZone: 'America/Chicago',
+                    hour12: false,
+                    hour: '2-digit',
+                    minute: '2-digit'
+                }) + ' CST';
+            }
+
+            return utcTimeStr;
+        }
+
+        // Limit DOM children to prevent memory issues
+        const MAX_LOG_ENTRIES = 100;
+        const MAX_TRADE_ENTRIES = 50;
+        const MAX_DECISION_ENTRIES = 20;
+
+        function trimChildren(element, maxCount) {
+            while (element.children.length > maxCount) {
+                element.removeChild(element.lastChild);
+            }
+        }
+
         function updateDashboard(data) {
             if (data.stats) {
                 const s = data.stats;
@@ -658,13 +705,15 @@ DASHBOARD_HTML = """
                     const extra = log.extra ? ' <span class="log-extra">' + JSON.stringify(log.extra) + '</span>' : '';
 
                     line.innerHTML =
-                        '<span class="log-time">' + log.timestamp + '</span>' +
+                        '<span class="log-time">' + utcToCst(log.timestamp) + '</span>' +
                         '<span class="log-level ' + levelClass + '">[' + (log.level || 'INFO').toUpperCase() + ']</span>' +
                         '<span class="log-msg">' + log.message + '</span>' + extra;
 
                     terminal.appendChild(line);
                 });
 
+                // Trim old entries to prevent memory issues
+                trimChildren(terminal, MAX_LOG_ENTRIES);
                 terminal.scrollTop = terminal.scrollHeight;
                 document.getElementById('log-count').textContent = terminal.children.length;
             }
@@ -692,7 +741,7 @@ DASHBOARD_HTML = """
                     else if (status === 'loss') statusLabel = 'LOSS';
 
                     item.innerHTML = `
-                        <div class="trade-time">${trade.time}<br>${trade.market_time || ''}</div>
+                        <div class="trade-time">${utcToCst(trade.time)}<br>${utcToCst(trade.market_time) || ''}</div>
                         <div class="trade-info">
                             <div class="trade-asset">${trade.asset}</div>
                             <div class="trade-details">
@@ -713,6 +762,8 @@ DASHBOARD_HTML = """
                     tradeList.insertBefore(item, tradeList.firstChild);
                 });
 
+                // Trim old entries to prevent memory issues
+                trimChildren(tradeList, MAX_TRADE_ENTRIES);
                 document.getElementById('trade-count').textContent = tradeList.children.length;
             }
 
@@ -769,7 +820,7 @@ DASHBOARD_HTML = """
 
                         html += `<tr style="border-bottom: 1px solid var(--border); background: ${rowBg};">`;
                         html += `<td style="padding: 8px; color: var(--cyan); font-weight: bold;">${m.asset}</td>`;
-                        html += `<td style="padding: 8px; color: var(--dim-green);">${m.end_time || 'N/A'}</td>`;
+                        html += `<td style="padding: 8px; color: var(--dim-green);">${utcToCst(m.end_time) || 'N/A'}</td>`;
                         html += `<td style="padding: 8px; text-align: right; color: ${m.seconds_remaining > 60 ? 'var(--green)' : 'var(--red)'};">${timeLeft}</td>`;
                         html += `<td style="padding: 8px; text-align: right;">${m.up_price ? (m.up_price * 100).toFixed(1) + '¢' : 'N/A'}</td>`;
                         html += `<td style="padding: 8px; text-align: right;">${m.down_price ? (m.down_price * 100).toFixed(1) + '¢' : 'N/A'}</td>`;
@@ -792,7 +843,9 @@ DASHBOARD_HTML = """
                 if (data.decisions.length === 0) {
                     html = '<div style="padding: 15px; text-align: center; color: var(--dim-green);">Waiting for market evaluation...</div>';
                 } else {
-                    for (const d of data.decisions) {
+                    // Limit decisions shown to prevent memory issues
+                    const decisionsToShow = data.decisions.slice(0, MAX_DECISION_ENTRIES);
+                    for (const d of decisionsToShow) {
                         const actionColor = d.action === 'TRADE' ? 'var(--green)' :
                                            d.action === 'SKIP' ? 'var(--amber)' : 'var(--dim-green)';
                         const spreadColor = d.spread >= 2.0 ? 'var(--green)' :
@@ -800,7 +853,7 @@ DASHBOARD_HTML = """
 
                         html += `<div style="padding: 8px 12px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center;">`;
                         html += `<div style="flex: 1;">`;
-                        html += `<span style="color: var(--dim-green); font-size: 0.75rem;">${d.timestamp}</span> `;
+                        html += `<span style="color: var(--dim-green); font-size: 0.75rem;">${utcToCst(d.timestamp)}</span> `;
                         html += `<span style="color: var(--cyan); font-weight: bold;">${d.asset}</span> `;
                         html += `<span style="color: ${actionColor}; font-weight: bold;">[${d.action}]</span> `;
                         html += `<span style="color: var(--dim-green);">${d.reason}</span>`;
@@ -819,7 +872,19 @@ DASHBOARD_HTML = """
         }
 
         function updateTime() {
-            document.getElementById('current-time').textContent = new Date().toISOString();
+            // Display current time in CST
+            const now = new Date();
+            const cstTime = now.toLocaleString('en-US', {
+                timeZone: 'America/Chicago',
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit',
+                hour12: false
+            });
+            document.getElementById('current-time').textContent = cstTime + ' CST';
         }
         setInterval(updateTime, 1000);
         updateTime();
@@ -828,6 +893,11 @@ DASHBOARD_HTML = """
         function updateUptime() {
             if (!uptimeStart) return;
             const diff = Math.floor((Date.now() - uptimeStart) / 1000);
+            // Only show positive uptime
+            if (diff < 0) {
+                document.getElementById('uptime').textContent = '00:00:00';
+                return;
+            }
             const h = Math.floor(diff / 3600).toString().padStart(2, '0');
             const m = Math.floor((diff % 3600) / 60).toString().padStart(2, '0');
             const s = (diff % 60).toString().padStart(2, '0');
@@ -838,7 +908,13 @@ DASHBOARD_HTML = """
         fetch('/dashboard/state')
             .then(r => r.json())
             .then(data => {
-                uptimeStart = new Date(data.stats.uptime_start).getTime();
+                // Parse uptime_start as a UTC time
+                const startStr = data.stats.uptime_start;
+                if (startStr) {
+                    // Ensure it's parsed as UTC
+                    uptimeStart = new Date(startStr.endsWith('Z') ? startStr : startStr + 'Z').getTime();
+                }
+                updateUptime();
                 updateDashboard(data);
                 // Load existing trades
                 if (data.trades && data.trades.length > 0) {
