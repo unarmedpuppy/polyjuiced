@@ -239,13 +239,17 @@ class GabagoolStrategy(BaseStrategy):
                 spread_cents = (1.0 - up_price - down_price) * 100
                 min_spread = self.gabagool_config.min_spread_threshold * 100
                 if spread_cents >= min_spread:
-                    status = f"OPPORTUNITY! Spread {spread_cents:.1f}¢ >= {min_spread:.0f}¢"
+                    # Positive spread = arbitrage opportunity
+                    action = "YES"
+                    reason = f"Spread {spread_cents:.1f}¢ >= {min_spread:.0f}¢ threshold"
                 else:
-                    status = f"Spread {spread_cents:.1f}¢ < {min_spread:.0f}¢ threshold"
+                    # No opportunity - spread too small or negative
+                    action = "NO"
+                    reason = f"Spread {spread_cents:.1f}¢ < {min_spread:.0f}¢ threshold"
                 add_decision(
                     asset=market.asset,
-                    action="EVAL",
-                    reason=status,
+                    action=action,
+                    reason=reason,
                     up_price=up_price,
                     down_price=down_price,
                     spread=spread_cents,

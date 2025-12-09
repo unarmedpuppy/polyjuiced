@@ -846,19 +846,32 @@ DASHBOARD_HTML = """
                     // Limit decisions shown to prevent memory issues
                     const decisionsToShow = data.decisions.slice(0, MAX_DECISION_ENTRIES);
                     for (const d of decisionsToShow) {
-                        const actionColor = d.action === 'TRADE' ? 'var(--green)' :
-                                           d.action === 'SKIP' ? 'var(--amber)' : 'var(--dim-green)';
+                        // Determine colors based on action
+                        let actionColor, actionBg, decisionText;
+                        if (d.action === 'YES' || d.action === 'TRADE') {
+                            actionColor = 'var(--green)';
+                            actionBg = 'rgba(0, 255, 65, 0.15)';
+                            decisionText = 'TRADE: YES';
+                        } else if (d.action === 'NO' || d.action === 'SKIP') {
+                            actionColor = 'var(--red)';
+                            actionBg = 'rgba(255, 0, 64, 0.08)';
+                            decisionText = 'TRADE: NO';
+                        } else {
+                            actionColor = 'var(--amber)';
+                            actionBg = 'rgba(255, 176, 0, 0.08)';
+                            decisionText = d.action;
+                        }
                         const spreadColor = d.spread >= 2.0 ? 'var(--green)' :
                                            d.spread >= 0 ? 'var(--amber)' : 'var(--red)';
 
-                        html += `<div style="padding: 8px 12px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center;">`;
+                        html += `<div style="padding: 8px 12px; border-bottom: 1px solid var(--border); background: ${actionBg}; display: flex; justify-content: space-between; align-items: center;">`;
                         html += `<div style="flex: 1;">`;
                         html += `<span style="color: var(--dim-green); font-size: 0.75rem;">${utcToCst(d.timestamp)}</span> `;
                         html += `<span style="color: var(--cyan); font-weight: bold;">${d.asset}</span> `;
-                        html += `<span style="color: ${actionColor}; font-weight: bold;">[${d.action}]</span> `;
+                        html += `<span style="color: ${actionColor}; font-weight: bold; font-size: 1.1rem;">[${decisionText}]</span> `;
                         html += `<span style="color: var(--dim-green);">${d.reason}</span>`;
                         html += `</div>`;
-                        html += `<div style="text-align: right; min-width: 180px;">`;
+                        html += `<div style="text-align: right; min-width: 200px;">`;
                         html += `<span style="color: var(--dim-green);">Up:</span> <span>${d.up_price ? (d.up_price * 100).toFixed(1) + '¢' : 'N/A'}</span> `;
                         html += `<span style="color: var(--dim-green);">Down:</span> <span>${d.down_price ? (d.down_price * 100).toFixed(1) + '¢' : 'N/A'}</span> `;
                         html += `<span style="color: var(--dim-green);">Spread:</span> <span style="color: ${spreadColor}; font-weight: bold;">${d.spread.toFixed(1)}¢</span>`;
