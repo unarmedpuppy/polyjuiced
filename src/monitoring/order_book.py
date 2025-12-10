@@ -159,6 +159,13 @@ class OrderBookTracker:
         self._token_side[market.yes_token_id] = "yes"
         self._token_side[market.no_token_id] = "no"
 
+        log.info(
+            "Token mapping added",
+            yes_token=market.yes_token_id[:20] if market.yes_token_id else "None",
+            no_token=market.no_token_id[:20] if market.no_token_id else "None",
+            total_tokens=len(self._token_to_market),
+        )
+
         # Register handler and subscribe
         self.ws.on_book_update(self._handle_book_update)
         await self.ws.subscribe([market.yes_token_id, market.no_token_id])
