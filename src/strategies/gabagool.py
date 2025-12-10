@@ -164,6 +164,8 @@ class GabagoolStrategy(BaseStrategy):
         # Track directional positions: {condition_id: DirectionalPosition}
         self._directional_positions: Dict[str, DirectionalPosition] = {}
         self._directional_daily_exposure: float = 0.0
+        # Queue for opportunities detected by WebSocket (callback is sync, execution is async)
+        self._opportunity_queue: asyncio.Queue = asyncio.Queue()
 
     async def start(self) -> None:
         """Start the Gabagool strategy."""
@@ -185,6 +187,10 @@ class GabagoolStrategy(BaseStrategy):
             min_spread_cents=self.gabagool_config.min_spread_threshold * 100,
         )
 
+        # Register callback for IMMEDIATE opportunity detection
+        # This fires synchronously from WebSocket handler, so we queue for async execution
+        self._tracker._tracker.on_opportunity(self._queue_opportunity)
+
         # Start the main loop
         await self._run_loop()
 
@@ -197,13 +203,45 @@ class GabagoolStrategy(BaseStrategy):
             daily_trades=self._daily_trades,
         )
 
+    def _queue_opportunity(self, opportunity: ArbitrageOpportunity) -> None:
+        """Queue an opportunity for async execution (called from sync WebSocket handler)."""
+        try:
+            # Use put_nowait since we're in a sync context
+            self._opportunity_queue.put_nowait(opportunity)
+            log.info(
+                "QUEUED opportunity for immediate execution",
+                asset=opportunity.market.asset,
+                spread_cents=f"{opportunity.spread_cents:.1f}¢",
+            )
+        except asyncio.QueueFull:
+            log.warning("Opportunity queue full, dropping opportunity")
+
     async def _run_loop(self) -> None:
         """Main strategy loop."""
         last_balance_update = 0
+        last_market_update = 0
         balance_update_interval = 30  # Update balance every 30 seconds
+        market_update_interval = 30  # Update markets every 30 seconds (don't block opportunities)
 
         while self._running:
             try:
+                # PRIORITY 1: Process queued opportunities IMMEDIATELY
+                # These come from WebSocket callbacks and need instant execution
+                while not self._opportunity_queue.empty():
+                    try:
+                        opportunity = self._opportunity_queue.get_nowait()
+                        if opportunity.is_valid:
+                            log.info(
+                                "EXECUTING queued opportunity",
+                                asset=opportunity.market.asset,
+                                spread_cents=f"{opportunity.spread_cents:.1f}¢",
+                            )
+                            await self.on_opportunity(opportunity)
+                        else:
+                            log.debug("Queued opportunity expired", asset=opportunity.market.asset)
+                    except asyncio.QueueEmpty:
+                        break
+
                 # Reset daily counters if new day
                 self._check_daily_reset()
 
@@ -227,29 +265,29 @@ class GabagoolStrategy(BaseStrategy):
                     await asyncio.sleep(60)
                     continue
 
-                # Find and track active markets
-                await self._update_active_markets()
+                # Find and track active markets (only every 30s to not block opportunities)
+                if now - last_market_update >= market_update_interval:
+                    await self._update_active_markets()
+                    last_market_update = now
 
-                # Get best opportunity (arbitrage)
+                # Fallback: Also poll for opportunities in case callback missed any
                 opportunity = self._tracker.get_best_opportunity()
 
-                if opportunity:
+                if opportunity and opportunity.is_valid:
                     log.info(
-                        "Opportunity found by polling",
+                        "Opportunity found by polling (fallback)",
                         asset=opportunity.market.asset,
                         spread_cents=f"{opportunity.spread_cents:.1f}¢",
-                        is_valid=opportunity.is_valid,
                     )
-                    if opportunity.is_valid:
-                        await self.on_opportunity(opportunity)
+                    await self.on_opportunity(opportunity)
 
                 # Check directional strategy (runs alongside arbitrage)
                 if self.gabagool_config.directional_enabled:
                     await self._check_directional_opportunities()
                     await self._manage_directional_positions()
 
-                # Short sleep to prevent busy loop
-                await asyncio.sleep(0.1)
+                # Short sleep to prevent busy loop but stay responsive
+                await asyncio.sleep(0.05)
 
             except Exception as e:
                 log.error("Error in strategy loop", error=str(e))

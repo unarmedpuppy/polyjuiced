@@ -65,16 +65,11 @@ class MarketState:
 
     @property
     def is_stale(self) -> bool:
-        """Check if data is stale (> 60 seconds old).
-
-        Note: Increased from 10s to 60s because _update_active_markets()
-        takes ~30s per loop iteration, which was causing all states to be
-        marked stale before the strategy could poll for opportunities.
-        """
+        """Check if data is stale (> 10 seconds old)."""
         if not self.last_update:
             return True
         age = (datetime.utcnow() - self.last_update).total_seconds()
-        return age > 60
+        return age > 10
 
 
 @dataclass
