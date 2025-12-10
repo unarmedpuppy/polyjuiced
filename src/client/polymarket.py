@@ -163,7 +163,10 @@ class PolymarketClient:
         """
         self._ensure_connected()
         try:
-            result = self._client.get_balance_allowance()
+            from py_clob_client.clob_types import BalanceAllowanceParams
+            # Must pass params object - defaults work for USDC balance
+            params = BalanceAllowanceParams(signature_type=self.settings.signature_type)
+            result = self._client.get_balance_allowance(params)
             # Convert from raw values (6 decimals for USDC) to human-readable
             balance = float(result.get("balance", 0)) / 1e6
             allowance = float(result.get("allowance", 0)) / 1e6
