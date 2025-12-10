@@ -36,6 +36,8 @@ stats: Dict[str, Any] = {
     "all_time_trades": 0,
     "all_time_wins": 0,
     "all_time_losses": 0,
+    # Wallet balance
+    "wallet_balance": 0.0,
 }
 
 # Database reference (set during initialization)
@@ -453,11 +455,15 @@ DASHBOARD_HTML = """
                     <span id="uptime">00:00:00</span>
                     <span>UPTIME</span>
                 </div>
+                <div class="status-item" style="margin-left: 20px; padding-left: 20px; border-left: 1px solid var(--border);">
+                    <span style="color: var(--cyan); font-family: 'VT323', monospace; font-size: 1.2rem;">$<span id="wallet-balance">0.00</span></span>
+                    <span>WALLET</span>
+                </div>
             </div>
         </header>
 
         <div class="grid">
-            <!-- Daily Stats -->
+            <!-- Total Stats -->
             <div class="panel">
                 <div class="panel-header">
                     <span class="panel-title">[ P&L ]</span>
@@ -465,7 +471,7 @@ DASHBOARD_HTML = """
                 <div class="panel-body">
                     <div style="text-align: center;">
                         <div id="daily-pnl" class="stat-value" style="font-size: 2.5rem;">$0.00</div>
-                        <div class="stat-label">DAILY P&L</div>
+                        <div class="stat-label">TOTAL P&L</div>
                     </div>
                 </div>
             </div>
@@ -689,6 +695,11 @@ DASHBOARD_HTML = """
 
                 const wsEl = document.getElementById('ws-status');
                 wsEl.className = 'status-dot ' + (s.websocket === 'CONNECTED' ? '' : 'error');
+
+                // Update wallet balance
+                if (s.wallet_balance !== undefined) {
+                    document.getElementById('wallet-balance').textContent = s.wallet_balance.toFixed(2);
+                }
 
                 if (s.dry_run) {
                     document.getElementById('dry-run-banner').style.display = 'block';
@@ -936,11 +947,8 @@ DASHBOARD_HTML = """
                     uptimeStart = new Date(startStr.endsWith('Z') ? startStr : startStr + 'Z').getTime();
                 }
                 updateUptime();
+                // Load initial state - trades are included in data, no need to load separately
                 updateDashboard(data);
-                // Load existing trades
-                if (data.trades && data.trades.length > 0) {
-                    updateDashboard({trades: data.trades});
-                }
             });
     </script>
 </body>
@@ -1070,23 +1078,24 @@ async def init_persistence(db: "Database") -> None:
             if last_id.startswith("trade-"):
                 _trade_id_counter = int(last_id.split("-")[1])
 
-        # Load today's stats
-        today_stats = await db.get_today_stats()
-        if today_stats:
-            stats["daily_pnl"] = today_stats.get("pnl") or 0.0
-            stats["daily_trades"] = today_stats.get("trades") or 0
-            stats["wins"] = today_stats.get("wins") or 0
-            stats["losses"] = today_stats.get("losses") or 0
-            stats["pending"] = today_stats.get("pending") or 0
-            stats["daily_exposure"] = today_stats.get("exposure") or 0.0
-
-        # Load all-time stats
+        # Load all-time stats (primary display)
         all_time = await db.get_all_time_stats()
         if all_time:
             stats["all_time_pnl"] = all_time.get("total_pnl") or 0.0
             stats["all_time_trades"] = all_time.get("total_trades") or 0
             stats["all_time_wins"] = all_time.get("wins") or 0
             stats["all_time_losses"] = all_time.get("losses") or 0
+            # Use all-time stats for main display
+            stats["daily_pnl"] = stats["all_time_pnl"]
+            stats["daily_trades"] = stats["all_time_trades"]
+            stats["wins"] = stats["all_time_wins"]
+            stats["losses"] = stats["all_time_losses"]
+            stats["pending"] = all_time.get("pending") or 0
+
+        # Load today's stats for daily exposure tracking
+        today_stats = await db.get_today_stats()
+        if today_stats:
+            stats["daily_exposure"] = today_stats.get("exposure") or 0.0
 
         # Load recent logs
         recent_logs = await db.get_recent_logs(limit=100)

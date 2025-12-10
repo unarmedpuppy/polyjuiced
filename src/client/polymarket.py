@@ -155,6 +155,26 @@ class PolymarketClient:
     # L2 Methods (Authenticated, requires API credentials)
     # =========================================================================
 
+    def get_balance(self) -> Dict[str, Any]:
+        """Get wallet balance and allowance.
+
+        Returns:
+            Dictionary with 'balance' and 'allowance' keys (values in USDC)
+        """
+        self._ensure_connected()
+        try:
+            result = self._client.get_balance_allowance()
+            # Convert from raw values (6 decimals for USDC) to human-readable
+            balance = float(result.get("balance", 0)) / 1e6
+            allowance = float(result.get("allowance", 0)) / 1e6
+            return {
+                "balance": balance,
+                "allowance": allowance,
+            }
+        except Exception as e:
+            log.warning("Failed to get balance", error=str(e))
+            return {"balance": 0.0, "allowance": 0.0}
+
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),

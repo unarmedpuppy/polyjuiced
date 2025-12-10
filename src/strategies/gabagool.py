@@ -199,10 +199,24 @@ class GabagoolStrategy(BaseStrategy):
 
     async def _run_loop(self) -> None:
         """Main strategy loop."""
+        last_balance_update = 0
+        balance_update_interval = 30  # Update balance every 30 seconds
+
         while self._running:
             try:
                 # Reset daily counters if new day
                 self._check_daily_reset()
+
+                # Update wallet balance periodically
+                import time
+                now = time.time()
+                if now - last_balance_update >= balance_update_interval:
+                    try:
+                        balance_info = self.client.get_balance()
+                        update_stats(wallet_balance=balance_info.get("balance", 0.0))
+                        last_balance_update = now
+                    except Exception as e:
+                        log.debug("Failed to update balance", error=str(e))
 
                 # Check for resolved markets and update dashboard
                 await self._check_resolved_trades()
