@@ -212,6 +212,7 @@ class PolymarketClient:
         order_args = MarketOrderArgs(
             token_id=token_id,
             amount=amount_usd,
+            side=side.upper(),
         )
         return self._client.create_market_order(order_args)
 
