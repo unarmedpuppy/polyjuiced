@@ -242,6 +242,7 @@ class OrderBookTracker:
             update: Order book update from WebSocket
         """
         token_id = update.token_id
+        log.info("OrderBookTracker callback invoked", token_id=token_id[:20] if token_id else "None", best_bid=update.best_bid, best_ask=update.best_ask)
 
         # Find the market this token belongs to
         # The WebSocket returns full token IDs (77+ chars) while Gamma API
