@@ -159,13 +159,6 @@ class OrderBookTracker:
         self._token_side[market.yes_token_id] = "yes"
         self._token_side[market.no_token_id] = "no"
 
-        log.info(
-            "Token mapping added",
-            yes_token=market.yes_token_id[:20] if market.yes_token_id else "None",
-            no_token=market.no_token_id[:20] if market.no_token_id else "None",
-            total_tokens=len(self._token_to_market),
-        )
-
         # Register handler and subscribe
         self.ws.on_book_update(self._handle_book_update)
         await self.ws.subscribe([market.yes_token_id, market.no_token_id])
@@ -242,11 +235,10 @@ class OrderBookTracker:
             update: Order book update from WebSocket
         """
         token_id = update.token_id
-        log.info("OrderBookTracker callback invoked", token_id=token_id[:20] if token_id else "None", best_bid=update.best_bid, best_ask=update.best_ask)
 
         # Find the market this token belongs to
-        # The WebSocket returns full token IDs (77+ chars) while Gamma API
-        # returns truncated ones (20 chars). Use prefix matching.
+        # The WebSocket may return full token IDs (77+ chars) while Gamma API
+        # returns truncated ones (20 chars). Use prefix matching as fallback.
         condition_id = self._token_to_market.get(token_id)
         if not condition_id and token_id:
             # Try prefix matching - check if any stored token is a prefix of the incoming token
@@ -257,17 +249,17 @@ class OrderBookTracker:
                     self._token_to_market[token_id] = cid
                     if stored_token in self._token_side:
                         self._token_side[token_id] = self._token_side[stored_token]
-                    log.info("Token matched by prefix", short=stored_token[:16], full=token_id[:20])
+                    log.debug("Token matched by prefix", short=stored_token[:16], full=token_id[:20])
                     break
 
         if not condition_id:
-            # Only log once per unique token
+            # Only log once per unique token to avoid spam
             if not hasattr(self, '_unknown_tokens'):
                 self._unknown_tokens = set()
             token_prefix = token_id[:20] if token_id else "None"
             if token_prefix not in self._unknown_tokens:
                 self._unknown_tokens.add(token_prefix)
-                log.info("Token not in mapping", token_id=token_prefix, known_tokens=list(self._token_to_market.keys())[:4])
+                log.debug("Ignoring unknown token", token_id=token_prefix)
             return
 
         state = self._markets.get(condition_id)

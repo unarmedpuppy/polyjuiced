@@ -280,9 +280,9 @@ class PolymarketWebSocket:
             log.error("WebSocket error message", data=data)
         elif msg_type is None:
             # Log raw message for debugging unknown formats
-            log.info("WS message without type", keys=list(data.keys())[:10])
+            log.debug("WS message without type", keys=list(data.keys())[:10])
         else:
-            log.info("WS unknown message type", type=msg_type, keys=list(data.keys())[:5])
+            log.debug("WS unknown message type", type=msg_type, keys=list(data.keys())[:5])
 
     async def _handle_book_update(self, data: Dict[str, Any]) -> None:
         """Handle order book update message."""
@@ -323,13 +323,10 @@ class PolymarketWebSocket:
                 midpoint=midpoint,
             )
 
-            log.debug("Calling book update callback", token_id=token_id[:20] if token_id else "None", best_bid=best_bid, best_ask=best_ask)
             self._on_book_update(update)
-            log.debug("Book update callback completed")
 
         except Exception as e:
-            import traceback
-            log.error("Error parsing book update", error=str(e), traceback=traceback.format_exc())
+            log.error("Error parsing book update", error=str(e))
 
     async def _handle_price_change(self, data: Dict[str, Any]) -> None:
         """Handle price change message."""
