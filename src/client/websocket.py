@@ -323,10 +323,13 @@ class PolymarketWebSocket:
                 midpoint=midpoint,
             )
 
+            log.debug("Calling book update callback", token_id=token_id[:20] if token_id else "None", best_bid=best_bid, best_ask=best_ask)
             self._on_book_update(update)
+            log.debug("Book update callback completed")
 
         except Exception as e:
-            log.error("Error parsing book update", error=str(e))
+            import traceback
+            log.error("Error parsing book update", error=str(e), traceback=traceback.format_exc())
 
     async def _handle_price_change(self, data: Dict[str, Any]) -> None:
         """Handle price change message."""
