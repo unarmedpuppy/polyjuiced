@@ -276,6 +276,86 @@ class PolymarketClient:
         return self._client.get_trades()
 
     # =========================================================================
+    # Single-Leg Execution (for directional trades)
+    # =========================================================================
+
+    async def execute_single_order(
+        self,
+        token_id: str,
+        side: str,
+        amount_usd: float = None,
+        amount_shares: float = None,
+        timeout_seconds: float = 0.5,
+    ) -> Dict[str, Any]:
+        """Execute a single order for directional trades.
+
+        Args:
+            token_id: The YES or NO token ID
+            side: "BUY" or "SELL"
+            amount_usd: Dollar amount (for BUY orders)
+            amount_shares: Share amount (for SELL orders)
+            timeout_seconds: Timeout for order placement
+
+        Returns:
+            Dict with 'order', 'success' keys
+        """
+        log.info(
+            "Executing single order",
+            token_id=token_id,
+            side=side,
+            amount_usd=amount_usd,
+            amount_shares=amount_shares,
+        )
+
+        async def place_order():
+            if side.upper() == "BUY":
+                return self.create_market_order(token_id, amount_usd, "BUY")
+            else:
+                # For SELL, use limit order at current price to ensure fill
+                # Get current price and sell at slightly below market
+                try:
+                    price = self.get_price(token_id, "sell")
+                    # Sell at 1 tick below to ensure fill
+                    sell_price = max(0.01, price - 0.01)
+                    return self.create_limit_order(
+                        token_id=token_id,
+                        price=sell_price,
+                        size=amount_shares,
+                        side="SELL",
+                        order_type="FOK",  # Fill-or-Kill for immediate execution
+                    )
+                except Exception as e:
+                    log.error("Failed to get sell price", error=str(e))
+                    raise
+
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(place_order),
+                timeout=timeout_seconds,
+            )
+
+            return {
+                "order": result,
+                "success": True,
+            }
+
+        except asyncio.TimeoutError:
+            log.error("Single order timed out")
+            return {
+                "order": None,
+                "success": False,
+                "error": "timeout",
+            }
+
+        except Exception as e:
+            log.error("Single order failed", error=str(e))
+            return {
+                "order": None,
+                "success": False,
+                "error": str(e),
+            }
+
+    # =========================================================================
     # Dual-Leg Execution (for Gabagool strategy)
     # =========================================================================
 
@@ -373,15 +453,8 @@ class PolymarketClient:
     # Market Resolution
     # =========================================================================
 
-    def get_market_resolution(self, condition_id: str) -> Optional[Dict[str, Any]]:
-        """Get resolution status for a market.
-
-        Args:
-            condition_id: The market condition ID
-
-        Returns:
-            Resolution data if resolved, None if not yet resolved
-        """
+    def _get_market_resolution_sync(self, condition_id: str) -> Optional[Dict[str, Any]]:
+        """Synchronous implementation of get_market_resolution."""
         self._ensure_connected()
         try:
             market = self._client.get_market(condition_id)
@@ -396,6 +469,17 @@ class PolymarketClient:
         except Exception as e:
             log.error("Failed to get market resolution", error=str(e))
             return None
+
+    async def get_market_resolution(self, condition_id: str) -> Optional[Dict[str, Any]]:
+        """Get resolution status for a market (async).
+
+        Args:
+            condition_id: The market condition ID
+
+        Returns:
+            Resolution data if resolved, None if not yet resolved
+        """
+        return await asyncio.to_thread(self._get_market_resolution_sync, condition_id)
 
     # =========================================================================
     # Async wrappers for main.py compatibility
