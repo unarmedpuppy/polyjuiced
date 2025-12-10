@@ -632,6 +632,26 @@ class GabagoolStrategy(BaseStrategy):
         min_shares = min(yes_shares, no_shares)
         expected_profit = min_shares - total_cost
 
+        # CRITICAL: Validate expected profit is positive before executing
+        if expected_profit <= 0:
+            log.warning(
+                "Rejecting trade with non-positive expected profit",
+                asset=market.asset,
+                expected_profit=f"${expected_profit:.4f}",
+                yes_shares=yes_shares,
+                no_shares=no_shares,
+                total_cost=total_cost,
+            )
+            add_decision(
+                asset=market.asset,
+                action="REJECT",
+                reason=f"Expected profit ${expected_profit:.2f} <= $0 (math error)",
+                up_price=opportunity.yes_price,
+                down_price=opportunity.no_price,
+                spread=opportunity.spread_cents,
+            )
+            return None
+
         # Get market end time for dashboard display
         market_end_time = None
         if hasattr(market, "end_time") and market.end_time:
