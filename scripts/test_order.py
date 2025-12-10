@@ -47,8 +47,10 @@ async def test_order():
 
     market = markets[0]
     print(f'\nTest market: {market.slug}')
-    print(f'YES token: {market.yes_token_id[:20]}...')
-    print(f'NO token: {market.no_token_id[:20]}...')
+    yes_token = market.yes_token_id
+    no_token = market.no_token_id
+    print(f'YES token: {yes_token[:20]}...')
+    print(f'NO token: {no_token[:20]}...')
     print(f'End time: {market.end_time}')
 
     # Get current prices
