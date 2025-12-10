@@ -574,7 +574,11 @@ class GabagoolStrategy(BaseStrategy):
     ) -> tuple:
         """Calculate optimal position sizes for YES and NO.
 
-        Uses inverse weighting: buy more of the cheaper side.
+        For arbitrage profit, we need EQUAL SHARES of YES and NO.
+        At resolution, one side pays $1, one pays $0.
+        Profit = num_shares * $1 - (num_shares * yes_price + num_shares * no_price)
+               = num_shares * (1 - yes_price - no_price)
+               = num_shares * spread
 
         Args:
             budget: Total USD budget for this trade
@@ -584,24 +588,26 @@ class GabagoolStrategy(BaseStrategy):
         Returns:
             Tuple of (yes_amount_usd, no_amount_usd)
         """
-        total_price = yes_price + no_price
+        cost_per_pair = yes_price + no_price
 
-        if total_price <= 0:
+        if cost_per_pair <= 0 or cost_per_pair >= 1.0:
             return (0.0, 0.0)
 
-        # Inverse weighting: allocate more to cheaper side
-        # If YES is cheaper (0.40), we want more YES
-        # If NO is cheaper (0.45), we want more NO
-        yes_weight = no_price / total_price  # Higher when YES is cheaper
-        no_weight = yes_price / total_price  # Higher when NO is cheaper
+        # Calculate how many share pairs we can buy with our budget
+        num_pairs = budget / cost_per_pair
 
-        yes_amount = budget * yes_weight
-        no_amount = budget * no_weight
+        # Equal shares means different dollar amounts
+        # Spend MORE on the expensive side to get equal shares
+        yes_amount = num_pairs * yes_price
+        no_amount = num_pairs * no_price
 
         # Ensure we don't exceed individual trade limits
         max_single = self.gabagool_config.max_trade_size_usd
-        yes_amount = min(yes_amount, max_single)
-        no_amount = min(no_amount, max_single)
+        if yes_amount > max_single or no_amount > max_single:
+            # Scale down proportionally
+            scale = max_single / max(yes_amount, no_amount)
+            yes_amount *= scale
+            no_amount *= scale
 
         return (yes_amount, no_amount)
 
