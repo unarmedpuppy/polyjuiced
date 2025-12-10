@@ -280,12 +280,14 @@ class PolymarketWebSocket:
             log.error("WebSocket error message", data=data)
         elif msg_type is None:
             # Log raw message for debugging unknown formats
-            log.debug("Message without type", keys=list(data.keys())[:5])
+            log.info("WS message without type", keys=list(data.keys())[:10])
         else:
-            log.debug("Unknown message type", type=msg_type)
+            log.info("WS unknown message type", type=msg_type, keys=list(data.keys())[:5])
 
     async def _handle_book_update(self, data: Dict[str, Any]) -> None:
         """Handle order book update message."""
+        token_id = data.get("asset_id", data.get("token_id"))
+        log.info("WS book update received", token_id=token_id[:16] if token_id else "None", has_callback=self._on_book_update is not None)
         if not self._on_book_update:
             return
 
