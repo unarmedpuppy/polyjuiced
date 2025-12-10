@@ -290,13 +290,11 @@ class PolymarketWebSocket:
         # Always convert to string for comparison
         raw_token = data.get("asset_id", data.get("token_id"))
         token_id = str(raw_token) if raw_token is not None else None
-        log.info("WS book update received", token_id=token_id, token_type=type(raw_token).__name__, has_callback=self._on_book_update is not None)
+
         if not self._on_book_update:
             return
 
         try:
-            # Ensure token_id is a string (already converted above)
-            pass  # token_id already set
             bids = data.get("bids", [])
             asks = data.get("asks", [])
 

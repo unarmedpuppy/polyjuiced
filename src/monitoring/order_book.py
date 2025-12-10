@@ -244,9 +244,29 @@ class OrderBookTracker:
         token_id = update.token_id
 
         # Find the market this token belongs to
+        # The WebSocket returns full token IDs (77+ chars) while Gamma API
+        # returns truncated ones (20 chars). Use prefix matching.
         condition_id = self._token_to_market.get(token_id)
+        if not condition_id and token_id:
+            # Try prefix matching - check if any stored token is a prefix of the incoming token
+            for stored_token, cid in self._token_to_market.items():
+                if token_id.startswith(stored_token):
+                    condition_id = cid
+                    # Also store the full token for future lookups
+                    self._token_to_market[token_id] = cid
+                    if stored_token in self._token_side:
+                        self._token_side[token_id] = self._token_side[stored_token]
+                    log.info("Token matched by prefix", short=stored_token[:16], full=token_id[:20])
+                    break
+
         if not condition_id:
-            log.info("Token not in mapping", token_id=token_id[:20] if token_id else "None", known_tokens=list(self._token_to_market.keys())[:4])
+            # Only log once per unique token
+            if not hasattr(self, '_unknown_tokens'):
+                self._unknown_tokens = set()
+            token_prefix = token_id[:20] if token_id else "None"
+            if token_prefix not in self._unknown_tokens:
+                self._unknown_tokens.add(token_prefix)
+                log.info("Token not in mapping", token_id=token_prefix, known_tokens=list(self._token_to_market.keys())[:4])
             return
 
         state = self._markets.get(condition_id)
