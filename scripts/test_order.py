@@ -46,17 +46,25 @@ async def test_order():
         return
 
     market = markets[0]
-    print(f'\nTest market: {market.slug}')
-    yes_token = market.yes_token_id
-    no_token = market.no_token_id
-    print(f'YES token: {yes_token[:20]}...')
-    print(f'NO token: {no_token[:20]}...')
-    print(f'End time: {market.end_time}')
+    # find_15min_markets returns dicts
+    slug = market.get('slug', 'unknown')
+    yes_token = market.get('yes_token_id') or market.get('up_token_id')
+    no_token = market.get('no_token_id') or market.get('down_token_id')
+
+    print(f'\nTest market: {slug}')
+    print(f'YES token: {yes_token[:20] if yes_token else "None"}...')
+    print(f'NO token: {no_token[:20] if no_token else "None"}...')
+    print(f'End time: {market.get("end_time")}')
+
+    if not yes_token or not no_token:
+        print('ERROR: Could not get token IDs')
+        print(f'Market data: {market}')
+        return
 
     # Get current prices
     try:
-        yes_price = client.get_price(market.yes_token_id, 'buy')
-        no_price = client.get_price(market.no_token_id, 'buy')
+        yes_price = client.get_price(yes_token, 'buy')
+        no_price = client.get_price(no_token, 'buy')
         print(f'\nCurrent prices:')
         print(f'  YES: ${yes_price:.4f}')
         print(f'  NO: ${no_price:.4f}')
@@ -73,7 +81,7 @@ async def test_order():
 
     try:
         result = client.create_market_order(
-            token_id=market.yes_token_id,
+            token_id=yes_token,
             amount_usd=test_amount,
             side='BUY'
         )
@@ -81,6 +89,8 @@ async def test_order():
         print('\nSUCCESS: Order API is working!')
     except Exception as e:
         print(f'Order FAILED: {e}')
+        import traceback
+        traceback.print_exc()
         print('\nThis error tells us what is wrong with order execution')
 
 
