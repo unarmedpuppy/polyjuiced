@@ -233,8 +233,15 @@ class GabagoolStrategy(BaseStrategy):
                 # Get best opportunity (arbitrage)
                 opportunity = self._tracker.get_best_opportunity()
 
-                if opportunity and opportunity.is_valid:
-                    await self.on_opportunity(opportunity)
+                if opportunity:
+                    log.info(
+                        "Opportunity found by polling",
+                        asset=opportunity.market.asset,
+                        spread_cents=f"{opportunity.spread_cents:.1f}¢",
+                        is_valid=opportunity.is_valid,
+                    )
+                    if opportunity.is_valid:
+                        await self.on_opportunity(opportunity)
 
                 # Check directional strategy (runs alongside arbitrage)
                 if self.gabagool_config.directional_enabled:
