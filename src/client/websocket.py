@@ -286,13 +286,17 @@ class PolymarketWebSocket:
 
     async def _handle_book_update(self, data: Dict[str, Any]) -> None:
         """Handle order book update message."""
-        token_id = data.get("asset_id", data.get("token_id"))
-        log.info("WS book update received", token_id=token_id[:16] if token_id else "None", has_callback=self._on_book_update is not None)
+        # Token IDs are large integers that lose precision when parsed as numbers
+        # Always convert to string for comparison
+        raw_token = data.get("asset_id", data.get("token_id"))
+        token_id = str(raw_token) if raw_token is not None else None
+        log.info("WS book update received", token_id=token_id, token_type=type(raw_token).__name__, has_callback=self._on_book_update is not None)
         if not self._on_book_update:
             return
 
         try:
-            token_id = data.get("asset_id", data.get("token_id"))
+            # Ensure token_id is a string (already converted above)
+            pass  # token_id already set
             bids = data.get("bids", [])
             asks = data.get("asks", [])
 
