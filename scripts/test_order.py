@@ -63,16 +63,33 @@ async def test_order():
 
     # Get current prices
     try:
-        yes_price = client.get_price(yes_token, 'buy')
-        no_price = client.get_price(no_token, 'buy')
-        print(f'\nCurrent prices:')
+        yes_price_raw = client._client.get_price(yes_token, 'buy')
+        no_price_raw = client._client.get_price(no_token, 'buy')
+        print(f'\nRaw price responses:')
+        print(f'  YES: {yes_price_raw} (type: {type(yes_price_raw).__name__})')
+        print(f'  NO: {no_price_raw} (type: {type(no_price_raw).__name__})')
+
+        # Handle dict response (price might be in a 'price' key)
+        if isinstance(yes_price_raw, dict):
+            yes_price = float(yes_price_raw.get('price', yes_price_raw.get('mid', 0.5)))
+        else:
+            yes_price = float(yes_price_raw)
+
+        if isinstance(no_price_raw, dict):
+            no_price = float(no_price_raw.get('price', no_price_raw.get('mid', 0.5)))
+        else:
+            no_price = float(no_price_raw)
+
+        print(f'\nParsed prices:')
         print(f'  YES: ${yes_price:.4f}')
         print(f'  NO: ${no_price:.4f}')
         print(f'  Sum: ${yes_price + no_price:.4f}')
         print(f'  Spread: {(1.0 - yes_price - no_price) * 100:.2f} cents')
     except Exception as e:
         print(f'Error getting prices: {e}')
-        return
+        import traceback
+        traceback.print_exc()
+        print('\nContinuing to order test anyway...')
 
     # Test placing a VERY small order ($0.10) - just to verify API works
     test_amount = 0.10
