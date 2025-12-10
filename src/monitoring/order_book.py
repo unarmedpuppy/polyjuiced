@@ -239,6 +239,7 @@ class OrderBookTracker:
         # Find the market this token belongs to
         condition_id = self._token_to_market.get(token_id)
         if not condition_id:
+            log.info("Token not in mapping", token_id=token_id[:20] if token_id else "None", known_tokens=list(self._token_to_market.keys())[:4])
             return
 
         state = self._markets.get(condition_id)
