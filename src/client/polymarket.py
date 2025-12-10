@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 
 import structlog
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
+from py_clob_client.clob_types import ApiCreds, MarketOrderArgs, OrderArgs, OrderType
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from ..config import PolymarketSettings
@@ -208,11 +208,12 @@ class PolymarketClient:
             amount=amount_usd,
             side=side,
         )
-        return self._client.create_market_order(
+        # py-clob-client requires MarketOrderArgs object
+        order_args = MarketOrderArgs(
             token_id=token_id,
             amount=amount_usd,
-            side=side.upper(),
         )
+        return self._client.create_market_order(order_args)
 
     @retry(
         stop=stop_after_attempt(3),
