@@ -751,10 +751,15 @@ DASHBOARD_HTML = """
                     if (status === 'win') statusLabel = 'WIN';
                     else if (status === 'loss') statusLabel = 'LOSS';
 
+                    const tradeUrl = trade.market_slug ? `https://polymarket.com/event/${trade.market_slug}` : null;
+                    const tradeAssetDisplay = tradeUrl
+                        ? `<a href="${tradeUrl}" target="_blank" style="color: inherit; text-decoration: none;">${trade.asset} ↗</a>`
+                        : trade.asset;
+
                     item.innerHTML = `
                         <div class="trade-time">${utcToCst(trade.time)}<br>${utcToCst(trade.market_time) || ''}</div>
                         <div class="trade-info">
-                            <div class="trade-asset">${trade.asset}</div>
+                            <div class="trade-asset">${tradeAssetDisplay}</div>
                             <div class="trade-details">
                                 YES: $${trade.yes_cost.toFixed(2)} @ ${(trade.yes_price * 100).toFixed(1)}¢ |
                                 NO: $${trade.no_cost.toFixed(2)} @ ${(trade.no_price * 100).toFixed(1)}¢ |
@@ -830,7 +835,11 @@ DASHBOARD_HTML = """
                         const timeLeft = m.seconds_remaining > 0 ? `${mins}m ${secs}s` : 'ENDED';
 
                         html += `<tr style="border-bottom: 1px solid var(--border); background: ${rowBg};">`;
-                        html += `<td style="padding: 8px; color: var(--cyan); font-weight: bold;">${m.asset}</td>`;
+                        const marketUrl = m.slug ? `https://polymarket.com/event/${m.slug}` : null;
+                        const assetDisplay = marketUrl
+                            ? `<a href="${marketUrl}" target="_blank" style="color: var(--cyan); text-decoration: none; font-weight: bold;">${m.asset} ↗</a>`
+                            : m.asset;
+                        html += `<td style="padding: 8px; color: var(--cyan); font-weight: bold;">${assetDisplay}</td>`;
                         html += `<td style="padding: 8px; color: var(--dim-green);">${utcToCst(m.end_time) || 'N/A'}</td>`;
                         html += `<td style="padding: 8px; text-align: right; color: ${m.seconds_remaining > 60 ? 'var(--green)' : 'var(--red)'};">${timeLeft}</td>`;
                         html += `<td style="padding: 8px; text-align: right;">${m.up_price ? (m.up_price * 100).toFixed(1) + '¢' : 'N/A'}</td>`;
@@ -1255,6 +1264,7 @@ def add_trade(
         "actual_profit": None,
         "status": "pending",
         "dry_run": dry_run,
+        "market_slug": market_slug,
     }
 
     trade_history.append(trade)

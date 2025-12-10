@@ -311,6 +311,7 @@ class GabagoolStrategy(BaseStrategy):
                 "down_price": down_price,
                 "is_tradeable": market.is_tradeable,
                 "question": market.question[:60] + "..." if len(market.question) > 60 else market.question,
+                "slug": market.slug,
             }
 
             # Log evaluation for tradeable markets with valid prices
@@ -683,6 +684,7 @@ class GabagoolStrategy(BaseStrategy):
                 spread=opportunity.spread_cents,
                 expected_profit=expected_profit,
                 market_end_time=market_end_time,
+                market_slug=market.slug,
                 dry_run=True,
             )
 
@@ -741,6 +743,7 @@ class GabagoolStrategy(BaseStrategy):
                 spread=opportunity.spread_cents,
                 expected_profit=expected_profit,
                 market_end_time=market_end_time,
+                market_slug=market.slug,
                 dry_run=False,
             )
 

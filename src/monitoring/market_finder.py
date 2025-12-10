@@ -29,6 +29,7 @@ class Market15Min:
     active: bool = True
     up_price: Optional[float] = None  # Price from Gamma API (0-1)
     down_price: Optional[float] = None  # Price from Gamma API (0-1)
+    slug: Optional[str] = None  # Market slug for Polymarket URL
 
     @property
     def time_remaining(self) -> timedelta:
@@ -200,6 +201,7 @@ class MarketFinder:
                 active=raw.get("active", True),
                 up_price=raw.get("up_price"),
                 down_price=raw.get("down_price"),
+                slug=raw.get("market_slug"),
             )
 
         except Exception as e:
