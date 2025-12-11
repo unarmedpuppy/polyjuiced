@@ -32,6 +32,7 @@ def main():
     api_passphrase = os.getenv("POLYMARKET_API_PASSPHRASE", "")
     proxy_wallet = os.getenv("POLYMARKET_PROXY_WALLET", "")
     clob_url = os.getenv("POLYMARKET_CLOB_HTTP_URL", "https://clob.polymarket.com")
+    signature_type = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "1"))
 
     print(f"\nDry run mode: {dry_run}")
     if dry_run:
@@ -44,11 +45,12 @@ def main():
 
     # Initialize CLOB client directly
     print("\n[1/4] Connecting to Polymarket CLOB...")
+    print(f"       Signature type: {signature_type}")
     client = ClobClient(
         host=clob_url,
         key=private_key,
         chain_id=137,  # Polygon Mainnet
-        signature_type=2,  # POLY_GNOSIS_SAFE
+        signature_type=signature_type,
         funder=proxy_wallet or None,
     )
 
@@ -72,7 +74,7 @@ def main():
     # Check balance
     print("\n[2/4] Checking balance...")
     try:
-        params = BalanceAllowanceParams(asset_type="COLLATERAL", signature_type=2)
+        params = BalanceAllowanceParams(asset_type="COLLATERAL", signature_type=signature_type)
         balance_info = client.get_balance_allowance(params)
         balance = float(balance_info.get("balance", 0)) / 1e6  # Convert from USDC decimals
         print(f"       Balance: ${balance:.2f}")
