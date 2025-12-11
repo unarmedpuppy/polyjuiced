@@ -152,8 +152,8 @@ def main():
     print(f"       UP token: {token_id[:30]}...")
     print(f"       UP price: ${token_price:.3f}")
 
-    # Execute trade
-    trade_amount = 1.00
+    # Execute trade - use $5 which is Polymarket's minimum order size
+    trade_amount = 5.00
 
     print(f"\n[4/4] Executing trade...")
     print(f"       Action: BUY ${trade_amount:.2f} of UP")
