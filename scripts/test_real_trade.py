@@ -166,9 +166,11 @@ def main():
 
     # Execute real trade
     try:
+        # Round to 2 decimals for taker amount (Polymarket requirement)
+        rounded_amount = round(trade_amount, 2)
         order_args = MarketOrderArgs(
             token_id=token_id,
-            amount=trade_amount,
+            amount=rounded_amount,
             side="BUY",
         )
 
