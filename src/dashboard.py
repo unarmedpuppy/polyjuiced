@@ -1165,6 +1165,11 @@ DASHBOARD_HTML = """
                     uptimeStart = new Date(startStr.endsWith('Z') ? startStr : startStr + 'Z').getTime();
                 }
                 updateUptime();
+                // Handle markets separately with optimized function to prevent flicker
+                if (data.markets) {
+                    updateMarketsOptimized(data.markets);
+                    delete data.markets;
+                }
                 // Load initial state - trades are included in data, no need to load separately
                 updateDashboard(data);
                 // Load P&L chart data
