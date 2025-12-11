@@ -36,7 +36,7 @@ async def main():
     # Initialize clients
     print("\n[1/4] Initializing Polymarket client...")
     poly_client = PolymarketClient(config)
-    poly_client.connect()  # Must connect first
+    await poly_client.connect()  # Must connect first (async)
 
     # Check balance
     balance_info = poly_client.get_balance()
