@@ -233,11 +233,17 @@ class PolymarketWebSocket:
 
     async def _process_messages(self) -> None:
         """Process incoming WebSocket messages."""
+        message_count = 0
         async for message in self._ws:
             try:
                 # Handle PONG/PING text messages (not JSON)
                 if message in ("PONG", "PING"):
                     continue
+
+                message_count += 1
+                # Log every 100th message to confirm we're receiving data
+                if message_count % 100 == 1:
+                    log.info("WS receiving messages", count=message_count, sample=str(message)[:200])
 
                 data = orjson.loads(message)
 
@@ -267,6 +273,7 @@ class PolymarketWebSocket:
         msg_type = data.get("event_type", data.get("type"))
 
         if msg_type == "book":
+            log.info("WS book update received", asset_id=str(data.get("asset_id", ""))[:20])
             await self._handle_book_update(data)
         elif msg_type == "price_change":
             await self._handle_price_change(data)
@@ -280,9 +287,9 @@ class PolymarketWebSocket:
             log.error("WebSocket error message", data=data)
         elif msg_type is None:
             # Log raw message for debugging unknown formats
-            log.debug("WS message without type", keys=list(data.keys())[:10])
+            log.info("WS message without type", keys=list(data.keys())[:10], sample=str(data)[:150])
         else:
-            log.debug("WS unknown message type", type=msg_type, keys=list(data.keys())[:5])
+            log.info("WS unknown message type", type=msg_type, keys=list(data.keys())[:5])
 
     async def _handle_book_update(self, data: Dict[str, Any]) -> None:
         """Handle order book update message."""
