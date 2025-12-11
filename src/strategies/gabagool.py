@@ -251,16 +251,6 @@ class GabagoolStrategy(BaseStrategy):
 
         # Update the active_markets dict if this market is in it
         # IMPORTANT: Must use dashboard.active_markets to get current reference (not imported copy)
-        active_market_ids = list(dashboard.active_markets.keys())[:3]
-        log.info(
-            "Checking active_markets",
-            condition_id=condition_id[:20],
-            in_active_markets=condition_id in dashboard.active_markets,
-            active_market_ids=[m[:20] for m in active_market_ids],
-            yes_price=f"${state.yes_price:.3f}",
-            no_price=f"${state.no_price:.3f}",
-        )
-
         if condition_id in dashboard.active_markets:
             dashboard.active_markets[condition_id]["up_price"] = state.yes_price
             dashboard.active_markets[condition_id]["down_price"] = state.no_price
