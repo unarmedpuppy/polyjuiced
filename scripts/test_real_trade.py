@@ -184,10 +184,16 @@ def main():
         signed_order = client.create_order(order_args)
         print(f"       Signed order created: {type(signed_order)}")
 
-        # Debug: print the order details
+        # Debug: print the order details - extract actual values from Uint objects
         order = signed_order.order
-        print(f"       Order maker_amount: {order.makerAmount}")
-        print(f"       Order taker_amount: {order.takerAmount}")
+        # Convert Uint objects to actual values
+        maker_val = int(order.makerAmount.value) if hasattr(order.makerAmount, 'value') else order.makerAmount
+        taker_val = int(order.takerAmount.value) if hasattr(order.takerAmount, 'value') else order.takerAmount
+        print(f"       Order maker_amount raw: {maker_val}")
+        print(f"       Order taker_amount raw: {taker_val}")
+        # USDC has 6 decimals, so divide by 1e6
+        print(f"       Order maker_amount (USDC): ${maker_val / 1e6:.6f}")
+        print(f"       Order taker_amount (shares): {taker_val / 1e6:.6f}")
 
         # Now POST the signed order to execute it
         print("       Posting order to exchange...")
