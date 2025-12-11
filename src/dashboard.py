@@ -349,42 +349,38 @@ DASHBOARD_HTML = """
         .log-msg { color: #ccc; }
         .log-extra { color: var(--dim-green); font-size: 0.75rem; }
 
-        /* Circuit breaker */
-        .circuit-status { text-align: center; padding: 20px; }
-
-        .circuit-level {
-            font-family: 'VT323', monospace;
-            font-size: 2.5rem;
-            margin-bottom: 10px;
-        }
-
-        .circuit-level.normal { color: var(--green); }
-        .circuit-level.warning { color: var(--amber); }
-        .circuit-level.caution { color: var(--amber); }
-        .circuit-level.halt { color: var(--red); animation: blink 0.5s infinite; }
-
-        @keyframes blink {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.3; }
-        }
-
-        .circuit-bar {
+        /* P&L Chart */
+        .chart-timeframe {
             display: flex;
-            justify-content: center;
-            gap: 10px;
-            margin-top: 15px;
+            gap: 5px;
         }
 
-        .circuit-segment {
-            width: 60px;
-            height: 8px;
+        .timeframe-btn {
             background: var(--dark-green);
-            border-radius: 4px;
+            border: 1px solid var(--border);
+            color: var(--dim-green);
+            padding: 2px 8px;
+            font-family: inherit;
+            font-size: 0.7rem;
+            cursor: pointer;
+            transition: all 0.2s;
         }
 
-        .circuit-segment.active { background: var(--green); box-shadow: 0 0 10px var(--green); }
-        .circuit-segment.warning { background: var(--amber); box-shadow: 0 0 10px var(--amber); }
-        .circuit-segment.halt { background: var(--red); box-shadow: 0 0 10px var(--red); }
+        .timeframe-btn.active {
+            background: var(--green);
+            color: var(--bg);
+            border-color: var(--green);
+        }
+
+        .timeframe-btn:hover {
+            border-color: var(--green);
+        }
+
+        #pnl-chart {
+            width: 100%;
+            height: 100px;
+            display: block;
+        }
 
         /* Win/Loss stats */
         .winloss {
@@ -524,21 +520,18 @@ DASHBOARD_HTML = """
                 </div>
             </div>
 
-            <!-- Circuit Breaker -->
+            <!-- P&L Chart -->
             <div class="panel">
                 <div class="panel-header">
-                    <span class="panel-title">[ CIRCUIT ]</span>
-                </div>
-                <div class="panel-body">
-                    <div class="circuit-status" style="padding: 10px;">
-                        <div id="circuit-level" class="circuit-level normal" style="font-size: 1.8rem;">NORMAL</div>
-                        <div class="circuit-bar">
-                            <div id="cb-0" class="circuit-segment active"></div>
-                            <div id="cb-1" class="circuit-segment"></div>
-                            <div id="cb-2" class="circuit-segment"></div>
-                            <div id="cb-3" class="circuit-segment"></div>
-                        </div>
+                    <span class="panel-title">[ P&L CHART ]</span>
+                    <div class="chart-timeframe">
+                        <button class="timeframe-btn active" data-tf="24h">24H</button>
+                        <button class="timeframe-btn" data-tf="7d">7D</button>
+                        <button class="timeframe-btn" data-tf="all">ALL</button>
                     </div>
+                </div>
+                <div class="panel-body" style="padding: 10px;">
+                    <canvas id="pnl-chart" width="280" height="100"></canvas>
                 </div>
             </div>
         </div>
@@ -688,23 +681,6 @@ DASHBOARD_HTML = """
                 document.getElementById('losses').textContent = s.losses || 0;
                 document.getElementById('pending').textContent = s.pending || 0;
 
-                const cbLevel = s.circuit_breaker.toUpperCase();
-                const cbEl = document.getElementById('circuit-level');
-                cbEl.textContent = cbLevel;
-                cbEl.className = 'circuit-level ' + cbLevel.toLowerCase();
-
-                const levels = ['NORMAL', 'WARNING', 'CAUTION', 'HALT'];
-                const currentIdx = levels.indexOf(cbLevel);
-                for (let i = 0; i < 4; i++) {
-                    const seg = document.getElementById('cb-' + i);
-                    seg.className = 'circuit-segment';
-                    if (i <= currentIdx) {
-                        if (cbLevel === 'HALT') seg.classList.add('halt');
-                        else if (cbLevel === 'WARNING' || cbLevel === 'CAUTION') seg.classList.add('warning');
-                        else seg.classList.add('active');
-                    }
-                }
-
                 const wsEl = document.getElementById('ws-status');
                 wsEl.className = 'status-dot ' + (s.websocket === 'CONNECTED' ? '' : 'error');
 
@@ -816,6 +792,12 @@ DASHBOARD_HTML = """
                     profitEl.className = 'trade-profit ' + (t.actual_profit >= 0 ? 'positive' : 'negative');
                     profitEl.textContent = (t.actual_profit >= 0 ? '+' : '') + '$' + t.actual_profit.toFixed(2);
                 }
+            }
+
+            // Update P&L chart with new data point
+            if (data.pnl_update) {
+                pnlData.push(data.pnl_update);
+                drawPnlChart(pnlData);
             }
 
             // Update markets list
@@ -965,6 +947,110 @@ DASHBOARD_HTML = """
         }
         setInterval(updateUptime, 1000);
 
+        // ========== P&L Chart ==========
+        let currentTimeframe = '24h';
+        let pnlData = [];
+
+        function drawPnlChart(data) {
+            const canvas = document.getElementById('pnl-chart');
+            if (!canvas) return;
+            const ctx = canvas.getContext('2d');
+            const width = canvas.width;
+            const height = canvas.height;
+
+            // Clear canvas
+            ctx.fillStyle = '#0d1117';
+            ctx.fillRect(0, 0, width, height);
+
+            if (!data || !data.length) {
+                ctx.fillStyle = '#00aa2a';
+                ctx.font = '12px "Share Tech Mono", monospace';
+                ctx.textAlign = 'center';
+                ctx.fillText('No data', width/2, height/2);
+                return;
+            }
+
+            // Calculate bounds with padding
+            const values = data.map(d => d.cumulative_pnl);
+            const minVal = Math.min(0, ...values);
+            const maxVal = Math.max(0, ...values);
+            const range = maxVal - minVal || 1;
+            const padding = range * 0.15;
+
+            // Draw horizontal grid lines
+            ctx.strokeStyle = '#003b00';
+            ctx.lineWidth = 1;
+            for (let i = 0; i <= 4; i++) {
+                const y = (height / 4) * i;
+                ctx.beginPath();
+                ctx.moveTo(0, y);
+                ctx.lineTo(width, y);
+                ctx.stroke();
+            }
+
+            // Draw zero line if crosses zero
+            if (minVal < 0 && maxVal > 0) {
+                const zeroY = height - ((0 - minVal + padding) / (range + 2*padding)) * height;
+                ctx.strokeStyle = '#1a3a1a';
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                ctx.moveTo(0, zeroY);
+                ctx.lineTo(width, zeroY);
+                ctx.stroke();
+            }
+
+            // Draw P&L line with glow
+            ctx.strokeStyle = '#00ff41';
+            ctx.lineWidth = 2;
+            ctx.shadowColor = '#00ff41';
+            ctx.shadowBlur = 8;
+            ctx.beginPath();
+
+            data.forEach((point, i) => {
+                const x = data.length === 1 ? width / 2 : (i / (data.length - 1)) * width;
+                const y = height - ((point.cumulative_pnl - minVal + padding) / (range + 2*padding)) * height;
+                if (i === 0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            });
+            ctx.stroke();
+            ctx.shadowBlur = 0;
+
+            // Draw current value label
+            const lastVal = data[data.length - 1].cumulative_pnl;
+            ctx.fillStyle = lastVal >= 0 ? '#00ff41' : '#ff0040';
+            ctx.font = 'bold 12px "Share Tech Mono", monospace';
+            ctx.textAlign = 'right';
+            ctx.fillText((lastVal >= 0 ? '+' : '') + '$' + lastVal.toFixed(2), width - 5, 14);
+
+            // Draw min/max labels
+            ctx.fillStyle = '#00aa2a';
+            ctx.font = '10px "Share Tech Mono", monospace';
+            ctx.textAlign = 'left';
+            ctx.fillText('$' + maxVal.toFixed(2), 3, 12);
+            ctx.fillText('$' + minVal.toFixed(2), 3, height - 3);
+        }
+
+        async function loadPnlData(timeframe) {
+            try {
+                const resp = await fetch('/dashboard/pnl-history?timeframe=' + timeframe);
+                const data = await resp.json();
+                pnlData = data.points || [];
+                drawPnlChart(pnlData);
+            } catch (e) {
+                console.error('Failed to load P&L data:', e);
+            }
+        }
+
+        // Timeframe button handlers
+        document.querySelectorAll('.timeframe-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                document.querySelectorAll('.timeframe-btn').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                currentTimeframe = btn.dataset.tf;
+                loadPnlData(currentTimeframe);
+            });
+        });
+
         fetch('/dashboard/state')
             .then(r => r.json())
             .then(data => {
@@ -977,6 +1063,8 @@ DASHBOARD_HTML = """
                 updateUptime();
                 // Load initial state - trades are included in data, no need to load separately
                 updateDashboard(data);
+                // Load P&L chart data
+                loadPnlData(currentTimeframe);
             });
     </script>
 </body>
@@ -1001,6 +1089,7 @@ class DashboardServer:
         self._app.router.add_get("/dashboard/", self._handle_dashboard)
         self._app.router.add_get("/dashboard/state", self._handle_state)
         self._app.router.add_get("/dashboard/events", self._handle_events)
+        self._app.router.add_get("/dashboard/pnl-history", self._handle_pnl_history)
 
         self._runner = web.AppRunner(self._app)
         await self._runner.setup()
@@ -1052,6 +1141,19 @@ class DashboardServer:
             self._clients.remove(response)
 
         return response
+
+    async def _handle_pnl_history(self, request: web.Request) -> web.Response:
+        """Get P&L history for charting."""
+        timeframe = request.query.get("timeframe", "all")
+        if timeframe not in ("24h", "7d", "all"):
+            timeframe = "all"
+
+        if _db:
+            points = await _db.get_pnl_history(timeframe)
+        else:
+            points = []
+
+        return web.json_response({"points": points})
 
     async def broadcast(self, data: Dict[str, Any]) -> None:
         """Broadcast update to all connected clients."""
@@ -1353,11 +1455,19 @@ def resolve_trade(trade_id: str, won: bool, actual_profit: float) -> None:
     stats["daily_pnl"] = stats.get("daily_pnl", 0.0) + actual_profit
 
     if dashboard:
+        # Calculate cumulative P&L for chart update
+        cumulative_pnl = stats.get("all_time_pnl", 0.0) + actual_profit
+        stats["all_time_pnl"] = cumulative_pnl
+
         asyncio.create_task(dashboard.broadcast({
             "trade_update": {
                 "id": trade_id,
                 "status": "win" if won else "loss",
                 "actual_profit": actual_profit,
+            },
+            "pnl_update": {
+                "timestamp": datetime.utcnow().isoformat(),
+                "cumulative_pnl": round(cumulative_pnl, 2),
             },
             "stats": stats,
         }))

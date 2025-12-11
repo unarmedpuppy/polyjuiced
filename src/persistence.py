@@ -471,6 +471,59 @@ class Database:
             row = await cursor.fetchone()
             return dict(row) if row else {}
 
+    async def get_pnl_history(self, timeframe: str = "all") -> List[Dict[str, Any]]:
+        """Get P&L history for charting.
+
+        Args:
+            timeframe: "24h", "7d", or "all"
+
+        Returns:
+            List of {timestamp, cumulative_pnl} points in chronological order
+        """
+        # Build time filter
+        if timeframe == "24h":
+            cutoff = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+        elif timeframe == "7d":
+            cutoff = (datetime.utcnow() - timedelta(days=7)).isoformat()
+        else:
+            cutoff = None
+
+        # Query resolved trades with actual profit
+        if cutoff:
+            query = """
+                SELECT resolved_at, actual_profit
+                FROM trades
+                WHERE status IN ('win', 'loss')
+                  AND resolved_at IS NOT NULL
+                  AND resolved_at >= ?
+                ORDER BY resolved_at ASC
+            """
+            params = (cutoff,)
+        else:
+            query = """
+                SELECT resolved_at, actual_profit
+                FROM trades
+                WHERE status IN ('win', 'loss')
+                  AND resolved_at IS NOT NULL
+                ORDER BY resolved_at ASC
+            """
+            params = ()
+
+        async with self._conn.execute(query, params) as cursor:
+            rows = await cursor.fetchall()
+
+        # Calculate cumulative P&L
+        points = []
+        cumulative = 0.0
+        for row in rows:
+            cumulative += row["actual_profit"] or 0
+            points.append({
+                "timestamp": row["resolved_at"],
+                "cumulative_pnl": round(cumulative, 2),
+            })
+
+        return points
+
 
 # Global database instance
 _db: Optional[Database] = None
