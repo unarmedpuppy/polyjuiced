@@ -16,7 +16,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds, MarketOrderArgs, BalanceAllowanceParams
+from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType, BalanceAllowanceParams
 import httpx
 
 def main():
@@ -152,31 +152,36 @@ def main():
     print(f"       UP token: {token_id[:30]}...")
     print(f"       UP price: ${token_price:.3f}")
 
-    # Execute trade - use $5 which is Polymarket's minimum order size
-    trade_amount = 5.00
+    # Execute trade using LIMIT order (GTC) - market orders have decimal precision bugs
+    # See: https://github.com/Polymarket/py-clob-client/issues/121
+    # We'll buy at a slightly aggressive price to ensure fill
+    trade_amount_usd = 5.00
+
+    # Calculate shares: price = 0.50 means $5 buys 10 shares
+    # Use a price slightly above market to ensure fill (limit buy)
+    limit_price = round(min(token_price + 0.02, 0.99), 2)  # Add 2 cents, cap at 0.99
+    shares_to_buy = round(trade_amount_usd / limit_price, 2)  # Round to 2 decimals
 
     print(f"\n[4/4] Executing trade...")
-    print(f"       Action: BUY ${trade_amount:.2f} of UP")
+    print(f"       Action: BUY {shares_to_buy} shares of UP at ${limit_price}")
+    print(f"       Max cost: ${shares_to_buy * limit_price:.2f}")
 
     if dry_run:
         print("\n       [DRY RUN] Would execute trade but dry_run=true")
-        expected_shares = trade_amount / token_price
-        print(f"       Expected shares: {expected_shares:.4f}")
         return
 
-    # Execute real trade
+    # Execute real trade using LIMIT order (GTC)
     try:
-        # Round to 2 decimals for taker amount (Polymarket requirement)
-        rounded_amount = round(trade_amount, 2)
-        order_args = MarketOrderArgs(
+        order_args = OrderArgs(
             token_id=token_id,
-            amount=rounded_amount,
+            price=limit_price,
+            size=shares_to_buy,
             side="BUY",
         )
 
-        # create_market_order just SIGNS the order, we need to POST it too
-        print("       Creating and signing order...")
-        signed_order = client.create_market_order(order_args)
+        # Create and sign the limit order
+        print("       Creating and signing limit order...")
+        signed_order = client.create_order(order_args)
         print(f"       Signed order created: {type(signed_order)}")
 
         # Debug: print the order details
