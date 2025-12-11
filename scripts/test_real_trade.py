@@ -9,130 +9,173 @@ This script:
 Run with: python3 scripts/test_real_trade.py
 """
 
-import asyncio
 import os
 import sys
 
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from src.client.polymarket import PolymarketClient
-from src.client.gamma import GammaClient
-from src.config import load_config
+from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import ApiCreds, MarketOrderArgs
+import httpx
 
-async def main():
+def main():
     print("=" * 60)
     print("TEST REAL TRADE - $1 on active 15-minute market")
     print("=" * 60)
 
-    # Load config
-    config = load_config()
+    # Get env vars directly
+    dry_run = os.getenv("GABAGOOL_DRY_RUN", "true").lower() == "true"
+    private_key = os.getenv("POLYMARKET_PRIVATE_KEY", "")
+    api_key = os.getenv("POLYMARKET_API_KEY", "")
+    api_secret = os.getenv("POLYMARKET_API_SECRET", "")
+    api_passphrase = os.getenv("POLYMARKET_API_PASSPHRASE", "")
+    proxy_wallet = os.getenv("POLYMARKET_PROXY_WALLET", "")
+    clob_url = os.getenv("POLYMARKET_CLOB_HTTP_URL", "https://clob.polymarket.com")
 
-    print(f"\nDry run mode: {config.gabagool.dry_run}")
-    if config.gabagool.dry_run:
+    print(f"\nDry run mode: {dry_run}")
+    if dry_run:
         print("WARNING: Dry run is enabled - no real trade will execute!")
         print("Set GABAGOOL_DRY_RUN=false to execute real trades")
 
-    # Initialize clients
-    print("\n[1/4] Initializing Polymarket client...")
-    poly_client = PolymarketClient(config.polymarket)  # Pass polymarket config, not full config
-    poly_client.connect()  # Sync connect (not async)
+    if not private_key:
+        print("ERROR: POLYMARKET_PRIVATE_KEY not set")
+        return
+
+    # Initialize CLOB client directly
+    print("\n[1/4] Connecting to Polymarket CLOB...")
+    client = ClobClient(
+        host=clob_url,
+        key=private_key,
+        chain_id=137,  # Polygon Mainnet
+        signature_type=2,  # POLY_GNOSIS_SAFE
+        funder=proxy_wallet or None,
+    )
+
+    # Set API credentials
+    if api_key:
+        creds = ApiCreds(
+            api_key=api_key,
+            api_secret=api_secret,
+            api_passphrase=api_passphrase,
+        )
+        client.set_api_creds(creds)
+
+    # Test connection
+    try:
+        client.get_ok()
+        print("       Connected!")
+    except Exception as e:
+        print(f"ERROR: Failed to connect: {e}")
+        return
 
     # Check balance
-    balance_info = poly_client.get_balance()
-    balance = balance_info.get("balance", 0)
-    print(f"       Wallet balance: ${balance:.2f}")
+    print("\n[2/4] Checking balance...")
+    try:
+        balance_info = client.get_balance_allowance(asset_type="COLLATERAL", signature_type=2)
+        balance = float(balance_info.get("balance", 0)) / 1e6  # Convert from USDC decimals
+        print(f"       Balance: ${balance:.2f}")
 
-    if balance < 1.0:
-        print("ERROR: Insufficient balance for $1 trade")
+        if balance < 1.0:
+            print("ERROR: Insufficient balance for $1 trade")
+            return
+    except Exception as e:
+        print(f"ERROR: Failed to get balance: {e}")
         return
 
-    # Find active market
-    print("\n[2/4] Finding active 15-minute market...")
-    gamma_client = GammaClient(config)
+    # Find active market via Gamma API
+    print("\n[3/4] Finding active 15-minute market...")
 
-    # Get BTC markets
-    markets = await gamma_client.find_15min_markets("BTC")
+    # Get current time slot
+    import time
+    slot_duration = 900  # 15 minutes
+    current_slot = (int(time.time()) // slot_duration) * slot_duration
+    next_slot = current_slot + slot_duration
 
-    if not markets:
-        print("       No active BTC markets, trying ETH...")
-        markets = await gamma_client.find_15min_markets("ETH")
+    # Try to find BTC market
+    proxy = os.getenv("HTTP_PROXY", None)
+    client_kwargs = {"proxy": proxy} if proxy else {}
 
-    if not markets:
-        print("ERROR: No active 15-minute markets found")
+    market_slug = f"btc-updown-15m-{next_slot}"
+    gamma_url = f"https://gamma-api.polymarket.com/markets/slug/{market_slug}"
+
+    try:
+        with httpx.Client(**client_kwargs) as http_client:
+            response = http_client.get(gamma_url, timeout=10)
+            if response.status_code == 200:
+                market = response.json()
+            else:
+                print(f"       BTC market not found, trying ETH...")
+                market_slug = f"eth-updown-15m-{next_slot}"
+                gamma_url = f"https://gamma-api.polymarket.com/markets/slug/{market_slug}"
+                response = http_client.get(gamma_url, timeout=10)
+                if response.status_code == 200:
+                    market = response.json()
+                else:
+                    print(f"ERROR: No active market found")
+                    return
+    except Exception as e:
+        print(f"ERROR: Failed to find market: {e}")
         return
 
-    # Pick the first tradeable market
-    market = None
-    for m in markets:
-        if m.is_tradeable and m.seconds_remaining > 120:  # At least 2 min left
-            market = m
-            break
+    # Extract token IDs
+    tokens = market.get("tokens", [])
+    yes_token = None
+    no_token = None
+    for token in tokens:
+        if token.get("outcome") == "Up":
+            yes_token = token
+        elif token.get("outcome") == "Down":
+            no_token = token
 
-    if not market:
-        print("ERROR: No tradeable market with enough time remaining")
+    if not yes_token:
+        print("ERROR: Could not find UP token")
         return
 
-    print(f"       Found: {market.asset} - {market.question[:50]}...")
-    print(f"       Time remaining: {market.seconds_remaining:.0f} seconds")
-    print(f"       UP token: {market.yes_token_id[:20]}...")
-    print(f"       DOWN token: {market.no_token_id[:20]}...")
+    token_id = yes_token["token_id"]
+    token_price = float(yes_token.get("price", 0.50))
 
-    # Get current prices
-    print("\n[3/4] Getting current prices...")
-    up_price = market.up_price or 0.50
-    down_price = market.down_price or 0.50
-    print(f"       UP price: ${up_price:.3f}")
-    print(f"       DOWN price: ${down_price:.3f}")
+    print(f"       Found: {market.get('question', 'Unknown')[:60]}...")
+    print(f"       UP token: {token_id[:30]}...")
+    print(f"       UP price: ${token_price:.3f}")
 
-    # Execute trade - buy $1 of UP (YES)
+    # Execute trade
     trade_amount = 1.00
-    token_id = market.yes_token_id
-    side = "BUY"
 
     print(f"\n[4/4] Executing trade...")
     print(f"       Action: BUY ${trade_amount:.2f} of UP")
-    print(f"       Token ID: {token_id[:30]}...")
 
-    if config.gabagool.dry_run:
+    if dry_run:
         print("\n       [DRY RUN] Would execute trade but dry_run=true")
-        expected_shares = trade_amount / up_price
+        expected_shares = trade_amount / token_price
         print(f"       Expected shares: {expected_shares:.4f}")
         return
 
     # Execute real trade
     try:
-        result = await poly_client.execute_single_order(
+        order_args = MarketOrderArgs(
             token_id=token_id,
-            side=side,
-            amount_usd=trade_amount,
-            timeout_seconds=30,
+            amount=trade_amount,
+            side="BUY",
         )
+        result = client.create_market_order(order_args)
 
         print("\n" + "=" * 60)
         print("TRADE RESULT:")
         print("=" * 60)
+        print(f"✅ Order response: {result}")
 
-        if result.get("success"):
-            print("✅ TRADE SUCCESSFUL!")
-            order = result.get("order", {})
-            print(f"   Order response: {order}")
-
-            # Check new balance
-            new_balance_info = poly_client.get_balance()
-            new_balance = new_balance_info.get("balance", 0)
-            print(f"\n   Previous balance: ${balance:.2f}")
-            print(f"   New balance: ${new_balance:.2f}")
-            print(f"   Spent: ${balance - new_balance:.2f}")
-        else:
-            print("❌ TRADE FAILED!")
-            print(f"   Error: {result.get('error', 'Unknown error')}")
-            print(f"   Full result: {result}")
+        # Check new balance
+        new_balance_info = client.get_balance_allowance(asset_type="COLLATERAL", signature_type=2)
+        new_balance = float(new_balance_info.get("balance", 0)) / 1e6
+        print(f"\n   Previous balance: ${balance:.2f}")
+        print(f"   New balance: ${new_balance:.2f}")
+        print(f"   Spent: ${balance - new_balance:.2f}")
 
     except Exception as e:
-        print(f"\n❌ EXCEPTION: {e}")
+        print(f"\n❌ TRADE FAILED: {e}")
         import traceback
         traceback.print_exc()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
