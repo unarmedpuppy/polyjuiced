@@ -61,10 +61,10 @@ class GabagoolConfig:
     markets: List[str] = field(default_factory=lambda: ["BTC", "ETH"])
     min_spread_threshold: float = 0.02  # 2 cents minimum to trade
 
-    # Position sizing (for $100 capital)
-    max_trade_size_usd: float = 5.0  # Per order
-    max_per_window_usd: float = 10.0  # Per 15-min market
-    max_daily_exposure_usd: float = 90.0  # Keep $10 reserve
+    # Position sizing
+    max_trade_size_usd: float = 25.0  # Per order
+    max_per_window_usd: float = 50.0  # Per 15-min market
+    max_daily_exposure_usd: float = 200.0  # Daily limit
 
     # Risk limits
     max_daily_loss_usd: float = 5.0  # Stop trading for day
@@ -95,9 +95,9 @@ class GabagoolConfig:
             enabled=os.getenv("GABAGOOL_ENABLED", "true").lower() == "true",
             markets=os.getenv("GABAGOOL_MARKETS", "BTC,ETH").split(","),
             min_spread_threshold=float(os.getenv("GABAGOOL_MIN_SPREAD", "0.02")),
-            max_trade_size_usd=float(os.getenv("GABAGOOL_MAX_TRADE_SIZE", "5.0")),
-            max_per_window_usd=float(os.getenv("GABAGOOL_MAX_PER_WINDOW", "10.0")),
-            max_daily_exposure_usd=float(os.getenv("GABAGOOL_MAX_DAILY_EXPOSURE", "90.0")),
+            max_trade_size_usd=float(os.getenv("GABAGOOL_MAX_TRADE_SIZE", "25.0")),
+            max_per_window_usd=float(os.getenv("GABAGOOL_MAX_PER_WINDOW", "50.0")),
+            max_daily_exposure_usd=float(os.getenv("GABAGOOL_MAX_DAILY_EXPOSURE", "200.0")),
             max_daily_loss_usd=float(os.getenv("GABAGOOL_MAX_DAILY_LOSS", "5.0")),
             max_unhedged_exposure_usd=float(os.getenv("GABAGOOL_MAX_UNHEDGED", "10.0")),
             max_slippage_cents=float(os.getenv("GABAGOOL_MAX_SLIPPAGE", "2.0")),
