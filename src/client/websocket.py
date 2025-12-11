@@ -276,6 +276,9 @@ class PolymarketWebSocket:
         if msg_type == "book":
             await self._handle_book_update(data)
         elif msg_type == "price_change":
+            # Debug: log sample price_change to understand the format
+            if self._msg_count == 201:
+                log.info("price_change sample", data=data)
             await self._handle_price_change(data)
         elif msg_type == "last_trade_price":
             log.debug("Trade executed", data=data)
