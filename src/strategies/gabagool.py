@@ -242,6 +242,13 @@ class GabagoolStrategy(BaseStrategy):
         condition_id = state.market.condition_id
         now = time_module.time()
 
+        log.info(
+            "State change callback fired",
+            condition_id=condition_id[:20],
+            yes_price=f"${state.yes_price:.3f}",
+            no_price=f"${state.no_price:.3f}",
+        )
+
         # Throttle: only broadcast every 500ms per market to avoid flooding
         last_broadcast = self._last_price_broadcast.get(condition_id, 0)
         if now - last_broadcast < 0.5:
