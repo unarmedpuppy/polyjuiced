@@ -122,27 +122,31 @@ def main():
         return
 
     # Extract token IDs
-    # Debug: print raw market structure
-    tokens = market.get("tokens", [])
-    print(f"       Raw tokens: {tokens}")
+    # Tokens are in clobTokenIds as JSON string: '["token1", "token2"]'
+    # Outcomes are in outcomes as JSON string: '["Up", "Down"]'
+    # Prices are in outcomePrices as JSON string: '["0.495", "0.505"]'
+    import json
 
-    yes_token = None
-    no_token = None
-    for token in tokens:
-        outcome = token.get("outcome", "").lower()
-        print(f"       Found outcome: '{outcome}'")
-        if outcome == "up" or outcome == "yes":
-            yes_token = token
-        elif outcome == "down" or outcome == "no":
-            no_token = token
+    clob_token_ids = json.loads(market.get("clobTokenIds", "[]"))
+    outcomes = json.loads(market.get("outcomes", "[]"))
+    outcome_prices = json.loads(market.get("outcomePrices", "[]"))
 
-    if not yes_token:
+    print(f"       Outcomes: {outcomes}")
+    print(f"       Token IDs: {[t[:30] + '...' for t in clob_token_ids]}")
+    print(f"       Prices: {outcome_prices}")
+
+    # Find Up token (index 0 if outcomes[0] == "Up")
+    token_id = None
+    token_price = 0.50
+    for i, outcome in enumerate(outcomes):
+        if outcome.lower() == "up":
+            token_id = clob_token_ids[i]
+            token_price = float(outcome_prices[i]) if i < len(outcome_prices) else 0.50
+            break
+
+    if not token_id:
         print("ERROR: Could not find UP token")
-        print(f"       Market data: {market}")
         return
-
-    token_id = yes_token["token_id"]
-    token_price = float(yes_token.get("price", 0.50))
 
     print(f"       Found: {market.get('question', 'Unknown')[:60]}...")
     print(f"       UP token: {token_id[:30]}...")
