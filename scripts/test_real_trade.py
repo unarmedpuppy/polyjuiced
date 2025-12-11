@@ -122,17 +122,23 @@ def main():
         return
 
     # Extract token IDs
+    # Debug: print raw market structure
     tokens = market.get("tokens", [])
+    print(f"       Raw tokens: {tokens}")
+
     yes_token = None
     no_token = None
     for token in tokens:
-        if token.get("outcome") == "Up":
+        outcome = token.get("outcome", "").lower()
+        print(f"       Found outcome: '{outcome}'")
+        if outcome == "up" or outcome == "yes":
             yes_token = token
-        elif token.get("outcome") == "Down":
+        elif outcome == "down" or outcome == "no":
             no_token = token
 
     if not yes_token:
         print("ERROR: Could not find UP token")
+        print(f"       Market data: {market}")
         return
 
     token_id = yes_token["token_id"]
