@@ -242,12 +242,27 @@ class GabagoolStrategy(BaseStrategy):
 
         # Update the active_markets dict if this market is in it
         # IMPORTANT: Must use dashboard.active_markets to get current reference (not imported copy)
+        active_count = len(dashboard.active_markets)
         if condition_id in dashboard.active_markets:
             dashboard.active_markets[condition_id]["up_price"] = state.yes_price
             dashboard.active_markets[condition_id]["down_price"] = state.no_price
 
             # Broadcast the update
+            log.info(
+                "RT broadcast",
+                asset=state.market.asset,
+                yes=f"{state.yes_price:.3f}",
+                no=f"{state.no_price:.3f}",
+            )
             update_markets(dashboard.active_markets)
+        elif active_count > 0:
+            # Debug: market not in active_markets even though active_markets has entries
+            log.warning(
+                "RT miss",
+                condition_id=condition_id[:20],
+                active_count=active_count,
+                active_keys=[k[:20] for k in list(dashboard.active_markets.keys())[:2]],
+            )
 
     async def _run_loop(self) -> None:
         """Main strategy loop."""

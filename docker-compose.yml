@@ -56,7 +56,7 @@ services:
       # Homepage integration
       - "homepage.group=Finance & Trading"
       - "homepage.name=Polymarket Bot"
-      - "homepage.icon=si-polymarket"
+      - "homepage.icon=si-ethereum"
       - "homepage.href=https://polymarket.server.unarmedpuppy.com/dashboard"
       - "homepage.description=Gabagool arbitrage strategy dashboard"
 
