@@ -171,12 +171,21 @@ def main():
             amount=trade_amount,
             side="BUY",
         )
-        result = client.create_market_order(order_args)
+
+        # create_market_order just SIGNS the order, we need to POST it too
+        print("       Creating and signing order...")
+        signed_order = client.create_market_order(order_args)
+        print(f"       Signed order created: {type(signed_order)}")
+
+        # Now POST the signed order to execute it
+        print("       Posting order to exchange...")
+        result = client.post_order(signed_order)
+        print(f"       Post result: {result}")
 
         print("\n" + "=" * 60)
         print("TRADE RESULT:")
         print("=" * 60)
-        print(f"✅ Order response: {result}")
+        print(f"✅ Order posted: {result}")
 
         # Check new balance
         new_balance_info = client.get_balance_allowance(params)
