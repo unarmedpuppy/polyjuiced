@@ -242,14 +242,6 @@ class GabagoolStrategy(BaseStrategy):
         condition_id = state.market.condition_id
         now = time_module.time()
 
-        # Debug: log callback to confirm it's firing
-        if not hasattr(self, '_state_change_count'):
-            self._state_change_count = 0
-        self._state_change_count += 1
-        if self._state_change_count % 100 == 1:
-            log.info("State change callback", asset=state.market.asset, count=self._state_change_count,
-                     in_active=condition_id in dashboard.active_markets)
-
         # Throttle: only broadcast every 500ms per market to avoid flooding
         last_broadcast = self._last_price_broadcast.get(condition_id, 0)
         if now - last_broadcast < 0.5:

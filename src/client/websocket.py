@@ -266,19 +266,9 @@ class PolymarketWebSocket:
         """
         msg_type = data.get("event_type", data.get("type"))
 
-        # Debug: log every 100th message to confirm data is flowing
-        if not hasattr(self, '_msg_count'):
-            self._msg_count = 0
-        self._msg_count += 1
-        if self._msg_count % 100 == 1:
-            log.info("WS message received", msg_type=msg_type, count=self._msg_count)
-
         if msg_type == "book":
             await self._handle_book_update(data)
         elif msg_type == "price_change":
-            # Debug: log sample price_change to understand the format
-            if self._msg_count == 201:
-                log.info("price_change sample", data=data)
             await self._handle_price_change(data)
         elif msg_type == "last_trade_price":
             log.debug("Trade executed", data=data)
