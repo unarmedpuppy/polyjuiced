@@ -159,6 +159,13 @@ class OrderBookTracker:
         self._token_side[market.yes_token_id] = "yes"
         self._token_side[market.no_token_id] = "no"
 
+        log.info(
+            "Token mapping added",
+            yes_token=market.yes_token_id[:20] if market.yes_token_id else "None",
+            no_token=market.no_token_id[:20] if market.no_token_id else "None",
+            condition_id=condition_id[:20],
+        )
+
         # Register handler and subscribe
         self.ws.on_book_update(self._handle_book_update)
         await self.ws.subscribe([market.yes_token_id, market.no_token_id])
@@ -240,6 +247,16 @@ class OrderBookTracker:
         # The WebSocket may return full token IDs (77+ chars) while Gamma API
         # returns truncated ones (20 chars). Use prefix matching as fallback.
         condition_id = self._token_to_market.get(token_id)
+
+        # Debug: log what we're looking for vs what we have
+        stored_tokens = list(self._token_to_market.keys())[:4]
+        log.info(
+            "Token lookup",
+            incoming=token_id[:30] if token_id else "None",
+            found=bool(condition_id),
+            stored_sample=[t[:20] for t in stored_tokens],
+        )
+
         if not condition_id and token_id:
             # Try prefix matching - check if any stored token is a prefix of the incoming token
             for stored_token, cid in self._token_to_market.items():
