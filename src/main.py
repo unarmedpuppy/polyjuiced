@@ -107,7 +107,11 @@ class GabagoolBot:
         # Initialize persistence and load historical data
         await init_persistence(self._db)
 
-        update_stats(dry_run=self.config.gabagool.dry_run)
+        update_stats(
+            dry_run=self.config.gabagool.dry_run,
+            arbitrage_enabled=self.config.gabagool.enabled,
+            directional_enabled=self.config.gabagool.directional_enabled,
+        )
         add_log("info", "Dashboard started", url="http://localhost:8080/dashboard")
 
         # Initialize components

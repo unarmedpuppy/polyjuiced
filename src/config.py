@@ -79,7 +79,7 @@ class GabagoolConfig:
     dry_run: bool = False  # LIVE mode enabled
 
     # Directional trading settings
-    directional_enabled: bool = True
+    directional_enabled: bool = False  # Disabled by default - arb only
     directional_entry_threshold: float = 0.25  # Max price to enter ($0.25)
     directional_time_threshold: float = 0.80  # Min 80% time remaining
     directional_size_ratio: float = 0.33  # 1/3 of arb trade size
@@ -105,7 +105,7 @@ class GabagoolConfig:
             ws_reconnect_delay_seconds=float(os.getenv("GABAGOOL_WS_RECONNECT_DELAY", "1.0")),
             dry_run=os.getenv("GABAGOOL_DRY_RUN", "false").lower() == "true",
             # Directional trading
-            directional_enabled=os.getenv("GABAGOOL_DIRECTIONAL_ENABLED", "true").lower() == "true",
+            directional_enabled=os.getenv("GABAGOOL_DIRECTIONAL_ENABLED", "false").lower() == "true",
             directional_entry_threshold=float(os.getenv("GABAGOOL_DIRECTIONAL_ENTRY_THRESHOLD", "0.25")),
             directional_time_threshold=float(os.getenv("GABAGOOL_DIRECTIONAL_TIME_THRESHOLD", "0.80")),
             directional_size_ratio=float(os.getenv("GABAGOOL_DIRECTIONAL_SIZE_RATIO", "0.33")),

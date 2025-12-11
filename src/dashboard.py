@@ -38,6 +38,9 @@ stats: Dict[str, Any] = {
     "all_time_losses": 0,
     # Wallet balance
     "wallet_balance": 0.0,
+    # Strategy status (for UI indicators)
+    "arbitrage_enabled": True,
+    "directional_enabled": False,
 }
 
 # Database reference (set during initialization)
@@ -459,6 +462,15 @@ DASHBOARD_HTML = """
                     <span style="color: var(--cyan); font-family: 'VT323', monospace; font-size: 1.2rem;">$<span id="wallet-balance">0.00</span></span>
                     <span>WALLET</span>
                 </div>
+                <!-- Strategy Status Indicators -->
+                <div class="status-item" style="margin-left: 20px; padding-left: 20px; border-left: 1px solid var(--border);">
+                    <div id="arb-status" class="status-dot"></div>
+                    <span>ARBITRAGE</span>
+                </div>
+                <div class="status-item">
+                    <div id="dir-status" class="status-dot error"></div>
+                    <span>DIRECTIONAL</span>
+                </div>
             </div>
         </header>
 
@@ -700,6 +712,13 @@ DASHBOARD_HTML = """
                 if (s.wallet_balance !== undefined) {
                     document.getElementById('wallet-balance').textContent = s.wallet_balance.toFixed(2);
                 }
+
+                // Update strategy status indicators
+                const arbEl = document.getElementById('arb-status');
+                arbEl.className = 'status-dot ' + (s.arbitrage_enabled ? '' : 'error');
+
+                const dirEl = document.getElementById('dir-status');
+                dirEl.className = 'status-dot ' + (s.directional_enabled ? '' : 'error');
 
                 if (s.dry_run) {
                     document.getElementById('dry-run-banner').style.display = 'block';
