@@ -184,16 +184,24 @@ def main():
         signed_order = client.create_order(order_args)
         print(f"       Signed order created: {type(signed_order)}")
 
-        # Debug: print the order details - extract actual values from Uint objects
+        # Debug: print the order details
         order = signed_order.order
-        # Convert Uint objects to actual values
-        maker_val = int(order.makerAmount.value) if hasattr(order.makerAmount, 'value') else order.makerAmount
-        taker_val = int(order.takerAmount.value) if hasattr(order.takerAmount, 'value') else order.takerAmount
-        print(f"       Order maker_amount raw: {maker_val}")
-        print(f"       Order taker_amount raw: {taker_val}")
-        # USDC has 6 decimals, so divide by 1e6
-        print(f"       Order maker_amount (USDC): ${maker_val / 1e6:.6f}")
-        print(f"       Order taker_amount (shares): {taker_val / 1e6:.6f}")
+        print(f"       Order dir: {[a for a in dir(order) if not a.startswith('_')]}")
+        print(f"       maker_amount type: {type(order.makerAmount)}")
+        print(f"       maker_amount str: {str(order.makerAmount)}")
+        print(f"       maker_amount repr: {repr(order.makerAmount)}")
+
+        # Try to access the underlying value
+        try:
+            maker_val = order.makerAmount
+            if hasattr(maker_val, 'encode_value'):
+                encoded = maker_val.encode_value()
+                print(f"       maker_amount encoded: {encoded.hex()}")
+                # Decode as big-endian int
+                maker_int = int.from_bytes(encoded, 'big')
+                print(f"       maker_amount int: {maker_int}")
+        except Exception as e:
+            print(f"       Error extracting maker: {e}")
 
         # Now POST the signed order to execute it
         print("       Posting order to exchange...")
