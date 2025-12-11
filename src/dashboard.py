@@ -620,14 +620,38 @@ DASHBOARD_HTML = """
         // SSE connection for real-time updates
         const evtSource = new EventSource('/dashboard/events');
 
+        // Debounce rapid updates using requestAnimationFrame
+        let pendingMarketUpdate = null;
+        let pendingMarketData = null;
+
         evtSource.onmessage = function(event) {
             const data = JSON.parse(event.data);
-            updateDashboard(data);
+
+            // Debounce market updates to prevent flickering
+            if (data.markets) {
+                pendingMarketData = data.markets;
+                if (!pendingMarketUpdate) {
+                    pendingMarketUpdate = requestAnimationFrame(() => {
+                        updateMarketsOptimized(pendingMarketData);
+                        pendingMarketUpdate = null;
+                    });
+                }
+                // Remove markets from data so updateDashboard doesn't process it
+                delete data.markets;
+            }
+
+            // Process other updates immediately
+            if (Object.keys(data).length > 0) {
+                updateDashboard(data);
+            }
         };
 
         evtSource.onerror = function(err) {
             document.getElementById('ws-status').classList.add('error');
         };
+
+        // Cache for market row elements to enable incremental updates
+        const marketRowCache = new Map();
 
         // Convert UTC timestamp to CST (UTC-6) for display
         function utcToCst(utcTimeStr) {
@@ -674,6 +698,119 @@ DASHBOARD_HTML = """
             while (element.children.length > maxCount) {
                 element.removeChild(element.lastChild);
             }
+        }
+
+        // Optimized market update - only updates changed cells, not entire table
+        function updateMarketsOptimized(markets) {
+            const marketsList = document.getElementById('markets-list');
+            const marketIds = new Set(Object.keys(markets));
+
+            let foundCount = 0;
+            let tradeableCount = 0;
+
+            // Handle empty state
+            if (marketIds.size === 0) {
+                marketsList.innerHTML = '<div style="padding: 20px; text-align: center; color: var(--dim-green);">No markets found. Waiting for next 15-minute window...</div>';
+                marketRowCache.clear();
+                document.getElementById('market-count').textContent = '0';
+                document.getElementById('tradeable-count').textContent = '0';
+                return;
+            }
+
+            // Create table structure if not exists
+            let table = marketsList.querySelector('table');
+            if (!table) {
+                marketsList.innerHTML = '';
+                table = document.createElement('table');
+                table.style.cssText = 'width: 100%; border-collapse: collapse; font-size: 0.85rem;';
+
+                const header = document.createElement('tr');
+                header.style.cssText = 'background: var(--dark-green); color: var(--green);';
+                header.innerHTML = `
+                    <th style="padding: 8px; text-align: left;">Asset</th>
+                    <th style="padding: 8px; text-align: left;">End Time</th>
+                    <th style="padding: 8px; text-align: right;">Time Left</th>
+                    <th style="padding: 8px; text-align: right;">Up Price</th>
+                    <th style="padding: 8px; text-align: right;">Down Price</th>
+                    <th style="padding: 8px; text-align: center;">Status</th>
+                `;
+                table.appendChild(header);
+                marketsList.appendChild(table);
+            }
+
+            // Remove rows for markets no longer in the data
+            for (const [id, row] of marketRowCache.entries()) {
+                if (!marketIds.has(id)) {
+                    row.remove();
+                    marketRowCache.delete(id);
+                }
+            }
+
+            // Update or create rows for each market
+            for (const [id, m] of Object.entries(markets)) {
+                foundCount++;
+                const isTradeable = m.seconds_remaining > 60;
+                if (isTradeable) tradeableCount++;
+
+                const mins = Math.floor(m.seconds_remaining / 60);
+                const secs = Math.floor(m.seconds_remaining % 60);
+                const timeLeft = m.seconds_remaining > 0 ? `${mins}m ${secs}s` : 'ENDED';
+
+                let row = marketRowCache.get(id);
+                if (!row) {
+                    // Create new row
+                    row = document.createElement('tr');
+                    row.dataset.marketId = id;
+                    row.style.cssText = 'border-bottom: 1px solid var(--border);';
+
+                    const marketUrl = m.slug ? `https://polymarket.com/event/${m.slug}` : null;
+                    const assetDisplay = marketUrl
+                        ? `<a href="${marketUrl}" target="_blank" style="color: var(--cyan); text-decoration: none; font-weight: bold;">${m.asset} ↗</a>`
+                        : m.asset;
+
+                    row.innerHTML = `
+                        <td style="padding: 8px; color: var(--cyan); font-weight: bold;" class="cell-asset">${assetDisplay}</td>
+                        <td style="padding: 8px; color: var(--dim-green);" class="cell-endtime">${utcToCst(m.end_time) || 'N/A'}</td>
+                        <td style="padding: 8px; text-align: right;" class="cell-timeleft">${timeLeft}</td>
+                        <td style="padding: 8px; text-align: right;" class="cell-upprice">${m.up_price ? (m.up_price * 100).toFixed(1) + '¢' : 'N/A'}</td>
+                        <td style="padding: 8px; text-align: right;" class="cell-downprice">${m.down_price ? (m.down_price * 100).toFixed(1) + '¢' : 'N/A'}</td>
+                        <td style="padding: 8px; text-align: center;" class="cell-status">${isTradeable ? 'TRADEABLE' : 'EXPIRED'}</td>
+                    `;
+                    table.appendChild(row);
+                    marketRowCache.set(id, row);
+                } else {
+                    // Update only changed cells (no innerHTML replacement = no flicker)
+                    const timeCell = row.querySelector('.cell-timeleft');
+                    const upCell = row.querySelector('.cell-upprice');
+                    const downCell = row.querySelector('.cell-downprice');
+                    const statusCell = row.querySelector('.cell-status');
+
+                    // Update time left
+                    if (timeCell.textContent !== timeLeft) {
+                        timeCell.textContent = timeLeft;
+                        timeCell.style.color = m.seconds_remaining > 60 ? 'var(--green)' : 'var(--red)';
+                    }
+
+                    // Update prices
+                    const upText = m.up_price ? (m.up_price * 100).toFixed(1) + '¢' : 'N/A';
+                    const downText = m.down_price ? (m.down_price * 100).toFixed(1) + '¢' : 'N/A';
+                    if (upCell.textContent !== upText) upCell.textContent = upText;
+                    if (downCell.textContent !== downText) downCell.textContent = downText;
+
+                    // Update status
+                    const statusText = isTradeable ? 'TRADEABLE' : 'EXPIRED';
+                    if (statusCell.textContent !== statusText) {
+                        statusCell.textContent = statusText;
+                        statusCell.style.color = isTradeable ? 'var(--green)' : 'var(--red)';
+                    }
+                }
+
+                // Update row background based on tradeable status
+                row.style.background = isTradeable ? 'rgba(0, 255, 65, 0.05)' : 'rgba(255, 0, 64, 0.05)';
+            }
+
+            document.getElementById('market-count').textContent = foundCount;
+            document.getElementById('tradeable-count').textContent = tradeableCount;
         }
 
         function updateDashboard(data) {
@@ -811,61 +948,7 @@ DASHBOARD_HTML = """
                 drawPnlChart(pnlData);
             }
 
-            // Update markets list
-            if (data.markets) {
-                const marketsList = document.getElementById('markets-list');
-                const markets = data.markets;
-
-                let foundCount = 0;
-                let tradeableCount = 0;
-                let html = '';
-
-                if (Object.keys(markets).length === 0) {
-                    html = '<div style="padding: 20px; text-align: center; color: var(--dim-green);">No markets found. Waiting for next 15-minute window...</div>';
-                } else {
-                    html = '<table style="width: 100%; border-collapse: collapse; font-size: 0.85rem;">';
-                    html += '<tr style="background: var(--dark-green); color: var(--green);">';
-                    html += '<th style="padding: 8px; text-align: left;">Asset</th>';
-                    html += '<th style="padding: 8px; text-align: left;">End Time</th>';
-                    html += '<th style="padding: 8px; text-align: right;">Time Left</th>';
-                    html += '<th style="padding: 8px; text-align: right;">Up Price</th>';
-                    html += '<th style="padding: 8px; text-align: right;">Down Price</th>';
-                    html += '<th style="padding: 8px; text-align: center;">Status</th>';
-                    html += '</tr>';
-
-                    for (const [id, m] of Object.entries(markets)) {
-                        foundCount++;
-                        const isTradeable = m.seconds_remaining > 60;
-                        if (isTradeable) tradeableCount++;
-
-                        const statusColor = isTradeable ? 'var(--green)' : 'var(--red)';
-                        const statusText = isTradeable ? 'TRADEABLE' : 'EXPIRED';
-                        const rowBg = isTradeable ? 'rgba(0, 255, 65, 0.05)' : 'rgba(255, 0, 64, 0.05)';
-
-                        const mins = Math.floor(m.seconds_remaining / 60);
-                        const secs = Math.floor(m.seconds_remaining % 60);
-                        const timeLeft = m.seconds_remaining > 0 ? `${mins}m ${secs}s` : 'ENDED';
-
-                        html += `<tr style="border-bottom: 1px solid var(--border); background: ${rowBg};">`;
-                        const marketUrl = m.slug ? `https://polymarket.com/event/${m.slug}` : null;
-                        const assetDisplay = marketUrl
-                            ? `<a href="${marketUrl}" target="_blank" style="color: var(--cyan); text-decoration: none; font-weight: bold;">${m.asset} ↗</a>`
-                            : m.asset;
-                        html += `<td style="padding: 8px; color: var(--cyan); font-weight: bold;">${assetDisplay}</td>`;
-                        html += `<td style="padding: 8px; color: var(--dim-green);">${utcToCst(m.end_time) || 'N/A'}</td>`;
-                        html += `<td style="padding: 8px; text-align: right; color: ${m.seconds_remaining > 60 ? 'var(--green)' : 'var(--red)'};">${timeLeft}</td>`;
-                        html += `<td style="padding: 8px; text-align: right;">${m.up_price ? (m.up_price * 100).toFixed(1) + '¢' : 'N/A'}</td>`;
-                        html += `<td style="padding: 8px; text-align: right;">${m.down_price ? (m.down_price * 100).toFixed(1) + '¢' : 'N/A'}</td>`;
-                        html += `<td style="padding: 8px; text-align: center; color: ${statusColor};">${statusText}</td>`;
-                        html += '</tr>';
-                    }
-                    html += '</table>';
-                }
-
-                marketsList.innerHTML = html;
-                document.getElementById('market-count').textContent = foundCount;
-                document.getElementById('tradeable-count').textContent = tradeableCount;
-            }
+            // Markets are now handled by updateMarketsOptimized() with debouncing
 
             // Update decisions list
             if (data.decisions) {
