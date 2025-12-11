@@ -763,6 +763,34 @@ class GabagoolStrategy(BaseStrategy):
             )
 
             if not api_result.get("success"):
+                error_msg = api_result.get("error", "Unknown error")
+
+                # Check for partial fill (critical issue!)
+                if api_result.get("partial_fill"):
+                    add_log(
+                        "error",
+                        f"PARTIAL FILL on {market.asset}! One leg filled, other didn't.",
+                        error=error_msg,
+                    )
+                    add_decision(
+                        asset=market.asset,
+                        action="PARTIAL",
+                        reason=f"PARTIAL FILL - manual intervention needed!",
+                        up_price=opportunity.yes_price,
+                        down_price=opportunity.no_price,
+                        spread=opportunity.spread_cents,
+                    )
+                else:
+                    # Normal rejection (FOK didn't fill) - this is fine
+                    add_decision(
+                        asset=market.asset,
+                        action="REJECT",
+                        reason=f"Order rejected: {error_msg}",
+                        up_price=opportunity.yes_price,
+                        down_price=opportunity.no_price,
+                        spread=opportunity.spread_cents,
+                    )
+
                 return TradeResult(
                     market=market,
                     yes_shares=0,
@@ -775,7 +803,7 @@ class GabagoolStrategy(BaseStrategy):
                     executed_at=datetime.utcnow(),
                     dry_run=False,
                     success=False,
-                    error=api_result.get("error", "Unknown error"),
+                    error=error_msg,
                 )
 
             # Add to dashboard trade history

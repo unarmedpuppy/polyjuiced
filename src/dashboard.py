@@ -877,6 +877,16 @@ DASHBOARD_HTML = """
                             actionColor = 'var(--red)';
                             actionBg = 'rgba(255, 0, 64, 0.08)';
                             decisionText = 'ARB: NO';
+                        } else if (d.action === 'REJECT') {
+                            // FOK order didn't fill - normal, not critical
+                            actionColor = 'var(--amber)';
+                            actionBg = 'rgba(255, 176, 0, 0.08)';
+                            decisionText = 'REJECTED';
+                        } else if (d.action === 'PARTIAL') {
+                            // CRITICAL: Partial fill - one leg filled, other didn't
+                            actionColor = '#ff0000';
+                            actionBg = 'rgba(255, 0, 0, 0.25)';
+                            decisionText = '⚠ PARTIAL FILL';
                         } else if (d.action === 'DIR_YES') {
                             actionColor = 'var(--cyan)';
                             actionBg = 'rgba(0, 255, 255, 0.15)';

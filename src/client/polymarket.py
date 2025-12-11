@@ -432,9 +432,19 @@ class PolymarketClient:
         no_token_id: str,
         yes_amount_usd: float,
         no_amount_usd: float,
-        timeout_seconds: float = 0.5,
+        timeout_seconds: float = 2.0,
     ) -> Dict[str, Any]:
-        """Execute YES and NO orders concurrently for arbitrage.
+        """Execute YES and NO orders for arbitrage with fill-or-kill semantics.
+
+        CRITICAL: For arbitrage, we MUST get both legs filled or neither.
+        A partial fill (one side only) creates an unhedged directional position
+        which defeats the purpose of arbitrage.
+
+        Strategy:
+        1. Place YES order first with FOK (Fill-or-Kill)
+        2. If YES fills, immediately place NO order with FOK
+        3. If NO fails after YES succeeded, we have a problem (log it, but we're stuck)
+        4. If YES fails, don't place NO at all
 
         Args:
             yes_token_id: YES token ID
@@ -444,39 +454,113 @@ class PolymarketClient:
             timeout_seconds: Timeout for order placement
 
         Returns:
-            Dict with 'yes_order', 'no_order', 'success' keys
+            Dict with 'yes_order', 'no_order', 'success', 'partial_fill' keys
         """
         log.info(
-            "Executing dual-leg order",
+            "Executing dual-leg arbitrage order (FOK)",
             yes_amount=yes_amount_usd,
             no_amount=no_amount_usd,
         )
 
-        async def place_yes():
-            return self.create_market_order(yes_token_id, yes_amount_usd, "BUY")
+        def place_fok_order(token_id: str, amount_usd: float, label: str) -> Dict[str, Any]:
+            """Place a Fill-or-Kill order."""
+            try:
+                price = self.get_price(token_id, "buy")
+            except Exception:
+                price = 0.50
 
-        async def place_no():
-            return self.create_market_order(no_token_id, no_amount_usd, "BUY")
+            # Aggressive price to ensure fill
+            limit_price = round(min(price + 0.03, 0.99), 2)  # +3 cents for FOK
+            shares = round(amount_usd / limit_price, 2)
+
+            log.info(
+                f"Placing {label} FOK order",
+                token_id=token_id[:20] + "...",
+                price=limit_price,
+                shares=shares,
+            )
+
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=limit_price,
+                size=shares,
+                side="BUY",
+                order_type=OrderType.FOK,  # Fill-or-Kill!
+            )
+
+            signed_order = self._client.create_order(order_args)
+            result = self._client.post_order(signed_order)
+            return result
 
         try:
-            # Execute both orders concurrently with timeout
-            yes_result, no_result = await asyncio.wait_for(
-                asyncio.gather(
-                    asyncio.to_thread(place_yes),
-                    asyncio.to_thread(place_no),
-                ),
+            # Step 1: Place YES order with FOK
+            yes_result = await asyncio.wait_for(
+                asyncio.to_thread(place_fok_order, yes_token_id, yes_amount_usd, "YES"),
                 timeout=timeout_seconds,
             )
 
+            # Check if YES order filled
+            yes_status = yes_result.get("status", "").upper()
+            yes_filled = yes_status in ("MATCHED", "FILLED", "LIVE")
+
+            if not yes_filled:
+                log.warning(
+                    "YES order did not fill (FOK rejected)",
+                    status=yes_status,
+                    result=yes_result,
+                )
+                return {
+                    "yes_order": yes_result,
+                    "no_order": None,
+                    "success": False,
+                    "partial_fill": False,
+                    "error": f"YES order FOK rejected: {yes_status}",
+                }
+
+            log.info("YES order filled, placing NO order...")
+
+            # Step 2: YES filled, now place NO order
+            no_result = await asyncio.wait_for(
+                asyncio.to_thread(place_fok_order, no_token_id, no_amount_usd, "NO"),
+                timeout=timeout_seconds,
+            )
+
+            # Check if NO order filled
+            no_status = no_result.get("status", "").upper()
+            no_filled = no_status in ("MATCHED", "FILLED", "LIVE")
+
+            if not no_filled:
+                # CRITICAL: YES filled but NO didn't - we have a partial fill!
+                log.error(
+                    "PARTIAL FILL: YES filled but NO did not!",
+                    yes_status=yes_status,
+                    no_status=no_status,
+                    no_result=no_result,
+                )
+                return {
+                    "yes_order": yes_result,
+                    "no_order": no_result,
+                    "success": False,
+                    "partial_fill": True,
+                    "error": f"PARTIAL FILL: YES filled, NO rejected ({no_status})",
+                }
+
+            # Both legs filled successfully!
+            log.info(
+                "Both legs filled successfully",
+                yes_status=yes_status,
+                no_status=no_status,
+            )
             return {
                 "yes_order": yes_result,
                 "no_order": no_result,
                 "success": True,
+                "partial_fill": False,
             }
 
         except asyncio.TimeoutError:
             log.error("Dual-leg order timed out")
-            # Try to cancel any pending orders
+            # Cancel any pending orders
             try:
                 self.cancel_all_orders()
             except Exception:
@@ -485,15 +569,22 @@ class PolymarketClient:
                 "yes_order": None,
                 "no_order": None,
                 "success": False,
+                "partial_fill": False,
                 "error": "timeout",
             }
 
         except Exception as e:
             log.error("Dual-leg order failed", error=str(e))
+            # Cancel any pending orders
+            try:
+                self.cancel_all_orders()
+            except Exception:
+                pass
             return {
                 "yes_order": None,
                 "no_order": None,
                 "success": False,
+                "partial_fill": False,
                 "error": str(e),
             }
 
