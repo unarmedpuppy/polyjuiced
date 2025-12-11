@@ -245,6 +245,12 @@ class GabagoolStrategy(BaseStrategy):
             active_markets[condition_id]["down_price"] = state.no_price
 
             # Broadcast the update
+            log.info(
+                "RT price broadcast",
+                asset=state.market.asset,
+                yes=f"{state.yes_price:.3f}",
+                no=f"{state.no_price:.3f}",
+            )
             update_markets(active_markets)
 
     async def _run_loop(self) -> None:
