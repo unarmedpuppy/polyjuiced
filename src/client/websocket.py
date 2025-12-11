@@ -339,19 +339,53 @@ class PolymarketWebSocket:
             log.error("Error parsing book update", error=str(e))
 
     async def _handle_price_change(self, data: Dict[str, Any]) -> None:
-        """Handle price change message."""
-        if not self._on_price_change:
+        """Handle price change message.
+
+        Price change messages contain real-time best bid/ask updates, which
+        are more frequent than full order book snapshots. We convert these
+        to OrderBookUpdate format so they can be processed by the same callback.
+
+        Message format:
+        {
+            "market": "condition_id",
+            "price_changes": [
+                {"asset_id": "...", "best_bid": "0.50", "best_ask": "0.52", ...},
+                ...
+            ],
+            "event_type": "price_change"
+        }
+        """
+        # Price change events contain best_bid/best_ask - emit as OrderBookUpdate
+        # so order_book tracker receives real-time updates
+        if not self._on_book_update:
             return
 
         try:
-            update = PriceUpdate(
-                token_id=data.get("asset_id", data.get("token_id")),
-                timestamp=datetime.utcnow(),
-                price=float(data.get("price", 0)),
-                side=data.get("side", "unknown"),
-            )
+            price_changes = data.get("price_changes", [])
 
-            self._on_price_change(update)
+            for change in price_changes:
+                raw_token = change.get("asset_id")
+                token_id = str(raw_token) if raw_token is not None else None
+
+                if not token_id:
+                    continue
+
+                # Extract best bid/ask from price change
+                best_bid = float(change.get("best_bid", 0))
+                best_ask = float(change.get("best_ask", 1.0))
+                midpoint = (best_bid + best_ask) / 2 if best_bid and best_ask else 0.5
+
+                update = OrderBookUpdate(
+                    token_id=token_id,
+                    timestamp=datetime.utcnow(),
+                    bids=[],  # price_change doesn't include full book
+                    asks=[],
+                    best_bid=best_bid,
+                    best_ask=best_ask,
+                    midpoint=midpoint,
+                )
+
+                self._on_book_update(update)
 
         except Exception as e:
             log.error("Error parsing price change", error=str(e))
