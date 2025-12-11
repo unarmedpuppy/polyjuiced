@@ -18,7 +18,7 @@ import structlog
 from ..client.polymarket import PolymarketClient
 from ..client.websocket import PolymarketWebSocket
 from ..config import AppConfig, GabagoolConfig
-from ..dashboard import add_log, add_trade, add_decision, resolve_trade, update_stats, update_markets, stats
+from ..dashboard import add_log, add_trade, add_decision, resolve_trade, update_stats, update_markets, stats, active_markets
 from ..metrics import (
     ACTIVE_MARKETS,
     DAILY_EXPOSURE_USD,
@@ -38,6 +38,7 @@ from ..metrics import (
 from ..monitoring.market_finder import Market15Min, MarketFinder
 from ..monitoring.order_book import (
     ArbitrageOpportunity,
+    MarketState,
     MultiMarketTracker,
     OrderBookTracker,
 )
@@ -166,6 +167,8 @@ class GabagoolStrategy(BaseStrategy):
         self._directional_daily_exposure: float = 0.0
         # Queue for opportunities detected by WebSocket (callback is sync, execution is async)
         self._opportunity_queue: asyncio.Queue = asyncio.Queue()
+        # Throttling for real-time price updates: {condition_id: last_broadcast_timestamp}
+        self._last_price_broadcast: Dict[str, float] = {}
 
     async def start(self) -> None:
         """Start the Gabagool strategy."""
@@ -191,6 +194,9 @@ class GabagoolStrategy(BaseStrategy):
         # This fires synchronously from WebSocket handler, so we queue for async execution
         self._tracker._tracker.on_opportunity(self._queue_opportunity)
 
+        # Register callback for real-time price updates to dashboard
+        self._tracker._tracker.on_state_change(self._on_market_state_change)
+
         # Start the main loop
         await self._run_loop()
 
@@ -215,6 +221,31 @@ class GabagoolStrategy(BaseStrategy):
             )
         except asyncio.QueueFull:
             log.warning("Opportunity queue full, dropping opportunity")
+
+    def _on_market_state_change(self, state: MarketState) -> None:
+        """Handle real-time price updates from WebSocket (called from sync context).
+
+        Broadcasts price updates to dashboard with throttling (max 2 updates/sec per market).
+        """
+        import time as time_module
+
+        condition_id = state.market.condition_id
+        now = time_module.time()
+
+        # Throttle: only broadcast every 500ms per market to avoid flooding
+        last_broadcast = self._last_price_broadcast.get(condition_id, 0)
+        if now - last_broadcast < 0.5:
+            return
+
+        self._last_price_broadcast[condition_id] = now
+
+        # Update the active_markets dict if this market is in it
+        if condition_id in active_markets:
+            active_markets[condition_id]["up_price"] = state.yes_price
+            active_markets[condition_id]["down_price"] = state.no_price
+
+            # Broadcast the update
+            update_markets(active_markets)
 
     async def _run_loop(self) -> None:
         """Main strategy loop."""
