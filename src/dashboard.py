@@ -41,6 +41,7 @@ stats: Dict[str, Any] = {
     # Strategy status (for UI indicators)
     "arbitrage_enabled": True,
     "directional_enabled": False,
+    "near_resolution_enabled": True,
 }
 
 # Database reference (set during initialization)
@@ -467,6 +468,10 @@ DASHBOARD_HTML = """
                     <div id="dir-status" class="status-dot error"></div>
                     <span>DIRECTIONAL</span>
                 </div>
+                <div class="status-item">
+                    <div id="nr-status" class="status-dot"></div>
+                    <span>NEAR-RES</span>
+                </div>
             </div>
         </header>
 
@@ -695,6 +700,9 @@ DASHBOARD_HTML = """
 
                 const dirEl = document.getElementById('dir-status');
                 dirEl.className = 'status-dot ' + (s.directional_enabled ? '' : 'error');
+
+                const nrEl = document.getElementById('nr-status');
+                nrEl.className = 'status-dot ' + (s.near_resolution_enabled ? '' : 'error');
 
                 if (s.dry_run) {
                     document.getElementById('dry-run-banner').style.display = 'block';

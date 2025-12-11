@@ -200,6 +200,13 @@ class GabagoolStrategy(BaseStrategy):
         # Register callback for real-time price updates to dashboard
         self._tracker._tracker.on_state_change(self._on_market_state_change)
 
+        # Update dashboard with strategy status
+        update_stats(
+            arbitrage_enabled=self.gabagool_config.enabled,
+            directional_enabled=self.gabagool_config.directional_enabled,
+            near_resolution_enabled=self.gabagool_config.near_resolution_enabled,
+        )
+
         # Start the main loop
         await self._run_loop()
 
