@@ -190,34 +190,61 @@ class PolymarketClient:
         token_id: str,
         amount_usd: float,
         side: str,
+        price: float = None,
     ) -> Dict[str, Any]:
-        """Execute a market order.
+        """Execute a market order using an aggressive limit order.
+
+        Note: Market orders have a decimal precision bug in py-clob-client.
+        We use limit orders at slightly aggressive prices as a workaround.
+        See: https://github.com/Polymarket/py-clob-client/issues/121
 
         Args:
             token_id: The YES or NO token ID
             amount_usd: Dollar amount to spend
             side: "BUY" or "SELL"
+            price: Current market price (required for calculating shares)
 
         Returns:
             Order result dictionary from exchange
         """
         self._ensure_connected()
+
+        # Get current price if not provided
+        if price is None:
+            try:
+                price = self.get_price(token_id, side.lower())
+            except Exception:
+                price = 0.50  # Default to 50/50
+
+        # Use aggressive limit price to ensure fill
+        if side.upper() == "BUY":
+            # Buy at slightly above market to ensure fill
+            limit_price = round(min(price + 0.02, 0.99), 2)
+        else:
+            # Sell at slightly below market to ensure fill
+            limit_price = round(max(price - 0.02, 0.01), 2)
+
+        # Calculate shares from amount
+        shares = round(amount_usd / limit_price, 2)
+
         log.info(
-            "Placing market order",
+            "Placing aggressive limit order (workaround for market order bug)",
             token_id=token_id,
-            amount=amount_usd,
+            amount_usd=amount_usd,
             side=side,
+            price=limit_price,
+            shares=shares,
         )
-        # py-clob-client requires MarketOrderArgs object
-        # Round amount to 2 decimals (Polymarket requirement for taker amount)
-        rounded_amount = round(amount_usd, 2)
-        order_args = MarketOrderArgs(
+
+        order_args = OrderArgs(
             token_id=token_id,
-            amount=rounded_amount,
+            price=limit_price,
+            size=shares,
             side=side.upper(),
         )
-        # create_market_order returns a SignedOrder - we must POST it to execute
-        signed_order = self._client.create_market_order(order_args)
+
+        # create_order returns a SignedOrder - we must POST it to execute
+        signed_order = self._client.create_order(order_args)
         log.info("Order signed, posting to exchange...")
         result = self._client.post_order(signed_order)
         log.info("Order posted", result=result)
@@ -267,7 +294,12 @@ class PolymarketClient:
             order_type=ot,
         )
 
-        return self._client.create_order(order_args)
+        # create_order returns a SignedOrder - we must POST it to execute
+        signed_order = self._client.create_order(order_args)
+        log.info("Order signed, posting to exchange...")
+        result = self._client.post_order(signed_order)
+        log.info("Order posted", result=result)
+        return result
 
     def cancel_order(self, order_id: str) -> Dict[str, Any]:
         """Cancel an open order.
