@@ -278,6 +278,15 @@ class OrderBookTracker:
 
         state.last_update = update.timestamp
 
+        # Debug: log update count to confirm data flow
+        if not hasattr(self, '_update_count'):
+            self._update_count = 0
+        self._update_count += 1
+        if self._update_count % 100 == 1:
+            log.info("Order book update", asset=state.market.asset,
+                     yes_ask=f"${state.yes_best_ask:.3f}", no_ask=f"${state.no_best_ask:.3f}",
+                     count=self._update_count)
+
         # Emit state change
         if self._on_state_change:
             self._on_state_change(state)
