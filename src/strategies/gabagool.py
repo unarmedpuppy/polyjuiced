@@ -170,6 +170,8 @@ class GabagoolStrategy(BaseStrategy):
         self._opportunity_queue: asyncio.Queue = asyncio.Queue()
         # Throttling for real-time price updates: {condition_id: last_broadcast_timestamp}
         self._last_price_broadcast: Dict[str, float] = {}
+        # Track near-resolution trades executed: {condition_id: True} to avoid duplicates
+        self._near_resolution_executed: Dict[str, bool] = {}
 
     async def start(self) -> None:
         """Start the Gabagool strategy."""
@@ -245,6 +247,8 @@ class GabagoolStrategy(BaseStrategy):
         if condition_id in dashboard.active_markets:
             dashboard.active_markets[condition_id]["up_price"] = state.yes_price
             dashboard.active_markets[condition_id]["down_price"] = state.no_price
+            # Also update time remaining (recalculated from end_time)
+            dashboard.active_markets[condition_id]["seconds_remaining"] = state.market.seconds_remaining
 
             # Broadcast the update via SSE
             update_markets(dashboard.active_markets)
@@ -318,6 +322,10 @@ class GabagoolStrategy(BaseStrategy):
                 if self.gabagool_config.directional_enabled:
                     await self._check_directional_opportunities()
                     await self._manage_directional_positions()
+
+                # Check near-resolution opportunities (high-confidence bets in final minute)
+                if self.gabagool_config.near_resolution_enabled:
+                    await self._check_near_resolution_opportunities()
 
                 # Short sleep to prevent busy loop but stay responsive
                 await asyncio.sleep(0.05)
@@ -979,7 +987,230 @@ class GabagoolStrategy(BaseStrategy):
             self._daily_trades = 0
             self._daily_exposure = 0.0
             self._directional_daily_exposure = 0.0
+            self._near_resolution_executed.clear()  # Reset near-resolution tracking
             self._last_reset = now
+
+    async def _check_near_resolution_opportunities(self) -> None:
+        """Check for near-resolution trading opportunities.
+
+        Strategy: When a market is in its final minute and one side has
+        price between 0.94 and 0.975, bet on that side winning.
+
+        This catches high-confidence markets just before resolution where
+        the price hasn't fully converged to $1.00 yet.
+        """
+        cfg = self.gabagool_config
+
+        for condition_id, market in self._active_markets.items():
+            # Skip if we already executed a near-resolution trade on this market
+            if condition_id in self._near_resolution_executed:
+                continue
+
+            # Check time remaining - must be under threshold (default 60s)
+            seconds_left = market.seconds_remaining
+            if seconds_left > cfg.near_resolution_time_threshold:
+                continue  # Too much time left
+
+            if seconds_left <= 0:
+                continue  # Already resolved
+
+            # Get current prices from tracker
+            market_state = self._tracker.get_market_state(condition_id)
+            if not market_state or market_state.is_stale:
+                continue
+
+            up_price = market_state.yes_price
+            down_price = market_state.no_price
+
+            # Check if either side is in the sweet spot (0.94 to 0.975)
+            target_side = None
+            target_price = None
+            target_token_id = None
+
+            if cfg.near_resolution_min_price <= up_price <= cfg.near_resolution_max_price:
+                target_side = "YES"
+                target_price = up_price
+                target_token_id = market.yes_token_id
+            elif cfg.near_resolution_min_price <= down_price <= cfg.near_resolution_max_price:
+                target_side = "NO"
+                target_price = down_price
+                target_token_id = market.no_token_id
+
+            if not target_side:
+                # Neither side is in the sweet spot - log why
+                if up_price > cfg.near_resolution_max_price or down_price > cfg.near_resolution_max_price:
+                    reason = f"Price too high (YES=${up_price:.2f}, NO=${down_price:.2f})"
+                else:
+                    reason = f"Price too low (YES=${up_price:.2f}, NO=${down_price:.2f})"
+                add_decision(
+                    asset=market.asset,
+                    action="NR_SKIP",
+                    reason=f"Near-res: {reason}",
+                    up_price=up_price,
+                    down_price=down_price,
+                    spread=(1.0 - up_price - down_price) * 100,
+                )
+                continue
+
+            # Found a near-resolution opportunity!
+            log.info(
+                "Near-resolution opportunity found",
+                asset=market.asset,
+                side=target_side,
+                price=f"${target_price:.2f}",
+                seconds_left=int(seconds_left),
+            )
+
+            add_decision(
+                asset=market.asset,
+                action="NR_BET",
+                reason=f"Near-res: Betting {target_side} @ ${target_price:.2f} ({int(seconds_left)}s left)",
+                up_price=up_price,
+                down_price=down_price,
+                spread=(1.0 - up_price - down_price) * 100,
+            )
+
+            # Execute the trade
+            await self._execute_near_resolution_trade(
+                market=market,
+                side=target_side,
+                price=target_price,
+                token_id=target_token_id,
+            )
+
+            # Mark this market as traded (prevent duplicates)
+            self._near_resolution_executed[condition_id] = True
+
+    async def _execute_near_resolution_trade(
+        self,
+        market: Market15Min,
+        side: str,
+        price: float,
+        token_id: str,
+    ) -> None:
+        """Execute a near-resolution trade.
+
+        Args:
+            market: Market to trade
+            side: "YES" or "NO"
+            price: Current price of the side we're betting on
+            token_id: Token ID to buy
+        """
+        cfg = self.gabagool_config
+        trade_size = cfg.near_resolution_size_usd
+
+        # Check daily limits
+        if self._daily_exposure + trade_size > cfg.max_daily_exposure_usd:
+            log.warning(
+                "Near-res trade skipped: daily exposure limit",
+                current=self._daily_exposure,
+                trade_size=trade_size,
+                limit=cfg.max_daily_exposure_usd,
+            )
+            return
+
+        # Calculate shares
+        shares = round(trade_size / price, 2)
+
+        log.info(
+            "Executing near-resolution trade",
+            asset=market.asset,
+            side=side,
+            price=f"${price:.2f}",
+            shares=shares,
+            cost=f"${trade_size:.2f}",
+        )
+
+        if cfg.dry_run:
+            add_log(
+                "info",
+                f"[DRY RUN] Near-res: {side} {shares:.2f} @ ${price:.2f}",
+                asset=market.asset,
+            )
+            return
+
+        try:
+            # Place FOK order for the target side only (not a dual-leg arb)
+            from py_clob_client.clob_types import OrderArgs, OrderType
+
+            # Slightly aggressive price to ensure fill
+            limit_price = round(min(price + 0.02, 0.99), 2)
+
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=limit_price,
+                size=shares,
+                side="BUY",
+                order_type=OrderType.FOK,
+            )
+
+            signed_order = self.client._client.create_order(order_args)
+            result = self.client._client.post_order(signed_order)
+
+            status = result.get("status", "").upper()
+            if status in ("MATCHED", "FILLED", "LIVE"):
+                # Success!
+                self._daily_exposure += trade_size
+                self._daily_trades += 1
+                update_stats(
+                    daily_exposure=self._daily_exposure,
+                    daily_trades=self._daily_trades,
+                )
+
+                # Record trade in dashboard
+                trade_id = add_trade(
+                    asset=market.asset,
+                    yes_price=price if side == "YES" else 0,
+                    no_price=price if side == "NO" else 0,
+                    yes_cost=trade_size if side == "YES" else 0,
+                    no_cost=trade_size if side == "NO" else 0,
+                    spread=0,  # Not an arb trade
+                    expected_profit=(1.0 - price) * shares,  # Profit if we win
+                    market_end_time=market.end_time.strftime("%H:%M UTC") if market.end_time else "N/A",
+                    market_slug=market.slug,
+                    dry_run=False,
+                )
+
+                add_log(
+                    "success",
+                    f"Near-res trade executed: {side} @ ${price:.2f}",
+                    asset=market.asset,
+                    trade_id=trade_id,
+                    shares=shares,
+                )
+
+                log.info(
+                    "Near-resolution trade filled",
+                    asset=market.asset,
+                    side=side,
+                    shares=shares,
+                    cost=trade_size,
+                    trade_id=trade_id,
+                )
+            else:
+                log.warning(
+                    "Near-resolution order rejected",
+                    asset=market.asset,
+                    status=status,
+                    result=result,
+                )
+                add_log(
+                    "warning",
+                    f"Near-res order rejected: {status}",
+                    asset=market.asset,
+                )
+
+        except Exception as e:
+            log.error(
+                "Near-resolution trade failed",
+                asset=market.asset,
+                error=str(e),
+            )
+            add_log(
+                "error",
+                f"Near-res trade failed: {str(e)}",
+                asset=market.asset,
+            )
 
     async def _check_directional_opportunities(self) -> None:
         """Check for directional trading opportunities on each market."""

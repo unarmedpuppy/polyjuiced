@@ -88,6 +88,13 @@ class GabagoolConfig:
     directional_trailing_activation: float = 0.05  # Trail starts when target - 5¢
     directional_trailing_distance: float = 0.10  # 10¢ trailing stop
 
+    # Near-resolution trading settings (high-confidence bets in final minute)
+    near_resolution_enabled: bool = True  # Bet on nearly-resolved markets
+    near_resolution_time_threshold: float = 60.0  # Max seconds remaining (60s = 1 min)
+    near_resolution_min_price: float = 0.94  # Min price to bet (94 cents)
+    near_resolution_max_price: float = 0.975  # Max price to bet (97.5 cents)
+    near_resolution_size_usd: float = 10.0  # Fixed trade size for near-resolution
+
     @classmethod
     def from_env(cls) -> "GabagoolConfig":
         """Load configuration from environment variables."""
@@ -113,6 +120,12 @@ class GabagoolConfig:
             directional_stop_loss=float(os.getenv("GABAGOOL_DIRECTIONAL_STOP_LOSS", "0.11")),
             directional_trailing_activation=float(os.getenv("GABAGOOL_DIRECTIONAL_TRAILING_ACTIVATION", "0.05")),
             directional_trailing_distance=float(os.getenv("GABAGOOL_DIRECTIONAL_TRAILING_DISTANCE", "0.10")),
+            # Near-resolution trading
+            near_resolution_enabled=os.getenv("GABAGOOL_NEAR_RESOLUTION_ENABLED", "true").lower() == "true",
+            near_resolution_time_threshold=float(os.getenv("GABAGOOL_NEAR_RESOLUTION_TIME", "60.0")),
+            near_resolution_min_price=float(os.getenv("GABAGOOL_NEAR_RESOLUTION_MIN_PRICE", "0.94")),
+            near_resolution_max_price=float(os.getenv("GABAGOOL_NEAR_RESOLUTION_MAX_PRICE", "0.975")),
+            near_resolution_size_usd=float(os.getenv("GABAGOOL_NEAR_RESOLUTION_SIZE", "10.0")),
         )
 
 
