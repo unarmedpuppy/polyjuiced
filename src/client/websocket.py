@@ -233,8 +233,14 @@ class PolymarketWebSocket:
 
     async def _process_messages(self) -> None:
         """Process incoming WebSocket messages."""
+        message_count = 0
         async for message in self._ws:
             try:
+                message_count += 1
+                # Log periodically to confirm messages are being received
+                if message_count % 100 == 1:
+                    log.info("WS messages received", count=message_count, sample=str(message)[:80])
+
                 # Handle PONG/PING text messages (not JSON)
                 if message in ("PONG", "PING"):
                     continue
@@ -290,6 +296,8 @@ class PolymarketWebSocket:
         # Always convert to string for comparison
         raw_token = data.get("asset_id", data.get("token_id"))
         token_id = str(raw_token) if raw_token is not None else None
+
+        log.info("Book update received", token_id=token_id[:20] if token_id else None, has_callback=bool(self._on_book_update))
 
         if not self._on_book_update:
             return
