@@ -179,6 +179,11 @@ def main():
         signed_order = client.create_market_order(order_args)
         print(f"       Signed order created: {type(signed_order)}")
 
+        # Debug: print the order details
+        order = signed_order.order
+        print(f"       Order maker_amount: {order.makerAmount}")
+        print(f"       Order taker_amount: {order.takerAmount}")
+
         # Now POST the signed order to execute it
         print("       Posting order to exchange...")
         result = client.post_order(signed_order)
