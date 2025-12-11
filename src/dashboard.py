@@ -1316,6 +1316,12 @@ def update_markets(markets_data: Dict[str, Dict[str, Any]]) -> None:
     global active_markets
     active_markets = markets_data
 
+    log.info(
+        "update_markets called",
+        dashboard_is_set=dashboard is not None,
+        market_count=len(markets_data),
+    )
+
     if dashboard:
         asyncio.create_task(dashboard.broadcast({"markets": active_markets}))
 
