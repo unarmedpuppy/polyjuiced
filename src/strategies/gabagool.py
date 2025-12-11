@@ -18,7 +18,8 @@ import structlog
 from ..client.polymarket import PolymarketClient
 from ..client.websocket import PolymarketWebSocket
 from ..config import AppConfig, GabagoolConfig
-from ..dashboard import add_log, add_trade, add_decision, resolve_trade, update_stats, update_markets, stats, active_markets
+from .. import dashboard
+from ..dashboard import add_log, add_trade, add_decision, resolve_trade, update_stats, update_markets, stats
 from ..metrics import (
     ACTIVE_MARKETS,
     DAILY_EXPOSURE_USD,
@@ -232,18 +233,6 @@ class GabagoolStrategy(BaseStrategy):
         condition_id = state.market.condition_id
         now = time_module.time()
 
-        # Debug: Log every 5 seconds to confirm callback is firing
-        if not hasattr(self, '_last_callback_debug'):
-            self._last_callback_debug = 0
-        if now - self._last_callback_debug > 5:
-            self._last_callback_debug = now
-            log.info(
-                "RT callback firing",
-                condition_id=condition_id[:16],
-                active_market_keys=list(active_markets.keys())[:3],
-                active_count=len(active_markets),
-            )
-
         # Throttle: only broadcast every 500ms per market to avoid flooding
         last_broadcast = self._last_price_broadcast.get(condition_id, 0)
         if now - last_broadcast < 0.5:
@@ -252,18 +241,13 @@ class GabagoolStrategy(BaseStrategy):
         self._last_price_broadcast[condition_id] = now
 
         # Update the active_markets dict if this market is in it
-        if condition_id in active_markets:
-            active_markets[condition_id]["up_price"] = state.yes_price
-            active_markets[condition_id]["down_price"] = state.no_price
+        # IMPORTANT: Must use dashboard.active_markets to get current reference (not imported copy)
+        if condition_id in dashboard.active_markets:
+            dashboard.active_markets[condition_id]["up_price"] = state.yes_price
+            dashboard.active_markets[condition_id]["down_price"] = state.no_price
 
             # Broadcast the update
-            log.info(
-                "RT price broadcast",
-                asset=state.market.asset,
-                yes=f"{state.yes_price:.3f}",
-                no=f"{state.no_price:.3f}",
-            )
-            update_markets(active_markets)
+            update_markets(dashboard.active_markets)
 
     async def _run_loop(self) -> None:
         """Main strategy loop."""
