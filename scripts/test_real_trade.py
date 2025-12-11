@@ -36,6 +36,7 @@ async def main():
     # Initialize clients
     print("\n[1/4] Initializing Polymarket client...")
     poly_client = PolymarketClient(config)
+    poly_client.connect()  # Must connect first
 
     # Check balance
     balance_info = poly_client.get_balance()
@@ -114,9 +115,15 @@ async def main():
 
         if result.get("success"):
             print("✅ TRADE SUCCESSFUL!")
-            print(f"   Order ID: {result.get('order_id', 'N/A')}")
-            print(f"   Shares received: {result.get('shares', 'N/A')}")
-            print(f"   Average price: ${result.get('avg_price', 'N/A')}")
+            order = result.get("order", {})
+            print(f"   Order response: {order}")
+
+            # Check new balance
+            new_balance_info = poly_client.get_balance()
+            new_balance = new_balance_info.get("balance", 0)
+            print(f"\n   Previous balance: ${balance:.2f}")
+            print(f"   New balance: ${new_balance:.2f}")
+            print(f"   Spent: ${balance - new_balance:.2f}")
         else:
             print("❌ TRADE FAILED!")
             print(f"   Error: {result.get('error', 'Unknown error')}")
