@@ -27,6 +27,16 @@ if os.getenv('POLYMARKET_API_KEY'):
 client.get_ok()
 print("Connected!")
 
+# Get balance
+from py_clob_client.clob_types import BalanceAllowanceParams
+params = BalanceAllowanceParams(
+    asset_type="COLLATERAL",
+    signature_type=int(os.getenv('POLYMARKET_SIGNATURE_TYPE', '1'))
+)
+balance_info = client.get_balance_allowance(params)
+balance = float(balance_info.get('balance', 0)) / 1e6
+print(f"\nBalance: ${balance:.2f}")
+
 # Get open orders
 print("\nOpen orders:")
 orders = client.get_orders()
