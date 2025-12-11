@@ -16,7 +16,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds, MarketOrderArgs
+from py_clob_client.clob_types import ApiCreds, MarketOrderArgs, BalanceAllowanceParams
 import httpx
 
 def main():
@@ -72,7 +72,8 @@ def main():
     # Check balance
     print("\n[2/4] Checking balance...")
     try:
-        balance_info = client.get_balance_allowance(asset_type="COLLATERAL", signature_type=2)
+        params = BalanceAllowanceParams(asset_type="COLLATERAL", signature_type=2)
+        balance_info = client.get_balance_allowance(params)
         balance = float(balance_info.get("balance", 0)) / 1e6  # Convert from USDC decimals
         print(f"       Balance: ${balance:.2f}")
 
@@ -166,7 +167,7 @@ def main():
         print(f"✅ Order response: {result}")
 
         # Check new balance
-        new_balance_info = client.get_balance_allowance(asset_type="COLLATERAL", signature_type=2)
+        new_balance_info = client.get_balance_allowance(params)
         new_balance = float(new_balance_info.get("balance", 0)) / 1e6
         print(f"\n   Previous balance: ${balance:.2f}")
         print(f"   New balance: ${new_balance:.2f}")
