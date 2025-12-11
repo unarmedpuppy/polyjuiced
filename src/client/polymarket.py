@@ -199,7 +199,7 @@ class PolymarketClient:
             side: "BUY" or "SELL"
 
         Returns:
-            Order result dictionary
+            Order result dictionary from exchange
         """
         self._ensure_connected()
         log.info(
@@ -209,12 +209,19 @@ class PolymarketClient:
             side=side,
         )
         # py-clob-client requires MarketOrderArgs object
+        # Round amount to 2 decimals (Polymarket requirement for taker amount)
+        rounded_amount = round(amount_usd, 2)
         order_args = MarketOrderArgs(
             token_id=token_id,
-            amount=amount_usd,
+            amount=rounded_amount,
             side=side.upper(),
         )
-        return self._client.create_market_order(order_args)
+        # create_market_order returns a SignedOrder - we must POST it to execute
+        signed_order = self._client.create_market_order(order_args)
+        log.info("Order signed, posting to exchange...")
+        result = self._client.post_order(signed_order)
+        log.info("Order posted", result=result)
+        return result
 
     @retry(
         stop=stop_after_attempt(3),
