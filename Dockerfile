@@ -18,6 +18,9 @@ COPY src/ ./src/
 # Copy scripts
 COPY scripts/ ./scripts/
 
+# Copy tests (for running tests in container)
+COPY tests/ ./tests/
+
 # Create non-root user and data directory
 RUN useradd -m -u 1000 botuser && \
     mkdir -p /app/data && \
