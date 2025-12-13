@@ -59,7 +59,7 @@ class LiquiditySnapshot:
     @classmethod
     def from_order_book(
         cls,
-        order_book: dict,
+        order_book,
         token_id: str,
         condition_id: str,
         asset: str,
@@ -68,7 +68,7 @@ class LiquiditySnapshot:
         """Create a snapshot from raw order book data.
 
         Args:
-            order_book: Raw order book dict from API
+            order_book: Order book from API (dict or OrderBookSummary object)
             token_id: Token ID
             condition_id: Market condition ID
             asset: Asset symbol
@@ -77,20 +77,35 @@ class LiquiditySnapshot:
         Returns:
             LiquiditySnapshot instance
         """
-        bids = order_book.get("bids", [])
-        asks = order_book.get("asks", [])
+        # Handle both dict and OrderBookSummary object from py-clob-client
+        if hasattr(order_book, "bids"):
+            bids = order_book.bids or []
+            asks = order_book.asks or []
+        else:
+            bids = order_book.get("bids", [])
+            asks = order_book.get("asks", [])
 
         bid_levels = []
         for bid in bids[:max_levels]:
-            price = float(bid.get("price", 0))
-            size = float(bid.get("size", 0))
+            # Handle both dict and object (py-clob-client returns objects)
+            if hasattr(bid, "price"):
+                price = float(bid.price or 0)
+                size = float(bid.size or 0)
+            else:
+                price = float(bid.get("price", 0))
+                size = float(bid.get("size", 0))
             if price > 0 and size > 0:
                 bid_levels.append(DepthLevel(price=price, size=size))
 
         ask_levels = []
         for ask in asks[:max_levels]:
-            price = float(ask.get("price", 0))
-            size = float(ask.get("size", 0))
+            # Handle both dict and object (py-clob-client returns objects)
+            if hasattr(ask, "price"):
+                price = float(ask.price or 0)
+                size = float(ask.size or 0)
+            else:
+                price = float(ask.get("price", 0))
+                size = float(ask.get("size", 0))
             if price > 0 and size > 0:
                 ask_levels.append(DepthLevel(price=price, size=size))
 
