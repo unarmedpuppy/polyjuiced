@@ -142,9 +142,10 @@ class CircuitBreaker:
         if time_remaining_seconds < 60:
             return (False, "Less than 60 seconds until resolution")
 
-        # Check daily exposure limit
-        if self._daily_exposure + trade_amount > self.config.max_daily_exposure_usd:
-            return (False, "Would exceed daily exposure limit")
+        # Check daily exposure limit (0 = unlimited)
+        if self.config.max_daily_exposure_usd > 0:
+            if self._daily_exposure + trade_amount > self.config.max_daily_exposure_usd:
+                return (False, "Would exceed daily exposure limit")
 
         # Check if daily loss limit reached
         if self._daily_loss <= -self.config.max_daily_loss_usd:

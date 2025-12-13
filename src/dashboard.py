@@ -746,9 +746,14 @@ DASHBOARD_HTML = """
                 }
             }
 
-            // Sort markets by seconds_remaining (ascending - ending soonest first)
+            // Sort markets by minutes remaining (rounded) to prevent constant reordering
+            // Using minute granularity keeps the list stable while still showing soonest first
             const sortedMarkets = Object.entries(markets).sort((a, b) => {
-                return (a[1].seconds_remaining || 0) - (b[1].seconds_remaining || 0);
+                const aMinutes = Math.floor((a[1].seconds_remaining || 0) / 60);
+                const bMinutes = Math.floor((b[1].seconds_remaining || 0) / 60);
+                if (aMinutes !== bMinutes) return aMinutes - bMinutes;
+                // Secondary sort by asset name for stability within same minute
+                return (a[1].asset || '').localeCompare(b[1].asset || '');
             });
 
             // Update or create rows for each market

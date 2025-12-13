@@ -16,6 +16,7 @@ from .config import AppConfig
 from .dashboard import DashboardServer, add_log, update_stats, init_persistence
 from .dashboard import dashboard as dashboard_instance
 import src.dashboard as dashboard_module
+from .liquidity import LiquidityCollector
 from .metrics import init_metrics
 from .metrics_server import MetricsServer
 from .monitoring.market_finder import MarketFinder
@@ -77,6 +78,7 @@ class GabagoolBot:
         self._metrics_server: Optional[MetricsServer] = None
         self._dashboard: Optional[DashboardServer] = None
         self._db: Optional[Database] = None
+        self._liquidity_collector: Optional[LiquidityCollector] = None
 
     async def start(self) -> None:
         """Start the bot and all components."""
@@ -144,6 +146,10 @@ class GabagoolBot:
         # Stop strategy
         if self._strategy:
             await self._strategy.stop()
+
+        # Stop liquidity collector
+        if self._liquidity_collector:
+            await self._liquidity_collector.stop()
 
         # Cancel WebSocket task
         if self._ws_task:
@@ -237,6 +243,18 @@ class GabagoolBot:
             market_finder=self._market_finder,
             config=self.config,
         )
+
+        # Create liquidity collector for fill/depth data collection
+        # See docs/LIQUIDITY_SIZING.md for roadmap
+        self._liquidity_collector = LiquidityCollector(
+            client=self._client,
+            database=self._db,
+            snapshot_interval_seconds=30.0,
+            max_snapshot_levels=10,
+        )
+        await self._liquidity_collector.start()
+        self._strategy.set_liquidity_collector(self._liquidity_collector)
+        add_log("info", "Liquidity data collection enabled")
 
         log.info("All components initialized")
 

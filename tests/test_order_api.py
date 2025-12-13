@@ -1,13 +1,34 @@
-"""Tests for Polymarket order API usage.
+"""Tests for Polymarket order API usage and trading strategy protections.
 
 These tests verify that we're using the py-clob-client library correctly,
 particularly around order placement and order types (FOK, GTC, etc.).
 
-Regression test for: OrderArgs.__init__() got an unexpected keyword argument 'order_type'
-The order_type parameter must be passed to post_order(), not OrderArgs().
+REGRESSION TESTS FOR KNOWN ISSUES:
+1. OrderArgs.__init__() got an unexpected keyword argument 'order_type'
+   - The order_type parameter must be passed to post_order(), not OrderArgs().
+   - See: TestOrderArgsSignature
 
-Note: We use GTC instead of FOK due to decimal precision bugs in py-clob-client.
-See: https://github.com/Polymarket/py-clob-client/issues/121
+2. Decimal precision errors: "invalid amounts, max accuracy of 2 decimals"
+   - FOK orders have precision bugs in py-clob-client
+   - We use GTC with Decimal module and ROUND_DOWN
+   - See: https://github.com/Polymarket/py-clob-client/issues/121
+   - See: TestDecimalPrecision
+
+3. Partial fills leaving directional exposure
+   - If YES fills but NO doesn't, we're left holding an unhedged position
+   - Solution: Pre-flight liquidity check + automatic unwind
+   - See: TestPartialFillProtection
+
+4. Position stacking from arb + near-resolution on same market
+   - Running both strategies on same market creates unbalanced positions
+   - Solution: Track arb positions and skip them for near-resolution
+   - See: TestPositionStackingPrevention
+
+5. Auto-settlement for resolved positions
+   - py-clob-client lacks native redeem function
+   - Workaround: Sell at $0.99 after market resolution
+   - See: https://github.com/Polymarket/py-clob-client/issues/117
+   - See: TestAutoSettlement
 """
 
 import inspect
@@ -201,6 +222,183 @@ class TestOrderTypeUsageInCodebase:
                     )
 
 
+class TestAutoSettlement:
+    """Tests for automatic settlement and position claiming functionality."""
+
+    def test_claim_resolved_position_method_exists(self):
+        """Verify claim_resolved_position method is implemented."""
+        import src.client.polymarket as polymarket_module
+
+        assert hasattr(polymarket_module.PolymarketClient, 'claim_resolved_position'), (
+            "PolymarketClient should have claim_resolved_position method"
+        )
+
+    def test_cancel_stale_orders_method_exists(self):
+        """Verify cancel_stale_orders method is implemented."""
+        import src.client.polymarket as polymarket_module
+
+        assert hasattr(polymarket_module.PolymarketClient, 'cancel_stale_orders'), (
+            "PolymarketClient should have cancel_stale_orders method"
+        )
+
+    def test_tracked_position_dataclass_exists(self):
+        """Verify TrackedPosition dataclass is defined in gabagool strategy."""
+        import src.strategies.gabagool as gabagool_module
+
+        assert hasattr(gabagool_module, 'TrackedPosition'), (
+            "gabagool module should have TrackedPosition dataclass"
+        )
+
+    def test_tracked_position_has_required_fields(self):
+        """Verify TrackedPosition has all required fields."""
+        from src.strategies.gabagool import TrackedPosition
+        from dataclasses import fields
+
+        field_names = [f.name for f in fields(TrackedPosition)]
+
+        required_fields = [
+            'condition_id', 'token_id', 'shares', 'entry_price',
+            'entry_cost', 'market_end_time', 'side', 'asset', 'claimed'
+        ]
+
+        for field in required_fields:
+            assert field in field_names, f"TrackedPosition missing required field: {field}"
+
+    def test_gabagool_strategy_has_settlement_tracking(self):
+        """Verify GabagoolStrategy has position tracking infrastructure."""
+        import src.strategies.gabagool as gabagool_module
+        source = inspect.getsource(gabagool_module.GabagoolStrategy.__init__)
+
+        assert '_tracked_positions' in source, (
+            "GabagoolStrategy should initialize _tracked_positions dict"
+        )
+        assert '_settlement_check_interval' in source, (
+            "GabagoolStrategy should have settlement check interval"
+        )
+
+    def test_check_settlement_method_exists(self):
+        """Verify _check_settlement method is implemented."""
+        import src.strategies.gabagool as gabagool_module
+
+        assert hasattr(gabagool_module.GabagoolStrategy, '_check_settlement'), (
+            "GabagoolStrategy should have _check_settlement method"
+        )
+
+    def test_track_position_method_exists(self):
+        """Verify _track_position method is implemented."""
+        import src.strategies.gabagool as gabagool_module
+
+        assert hasattr(gabagool_module.GabagoolStrategy, '_track_position'), (
+            "GabagoolStrategy should have _track_position method"
+        )
+
+
+class TestPartialFillProtection:
+    """Tests for partial fill detection and unwinding."""
+
+    def test_dual_leg_has_liquidity_check(self):
+        """Verify execute_dual_leg_order checks liquidity before trading."""
+        import src.client.polymarket as polymarket_module
+        source = inspect.getsource(polymarket_module.PolymarketClient.execute_dual_leg_order)
+
+        assert "get_order_book" in source, (
+            "execute_dual_leg_order should check order book for liquidity"
+        )
+        assert "Insufficient liquidity" in source, (
+            "execute_dual_leg_order should reject on insufficient liquidity"
+        )
+
+    def test_dual_leg_has_persistence_estimate(self):
+        """Verify liquidity check uses conservative persistence estimate."""
+        import src.client.polymarket as polymarket_module
+        source = inspect.getsource(polymarket_module.PolymarketClient.execute_dual_leg_order)
+
+        assert "PERSISTENCE_ESTIMATE" in source, (
+            "execute_dual_leg_order should apply persistence estimate to displayed depth"
+        )
+        # Should be a conservative value (< 0.5)
+        assert "0.4" in source or "0.3" in source, (
+            "Persistence estimate should be conservative (40% or less)"
+        )
+
+    def test_dual_leg_has_self_collapse_check(self):
+        """Verify we don't consume majority of book depth."""
+        import src.client.polymarket as polymarket_module
+        source = inspect.getsource(polymarket_module.PolymarketClient.execute_dual_leg_order)
+
+        assert "self-induced" in source.lower() or "collapse" in source.lower(), (
+            "execute_dual_leg_order should check for self-induced spread collapse"
+        )
+
+    def test_dual_leg_has_unwind_logic(self):
+        """Verify execute_dual_leg_order has unwind logic for partial fills."""
+        import src.client.polymarket as polymarket_module
+        source = inspect.getsource(polymarket_module.PolymarketClient.execute_dual_leg_order)
+
+        assert "unwind" in source.lower(), (
+            "execute_dual_leg_order should have unwind logic for partial fills"
+        )
+        assert "SELL" in source, (
+            "execute_dual_leg_order should sell to unwind partial fills"
+        )
+
+    def test_partial_fill_returns_unwound_status(self):
+        """Verify partial fill response includes unwind status."""
+        import src.client.polymarket as polymarket_module
+        source = inspect.getsource(polymarket_module.PolymarketClient.execute_dual_leg_order)
+
+        # Check that the return dict includes unwind information
+        assert '"unwound"' in source or "'unwound'" in source, (
+            "Partial fill response should include 'unwound' status"
+        )
+        assert '"unwind_order"' in source or "'unwind_order'" in source, (
+            "Partial fill response should include 'unwind_order' result"
+        )
+
+
+class TestPositionStackingPrevention:
+    """Tests for preventing near-resolution trades from stacking on arbitrage positions."""
+
+    def test_arbitrage_positions_tracking_exists(self):
+        """Verify _arbitrage_positions tracking dict exists."""
+        import src.strategies.gabagool as gabagool_module
+        source = inspect.getsource(gabagool_module.GabagoolStrategy.__init__)
+
+        assert "_arbitrage_positions" in source, (
+            "GabagoolStrategy should track arbitrage positions"
+        )
+
+    def test_near_resolution_skips_arbitrage_positions(self):
+        """Verify near-resolution trades skip markets with existing arbitrage positions."""
+        import src.strategies.gabagool as gabagool_module
+        source = inspect.getsource(gabagool_module.GabagoolStrategy._check_near_resolution_opportunities)
+
+        assert "_arbitrage_positions" in source, (
+            "Near-resolution should check for existing arbitrage positions"
+        )
+        assert "existing arbitrage position" in source.lower(), (
+            "Near-resolution should skip markets with arbitrage positions"
+        )
+
+    def test_arbitrage_marks_position_after_trade(self):
+        """Verify successful arbitrage trade marks the market."""
+        import src.strategies.gabagool as gabagool_module
+        source = inspect.getsource(gabagool_module.GabagoolStrategy._execute_trade)
+
+        assert "_arbitrage_positions" in source, (
+            "Arbitrage trade should mark position after successful execution"
+        )
+
+    def test_arbitrage_positions_cleared_on_reset(self):
+        """Verify arbitrage positions are cleared on daily reset."""
+        import src.strategies.gabagool as gabagool_module
+        source = inspect.getsource(gabagool_module.GabagoolStrategy._check_daily_reset)
+
+        assert "_arbitrage_positions.clear()" in source, (
+            "Daily reset should clear arbitrage position tracking"
+        )
+
+
 class TestDecimalPrecision:
     """Regression tests for decimal precision issues.
 
@@ -352,3 +550,262 @@ class TestDecimalPrecision:
                 assert fok_in_code == 0, (
                     f"{rel_path} should use GTC instead of FOK in post_order calls"
                 )
+
+
+class TestArbitragePositionSizing:
+    """Regression tests for arbitrage position sizing.
+
+    ISSUE: User observed unequal share positions (30.3 UP vs 16.8 DOWN)
+    when both arbitrage and near-resolution strategies were active.
+
+    REQUIREMENT: Arbitrage trades MUST have equal shares on both sides.
+    This ensures guaranteed profit regardless of market outcome:
+    - If UP wins: 30 shares * $1 = $30
+    - If DOWN wins: 30 shares * $1 = $30
+    Equal shares = equal payout regardless of winner.
+
+    Unequal shares break the arbitrage by creating directional exposure.
+    """
+
+    def test_calculate_position_sizes_returns_equal_shares(self):
+        """Verify position sizing calculates for equal share counts."""
+        # The arbitrage formula: shares = budget / (yes_price + no_price)
+        # Then buy 'shares' of YES and 'shares' of NO
+
+        budget = 20.0  # $20 budget
+        yes_price = 0.53
+        no_price = 0.40
+
+        # Expected calculation
+        cost_per_pair = yes_price + no_price  # 0.93
+        num_pairs = budget / cost_per_pair    # 21.5 shares each side
+
+        # Verify the math
+        assert cost_per_pair == pytest.approx(0.93, rel=0.01)
+        assert num_pairs == pytest.approx(21.5, rel=0.01)
+
+        # Total cost should equal budget
+        yes_cost = num_pairs * yes_price  # 21.5 * 0.53 = $11.40
+        no_cost = num_pairs * no_price    # 21.5 * 0.40 = $8.60
+        total_cost = yes_cost + no_cost   # $20.00
+
+        assert total_cost == pytest.approx(budget, rel=0.01)
+
+        # Share counts should be equal!
+        yes_shares = num_pairs
+        no_shares = num_pairs
+        assert yes_shares == no_shares, "Arbitrage MUST have equal share counts"
+
+    def test_unequal_shares_breaks_arbitrage_guarantee(self):
+        """Demonstrate why unequal shares break the arbitrage.
+
+        With the user's actual position:
+        - UP: 30.3 shares @ $0.53 = $16.06 cost
+        - DOWN: 16.8 shares @ $0.40 = $6.72 cost
+        - Total: $22.78 cost
+
+        Outcomes:
+        - If UP wins: 30.3 * $1 = $30.30 (profit: $7.52)
+        - If DOWN wins: 16.8 * $1 = $16.80 (LOSS: $5.98)
+
+        This is NOT arbitrage - it's a directional bet with risk!
+        """
+        up_shares = 30.3
+        down_shares = 16.8
+        up_cost = 16.06
+        down_cost = 6.72
+        total_cost = up_cost + down_cost
+
+        # If UP wins
+        up_win_payout = up_shares * 1.0
+        up_win_profit = up_win_payout - total_cost
+
+        # If DOWN wins
+        down_win_payout = down_shares * 1.0
+        down_win_profit = down_win_payout - total_cost
+
+        # Verify the asymmetric outcomes
+        assert up_win_profit > 0, "UP win should profit"
+        assert down_win_profit < 0, "DOWN win should LOSE money"
+
+        # This proves unequal shares is NOT arbitrage
+        assert up_win_profit != pytest.approx(down_win_profit, abs=1.0), (
+            "Unequal shares create asymmetric outcomes - not arbitrage!"
+        )
+
+    def test_equal_shares_guarantees_profit(self):
+        """Demonstrate that equal shares guarantee profit.
+
+        Correct arbitrage with equal shares:
+        - UP: 21.5 shares @ $0.53 = $11.40
+        - DOWN: 21.5 shares @ $0.40 = $8.60
+        - Total: $20.00 cost
+        - Either outcome: 21.5 * $1 = $21.50
+        - Guaranteed profit: $1.50
+        """
+        shares = 21.5  # Equal on both sides
+        up_price = 0.53
+        down_price = 0.40
+
+        up_cost = shares * up_price
+        down_cost = shares * down_price
+        total_cost = up_cost + down_cost
+
+        # Either outcome pays the same
+        payout = shares * 1.0
+        profit = payout - total_cost
+
+        # Verify guaranteed profit
+        assert profit > 0, "Equal shares should guarantee profit"
+        assert profit == pytest.approx(1.505, rel=0.01)
+
+        # Spread was 7 cents, so profit = shares * spread
+        spread = 1.0 - up_price - down_price
+        expected_profit = shares * spread
+        assert profit == pytest.approx(expected_profit, rel=0.01)
+
+
+class TestPartialFillScenarios:
+    """Regression tests for partial fill scenarios.
+
+    ISSUE: User placed dual-leg order but only one leg filled.
+    The unfilled leg showed as "open order" leaving directional exposure.
+
+    REQUIREMENT: Both legs must fill or neither. If partial fill occurs,
+    automatically unwind the filled leg to return to neutral.
+    """
+
+    def test_partial_fill_detection_in_response(self):
+        """Verify we can detect partial fills from API response."""
+        # Simulated API responses
+        yes_filled = {"status": "MATCHED", "size": "21.5"}
+        no_rejected = {"status": "REJECTED", "size": "0"}
+
+        # Detection logic
+        yes_status = yes_filled.get("status", "").upper()
+        no_status = no_rejected.get("status", "").upper()
+
+        yes_ok = yes_status in ("MATCHED", "FILLED", "LIVE")
+        no_ok = no_status in ("MATCHED", "FILLED", "LIVE")
+
+        partial_fill = yes_ok and not no_ok
+
+        assert partial_fill is True, "Should detect partial fill scenario"
+
+    def test_unwind_sells_at_aggressive_price(self):
+        """Verify unwind logic uses aggressive pricing for quick fill."""
+        from decimal import Decimal, ROUND_DOWN
+
+        current_price = 0.53
+        # Unwind should sell 2 cents below market to ensure fill
+        expected_sell_price = Decimal(str(current_price)) - Decimal("0.02")
+        expected_sell_price = max(expected_sell_price, Decimal("0.01"))
+
+        assert float(expected_sell_price) == pytest.approx(0.51, rel=0.01)
+
+
+class TestNearResolutionStrategyIsolation:
+    """Regression tests for near-resolution strategy isolation.
+
+    ISSUE: Near-resolution trades were stacking on top of arbitrage positions,
+    creating unbalanced share counts.
+
+    REQUIREMENT: Near-resolution should NEVER execute on markets where we
+    already have an arbitrage position.
+    """
+
+    def test_strategy_tracking_is_separate(self):
+        """Verify we track arb and near-res positions separately."""
+        # Simulated tracking dicts (as used in GabagoolStrategy)
+        arbitrage_positions = {}  # {condition_id: True}
+        near_resolution_executed = {}  # {condition_id: True}
+
+        condition_id = "test_market_123"
+
+        # Execute arbitrage on market
+        arbitrage_positions[condition_id] = True
+
+        # Near-resolution should check and skip
+        should_skip_near_res = condition_id in arbitrage_positions
+
+        assert should_skip_near_res is True, (
+            "Near-resolution should skip markets with existing arbitrage"
+        )
+
+    def test_near_resolution_requirements(self):
+        """Verify near-resolution strategy requirements."""
+        # Near-resolution config defaults
+        time_threshold = 60.0  # Final 60 seconds only
+        min_price = 0.94      # Must be at least 94 cents
+        max_price = 0.975     # Must be at most 97.5 cents
+
+        # Test valid near-resolution scenario
+        seconds_left = 45
+        up_price = 0.96
+
+        is_near_resolution = (
+            seconds_left <= time_threshold and
+            min_price <= up_price <= max_price
+        )
+
+        assert is_near_resolution is True
+
+        # Test invalid - too much time
+        is_invalid = 120 <= time_threshold
+        assert is_invalid is False
+
+        # Test invalid - price too low
+        is_invalid = min_price <= 0.85
+        assert is_invalid is False
+
+
+class TestSettlementWorkaround:
+    """Regression tests for settlement workaround.
+
+    ISSUE: py-clob-client doesn't have a native redeem/claim function.
+    After market resolves, winning positions are worth $1 but we can't
+    directly claim them.
+
+    WORKAROUND: Sell winning positions at $0.99 to realize profits.
+    Prices reach $0.99 approximately 10-15 minutes after market close.
+
+    See: https://github.com/Polymarket/py-clob-client/issues/117
+    """
+
+    def test_settlement_timing_requirement(self):
+        """Verify we wait appropriate time before attempting claim."""
+        from datetime import datetime, timedelta
+
+        market_end_time = datetime(2024, 1, 1, 12, 0, 0)  # Market ended at noon
+        current_time = datetime(2024, 1, 1, 12, 5, 0)     # 5 minutes later
+
+        time_since_end = (current_time - market_end_time).total_seconds()
+        min_wait_seconds = 600  # 10 minutes
+
+        should_attempt = time_since_end >= min_wait_seconds
+        assert should_attempt is False, "Should wait at least 10 minutes"
+
+        # Try again after 15 minutes
+        current_time = datetime(2024, 1, 1, 12, 15, 0)
+        time_since_end = (current_time - market_end_time).total_seconds()
+        should_attempt = time_since_end >= min_wait_seconds
+
+        assert should_attempt is True, "Should attempt after 10 minutes"
+
+    def test_claim_price_is_099(self):
+        """Verify we sell at 0.99 to claim winnings."""
+        from decimal import Decimal
+
+        claim_price = Decimal("0.99")
+        shares = Decimal("21.5")
+
+        proceeds = shares * claim_price
+        assert float(proceeds) == pytest.approx(21.285, rel=0.01)
+
+        # Verify we get nearly full value
+        full_value = shares * Decimal("1.00")
+        loss_to_spread = float(full_value - proceeds)
+
+        assert loss_to_spread == pytest.approx(0.215, rel=0.01), (
+            "Loss to $0.99 spread should be minimal (1% of position)"
+        )

@@ -11,11 +11,14 @@ Named after the successful Polymarket trader @gabagool22.
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 import structlog
 
 from ..client.polymarket import PolymarketClient
+
+if TYPE_CHECKING:
+    from ..liquidity.collector import LiquidityCollector
 from ..client.websocket import PolymarketWebSocket
 from ..config import AppConfig, GabagoolConfig
 from .. import dashboard
@@ -65,6 +68,22 @@ class TradeResult:
     success: bool = True
     error: Optional[str] = None
     trade_id: Optional[str] = None  # Dashboard trade ID for resolution tracking
+
+
+@dataclass
+class TrackedPosition:
+    """A position we're tracking for auto-settlement."""
+
+    condition_id: str
+    token_id: str  # The token we own (YES or NO)
+    shares: float
+    entry_price: float
+    entry_cost: float
+    market_end_time: datetime
+    side: str  # "YES" or "NO"
+    asset: str  # "BTC", "ETH", etc.
+    trade_id: Optional[str] = None
+    claimed: bool = False
 
 
 @dataclass
@@ -172,6 +191,31 @@ class GabagoolStrategy(BaseStrategy):
         self._last_price_broadcast: Dict[str, float] = {}
         # Track near-resolution trades executed: {condition_id: True} to avoid duplicates
         self._near_resolution_executed: Dict[str, bool] = {}
+        # Track arbitrage positions: {condition_id: True} - markets with dual-leg positions
+        self._arbitrage_positions: Dict[str, bool] = {}
+        # Track positions for auto-settlement: {condition_id: [TrackedPosition, ...]}
+        self._tracked_positions: Dict[str, List[TrackedPosition]] = {}
+        # Last time we ran settlement check
+        self._last_settlement_check: float = 0
+        # Settlement check interval (every 60 seconds)
+        self._settlement_check_interval: float = 60.0
+        # Liquidity collector for fill/depth logging (optional)
+        self._liquidity_collector: Optional["LiquidityCollector"] = None
+        # Last time we took depth snapshots
+        self._last_snapshot_time: float = 0
+        # Snapshot interval (every 30 seconds)
+        self._snapshot_interval: float = 30.0
+
+    def set_liquidity_collector(self, collector: "LiquidityCollector") -> None:
+        """Set the liquidity collector for data collection.
+
+        Args:
+            collector: LiquidityCollector instance
+        """
+        self._liquidity_collector = collector
+        # Also attach to client for fill logging
+        self.client.set_liquidity_collector(collector)
+        log.info("Liquidity collector attached to strategy")
 
     async def start(self) -> None:
         """Start the Gabagool strategy."""
@@ -334,6 +378,16 @@ class GabagoolStrategy(BaseStrategy):
                 if self.gabagool_config.near_resolution_enabled:
                     await self._check_near_resolution_opportunities()
 
+                # Check for positions to settle (every 60 seconds)
+                if now - self._last_settlement_check >= self._settlement_check_interval:
+                    await self._check_settlement()
+                    self._last_settlement_check = now
+
+                # Take liquidity snapshots (every 30 seconds)
+                if self._liquidity_collector and now - self._last_snapshot_time >= self._snapshot_interval:
+                    await self._take_liquidity_snapshots()
+                    self._last_snapshot_time = now
+
                 # Short sleep to prevent busy loop but stay responsive
                 await asyncio.sleep(0.05)
 
@@ -479,30 +533,56 @@ class GabagoolStrategy(BaseStrategy):
             ).inc()
             return None
 
+        # Calculate position budget
+        # If balance sizing is enabled, use 25% of available balance
+        # Otherwise use the fixed max_trade_size_usd
+        budget = self.gabagool_config.max_trade_size_usd
+        if self.gabagool_config.balance_sizing_enabled:
+            try:
+                balance_info = self.client.get_balance()
+                available_balance = balance_info.get("balance", 0.0)
+                if available_balance > 0:
+                    # Use configured percentage of balance
+                    balance_budget = available_balance * self.gabagool_config.balance_sizing_pct
+                    # Still cap at max_trade_size if configured (acts as upper bound)
+                    if self.gabagool_config.max_trade_size_usd > 0:
+                        budget = min(balance_budget, self.gabagool_config.max_trade_size_usd)
+                    else:
+                        budget = balance_budget
+                    log.debug(
+                        "Using balance-based sizing",
+                        balance=f"${available_balance:.2f}",
+                        budget=f"${budget:.2f}",
+                        pct=f"{self.gabagool_config.balance_sizing_pct*100:.0f}%",
+                    )
+            except Exception as e:
+                log.warning("Failed to get balance for sizing, using fixed max", error=str(e))
+
         # Calculate position sizes
         yes_amount, no_amount = self.calculate_position_sizes(
-            budget=self.gabagool_config.max_trade_size_usd,
+            budget=budget,
             yes_price=opportunity.yes_price,
             no_price=opportunity.no_price,
         )
 
-        # Check exposure limits
+        # Check exposure limits (0 = unlimited)
         total_cost = yes_amount + no_amount
-        if self._daily_exposure + total_cost > self.gabagool_config.max_daily_exposure_usd:
-            add_decision(
-                asset=opportunity.market.asset,
-                action="SKIP",
-                reason=f"Exposure limit (${self._daily_exposure:.0f}+${total_cost:.0f} > ${self.gabagool_config.max_daily_exposure_usd:.0f})",
-                up_price=opportunity.yes_price,
-                down_price=opportunity.no_price,
-                spread=opportunity.spread_cents,
-            )
-            log.warning("Would exceed daily exposure limit")
-            OPPORTUNITIES_SKIPPED.labels(
-                market=opportunity.market.asset,
-                reason="exposure_limit",
-            ).inc()
-            return None
+        if self.gabagool_config.max_daily_exposure_usd > 0:
+            if self._daily_exposure + total_cost > self.gabagool_config.max_daily_exposure_usd:
+                add_decision(
+                    asset=opportunity.market.asset,
+                    action="SKIP",
+                    reason=f"Exposure limit (${self._daily_exposure:.0f}+${total_cost:.0f} > ${self.gabagool_config.max_daily_exposure_usd:.0f})",
+                    up_price=opportunity.yes_price,
+                    down_price=opportunity.no_price,
+                    spread=opportunity.spread_cents,
+                )
+                log.warning("Would exceed daily exposure limit")
+                OPPORTUNITIES_SKIPPED.labels(
+                    market=opportunity.market.asset,
+                    reason="exposure_limit",
+                ).inc()
+                return None
 
         # Execute or simulate trade
         result = await self._execute_trade(
@@ -808,6 +888,8 @@ class GabagoolStrategy(BaseStrategy):
                 yes_amount_usd=yes_amount,
                 no_amount_usd=no_amount,
                 timeout_seconds=self.gabagool_config.order_timeout_seconds,
+                condition_id=market.condition_id,
+                asset=market.asset,
             )
 
             if not api_result.get("success"):
@@ -885,6 +967,36 @@ class GabagoolStrategy(BaseStrategy):
 
             # Track for resolution
             self._pending_trades[trade_id] = result
+
+            # Track positions for auto-settlement
+            self._track_position(
+                market=market,
+                token_id=market.yes_token_id,
+                shares=yes_shares,
+                entry_price=opportunity.yes_price,
+                entry_cost=yes_amount,
+                side="YES",
+                trade_id=trade_id,
+            )
+            self._track_position(
+                market=market,
+                token_id=market.no_token_id,
+                shares=no_shares,
+                entry_price=opportunity.no_price,
+                entry_cost=no_amount,
+                side="NO",
+                trade_id=trade_id,
+            )
+
+            # Mark this market as having an arbitrage position
+            # (prevents near-resolution from stacking additional single-leg trades)
+            self._arbitrage_positions[market.condition_id] = True
+            log.debug(
+                "Marked arbitrage position",
+                condition_id=market.condition_id,
+                asset=market.asset,
+            )
+
             return result
 
         except Exception as e:
@@ -904,11 +1016,205 @@ class GabagoolStrategy(BaseStrategy):
                 error=str(e),
             )
 
+    def _track_position(
+        self,
+        market: Market15Min,
+        token_id: str,
+        shares: float,
+        entry_price: float,
+        entry_cost: float,
+        side: str,
+        trade_id: Optional[str] = None,
+    ) -> None:
+        """Track a position for auto-settlement.
+
+        Args:
+            market: Market the position is in
+            token_id: Token ID of the position
+            shares: Number of shares
+            entry_price: Price we paid per share
+            entry_cost: Total cost
+            side: "YES" or "NO"
+            trade_id: Associated trade ID
+        """
+        position = TrackedPosition(
+            condition_id=market.condition_id,
+            token_id=token_id,
+            shares=shares,
+            entry_price=entry_price,
+            entry_cost=entry_cost,
+            market_end_time=market.end_time,
+            side=side,
+            asset=market.asset,
+            trade_id=trade_id,
+        )
+
+        if market.condition_id not in self._tracked_positions:
+            self._tracked_positions[market.condition_id] = []
+
+        self._tracked_positions[market.condition_id].append(position)
+        log.debug(
+            "Position tracked for settlement",
+            asset=market.asset,
+            side=side,
+            shares=shares,
+            condition_id=market.condition_id[:20] + "...",
+        )
+
+    async def _check_settlement(self) -> None:
+        """Check for positions that need settlement (claiming winnings).
+
+        This method:
+        1. Cancels stale GTC orders for markets that have ended
+        2. Attempts to claim winnings by selling resolved positions at 0.99
+        """
+        if self.gabagool_config.dry_run:
+            # Skip settlement in dry run mode
+            return
+
+        now = datetime.utcnow()
+
+        # 1. Cancel stale orders for ended markets
+        active_market_ids = set(self._active_markets.keys())
+        try:
+            cancel_result = await self.client.cancel_stale_orders(active_market_ids)
+            if cancel_result["cancelled"] > 0:
+                add_log(
+                    "info",
+                    f"Cancelled {cancel_result['cancelled']} stale orders",
+                )
+        except Exception as e:
+            log.error("Failed to cancel stale orders", error=str(e))
+
+        # 2. Check for positions to claim
+        positions_to_remove = []
+
+        for condition_id, positions in self._tracked_positions.items():
+            for position in positions:
+                # Skip already claimed
+                if position.claimed:
+                    continue
+
+                # Check if market has ended (with 15-min buffer for resolution)
+                if position.market_end_time is None:
+                    continue
+
+                time_since_end = (now - position.market_end_time).total_seconds()
+
+                # Wait at least 10 minutes after market end for prices to reach 0.99
+                # (Per GitHub issue #117, prices reach 0.99 about 10-15 min after close)
+                if time_since_end < 600:  # 10 minutes
+                    continue
+
+                # Try to claim this position
+                log.info(
+                    "Attempting to claim resolved position",
+                    asset=position.asset,
+                    side=position.side,
+                    shares=position.shares,
+                    condition_id=condition_id[:20] + "...",
+                )
+
+                try:
+                    claim_result = await self.client.claim_resolved_position(
+                        token_id=position.token_id,
+                        shares=position.shares,
+                        timeout_seconds=self.gabagool_config.order_timeout_seconds,
+                    )
+
+                    if claim_result["success"]:
+                        position.claimed = True
+                        proceeds = claim_result["proceeds"]
+                        profit = proceeds - position.entry_cost
+
+                        add_log(
+                            "success",
+                            f"Claimed {position.asset} {position.side}: +${proceeds:.2f}",
+                            profit=f"${profit:.2f}",
+                        )
+
+                        # Update wallet balance
+                        try:
+                            balance_info = self.client.get_balance()
+                            update_stats(wallet_balance=balance_info.get("balance", 0.0))
+                        except Exception:
+                            pass
+
+                    else:
+                        # Log but don't mark as claimed - will retry next cycle
+                        log.warning(
+                            "Failed to claim position, will retry",
+                            error=claim_result.get("error"),
+                            asset=position.asset,
+                        )
+
+                except Exception as e:
+                    log.error(
+                        "Error claiming position",
+                        error=str(e),
+                        asset=position.asset,
+                    )
+
+        # Clean up fully claimed positions (all positions for a market claimed)
+        for condition_id, positions in list(self._tracked_positions.items()):
+            if all(p.claimed for p in positions):
+                positions_to_remove.append(condition_id)
+
+        for condition_id in positions_to_remove:
+            del self._tracked_positions[condition_id]
+            log.info(
+                "Removed fully settled market",
+                condition_id=condition_id[:20] + "...",
+            )
+
+    async def _take_liquidity_snapshots(self) -> None:
+        """Take periodic order book depth snapshots for all active markets.
+
+        This builds historical depth data for persistence/slippage analysis.
+        See docs/LIQUIDITY_SIZING.md for the roadmap.
+        """
+        if not self._liquidity_collector:
+            return
+
+        snapshot_count = 0
+        for condition_id, market in self._active_markets.items():
+            try:
+                # Snapshot YES token
+                await self._liquidity_collector.take_snapshot(
+                    token_id=market.yes_token_id,
+                    condition_id=condition_id,
+                    asset=market.asset,
+                )
+                snapshot_count += 1
+
+                # Snapshot NO token
+                await self._liquidity_collector.take_snapshot(
+                    token_id=market.no_token_id,
+                    condition_id=condition_id,
+                    asset=market.asset,
+                )
+                snapshot_count += 1
+
+            except Exception as e:
+                log.debug("Failed to take snapshot", asset=market.asset, error=str(e))
+
+        if snapshot_count > 0:
+            log.debug(
+                "Liquidity snapshots taken",
+                count=snapshot_count,
+                markets=len(self._active_markets),
+            )
+
     async def _check_resolved_trades(self) -> None:
         """Check for resolved markets and update dashboard with results.
 
-        For 15-minute markets, we check if the market has ended and
-        then query for the resolution to determine win/loss.
+        For 15-minute binary markets with hedged arbitrage positions,
+        we can calculate the profit deterministically:
+        - At resolution, one side pays $1, the other $0
+        - Profit = min(yes_shares, no_shares) - total_cost
+
+        We use a timeout-based approach since the API resolution endpoint
+        may not always return data promptly for 15-min markets.
         """
         if not self._pending_trades:
             return
@@ -916,66 +1222,80 @@ class GabagoolStrategy(BaseStrategy):
         now = datetime.utcnow()
         resolved_ids = []
 
-        for trade_id, trade_result in self._pending_trades.items():
+        # Resolution timeout: resolve 60 seconds after market ends
+        # This gives Polymarket time to settle, but ensures we don't wait forever
+        RESOLUTION_TIMEOUT_SECONDS = 60
+
+        for trade_id, trade_result in list(self._pending_trades.items()):
             market = trade_result.market
 
-            # Check if market has ended (give a 30-second buffer)
+            # Check if market has end_time
             if not hasattr(market, "end_time") or market.end_time is None:
-                # For dry run simulations without end_time, auto-resolve after 15 mins
-                if trade_result.dry_run:
-                    elapsed = (now - trade_result.executed_at).total_seconds()
-                    if elapsed > 900:  # 15 minutes
-                        # Simulate a win (arbitrage should always profit if executed correctly)
-                        actual_profit = trade_result.expected_profit
-                        resolve_trade(trade_id, won=True, actual_profit=actual_profit)
+                # No end_time - use execution time + 15 mins as fallback
+                elapsed = (now - trade_result.executed_at).total_seconds()
+                if elapsed > 900 + RESOLUTION_TIMEOUT_SECONDS:  # 15 minutes + timeout
+                    # Auto-resolve based on expected profit (arbitrage is deterministic)
+                    actual_profit = trade_result.expected_profit
+                    won = actual_profit > 0
+                    resolve_trade(trade_id, won=won, actual_profit=actual_profit)
+                    resolved_ids.append(trade_id)
+                    log.info(
+                        "Trade resolved (timeout, no end_time)",
+                        asset=market.asset,
+                        profit=f"${actual_profit:.2f}",
+                        dry_run=trade_result.dry_run,
+                    )
+                continue
+
+            # Market has end_time - check if enough time has passed
+            time_since_end = (now - market.end_time).total_seconds()
+
+            if time_since_end < 0:
+                # Market hasn't ended yet
+                continue
+
+            if time_since_end < RESOLUTION_TIMEOUT_SECONDS:
+                # Market ended but we're still in the grace period
+                # Try API resolution first
+                try:
+                    resolution = await self.client.get_market_resolution(
+                        condition_id=market.condition_id
+                    )
+                    if resolution is not None:
+                        # API confirmed resolution
+                        actual_profit = min(trade_result.yes_shares, trade_result.no_shares) - trade_result.total_cost
+                        won = actual_profit > 0
+                        resolve_trade(trade_id, won=won, actual_profit=actual_profit)
                         resolved_ids.append(trade_id)
                         log.info(
-                            "DRY RUN: Simulated resolution",
+                            "Trade resolved (API confirmed)",
                             asset=market.asset,
+                            won=won,
                             profit=f"${actual_profit:.2f}",
                         )
+                except Exception as e:
+                    log.debug(
+                        "Resolution API check failed, will retry or timeout",
+                        trade_id=trade_id,
+                        error=str(e),
+                    )
                 continue
 
-            # Market has end_time - check if resolved
-            if now < market.end_time:
-                continue
+            # Timeout reached - auto-resolve
+            # For hedged arbitrage, profit is deterministic: min(shares) - cost
+            actual_profit = min(trade_result.yes_shares, trade_result.no_shares) - trade_result.total_cost
+            won = actual_profit > 0
 
-            # Market ended - query for resolution
-            try:
-                # Get market resolution from API
-                resolution = await self.client.get_market_resolution(
-                    condition_id=market.condition_id
-                )
+            resolve_trade(trade_id, won=won, actual_profit=actual_profit)
+            resolved_ids.append(trade_id)
 
-                if resolution is None:
-                    # Not yet resolved, wait
-                    continue
-
-                # Calculate actual profit based on resolution
-                # In arbitrage, we hold both YES and NO
-                # One side pays $1, the other pays $0
-                # Profit = $1 * min(yes_shares, no_shares) - total_cost
-                actual_profit = min(trade_result.yes_shares, trade_result.no_shares) - trade_result.total_cost
-
-                # We "win" if we made profit (which should always happen in arbitrage)
-                won = actual_profit > 0
-
-                resolve_trade(trade_id, won=won, actual_profit=actual_profit)
-                resolved_ids.append(trade_id)
-
-                log.info(
-                    "Market resolved",
-                    asset=market.asset,
-                    won=won,
-                    profit=f"${actual_profit:.2f}",
-                )
-
-            except Exception as e:
-                log.error(
-                    "Error checking resolution",
-                    trade_id=trade_id,
-                    error=str(e),
-                )
+            log.info(
+                "Trade resolved (timeout)",
+                asset=market.asset,
+                won=won,
+                profit=f"${actual_profit:.2f}",
+                time_since_end=f"{time_since_end:.0f}s",
+            )
 
         # Remove resolved trades from tracking
         for trade_id in resolved_ids:
@@ -995,6 +1315,7 @@ class GabagoolStrategy(BaseStrategy):
             self._daily_exposure = 0.0
             self._directional_daily_exposure = 0.0
             self._near_resolution_executed.clear()  # Reset near-resolution tracking
+            self._arbitrage_positions.clear()  # Reset arbitrage position tracking
             self._last_reset = now
 
     async def _check_near_resolution_opportunities(self) -> None:
@@ -1011,6 +1332,16 @@ class GabagoolStrategy(BaseStrategy):
         for condition_id, market in self._active_markets.items():
             # Skip if we already executed a near-resolution trade on this market
             if condition_id in self._near_resolution_executed:
+                continue
+
+            # Skip if we have an existing arbitrage position on this market
+            # (prevents unbalanced positions from stacking arb + near-res)
+            if condition_id in self._arbitrage_positions:
+                log.debug(
+                    "Near-res skipped: existing arbitrage position",
+                    asset=market.asset,
+                    condition_id=condition_id,
+                )
                 continue
 
             # Check time remaining - must be under threshold (default 60s)
@@ -1215,6 +1546,17 @@ class GabagoolStrategy(BaseStrategy):
                     side=side,
                     shares=shares,
                     cost=trade_size,
+                    trade_id=trade_id,
+                )
+
+                # Track position for auto-settlement
+                self._track_position(
+                    market=market,
+                    token_id=token_id,
+                    shares=shares,
+                    entry_price=limit_price,
+                    entry_cost=trade_size,
+                    side=side,
                     trade_id=trade_id,
                 )
             else:

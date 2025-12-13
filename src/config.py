@@ -62,12 +62,14 @@ class GabagoolConfig:
     min_spread_threshold: float = 0.02  # 2 cents minimum to trade
 
     # Position sizing
-    max_trade_size_usd: float = 25.0  # Per order
+    max_trade_size_usd: float = 25.0  # Per order (may be overridden by balance-based sizing)
     max_per_window_usd: float = 50.0  # Per 15-min market
-    max_daily_exposure_usd: float = 200.0  # Daily limit
+    max_daily_exposure_usd: float = 0.0  # 0 = unlimited (circuit breaker uses max_daily_loss instead)
+    balance_sizing_enabled: bool = True  # Scale position size with available balance
+    balance_sizing_pct: float = 0.25  # Use up to 25% of available capital per arb trade
 
-    # Risk limits
-    max_daily_loss_usd: float = 5.0  # Stop trading for day
+    # Risk limits (circuit breaker)
+    max_daily_loss_usd: float = 10.0  # Stop trading for day if losses exceed this
     max_unhedged_exposure_usd: float = 10.0  # Trigger hedge
     max_slippage_cents: float = 2.0  # Reject trade
 
@@ -104,8 +106,10 @@ class GabagoolConfig:
             min_spread_threshold=float(os.getenv("GABAGOOL_MIN_SPREAD", "0.02")),
             max_trade_size_usd=float(os.getenv("GABAGOOL_MAX_TRADE_SIZE", "25.0")),
             max_per_window_usd=float(os.getenv("GABAGOOL_MAX_PER_WINDOW", "50.0")),
-            max_daily_exposure_usd=float(os.getenv("GABAGOOL_MAX_DAILY_EXPOSURE", "200.0")),
-            max_daily_loss_usd=float(os.getenv("GABAGOOL_MAX_DAILY_LOSS", "5.0")),
+            max_daily_exposure_usd=float(os.getenv("GABAGOOL_MAX_DAILY_EXPOSURE", "0.0")),
+            balance_sizing_enabled=os.getenv("GABAGOOL_BALANCE_SIZING_ENABLED", "true").lower() == "true",
+            balance_sizing_pct=float(os.getenv("GABAGOOL_BALANCE_SIZING_PCT", "0.25")),
+            max_daily_loss_usd=float(os.getenv("GABAGOOL_MAX_DAILY_LOSS", "10.0")),
             max_unhedged_exposure_usd=float(os.getenv("GABAGOOL_MAX_UNHEDGED", "10.0")),
             max_slippage_cents=float(os.getenv("GABAGOOL_MAX_SLIPPAGE", "2.0")),
             order_timeout_seconds=float(os.getenv("GABAGOOL_ORDER_TIMEOUT", "10.0")),

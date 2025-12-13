@@ -257,10 +257,11 @@ class PositionSizer:
         if position.total_cost > self.config.max_per_window_usd:
             return (False, "Total cost exceeds per-window limit")
 
-        # Check daily exposure
-        projected_exposure = current_daily_exposure + position.total_cost
-        if projected_exposure > self.config.max_daily_exposure_usd:
-            return (False, "Would exceed daily exposure limit")
+        # Check daily exposure (0 = unlimited)
+        if self.config.max_daily_exposure_usd > 0:
+            projected_exposure = current_daily_exposure + position.total_cost
+            if projected_exposure > self.config.max_daily_exposure_usd:
+                return (False, "Would exceed daily exposure limit")
 
         # Check minimum profit
         if position.expected_profit < 0:

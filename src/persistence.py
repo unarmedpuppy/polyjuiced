@@ -110,6 +110,54 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_markets_end_time ON markets(end_time);
             CREATE INDEX IF NOT EXISTS idx_logs_created ON logs(created_at);
             CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
+
+            -- =========================================================================
+            -- Liquidity Data Tables (for building persistence/slippage models)
+            -- See docs/LIQUIDITY_SIZING.md for rationale
+            -- =========================================================================
+
+            -- Fill records: captures every order execution with slippage data
+            CREATE TABLE IF NOT EXISTS fill_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                token_id TEXT NOT NULL,
+                condition_id TEXT NOT NULL,
+                asset TEXT NOT NULL,
+                side TEXT NOT NULL,
+                intended_size REAL NOT NULL,
+                filled_size REAL NOT NULL,
+                intended_price REAL NOT NULL,
+                actual_avg_price REAL NOT NULL,
+                time_to_fill_ms INTEGER NOT NULL,
+                slippage REAL NOT NULL,
+                pre_fill_depth REAL NOT NULL,
+                post_fill_depth REAL,
+                order_type TEXT DEFAULT 'GTC',
+                order_id TEXT,
+                fill_ratio REAL,
+                persistence_ratio REAL
+            );
+
+            -- Liquidity snapshots: periodic order book depth captures
+            CREATE TABLE IF NOT EXISTS liquidity_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                token_id TEXT NOT NULL,
+                condition_id TEXT NOT NULL,
+                asset TEXT NOT NULL,
+                bid_levels TEXT,  -- JSON array of [price, size] tuples
+                ask_levels TEXT,  -- JSON array of [price, size] tuples
+                total_bid_depth REAL NOT NULL,
+                total_ask_depth REAL NOT NULL
+            );
+
+            -- Indexes for liquidity queries
+            CREATE INDEX IF NOT EXISTS idx_fills_timestamp ON fill_records(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_fills_token ON fill_records(token_id);
+            CREATE INDEX IF NOT EXISTS idx_fills_asset ON fill_records(asset);
+            CREATE INDEX IF NOT EXISTS idx_snapshots_timestamp ON liquidity_snapshots(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_snapshots_token ON liquidity_snapshots(token_id);
+            CREATE INDEX IF NOT EXISTS idx_snapshots_asset ON liquidity_snapshots(asset);
         """)
         await self._conn.commit()
 
@@ -427,6 +475,319 @@ class Database:
         ) as cursor:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
+
+    # ========== Liquidity Data Operations ==========
+
+    async def save_fill_record(
+        self,
+        token_id: str,
+        condition_id: str,
+        asset: str,
+        side: str,
+        intended_size: float,
+        filled_size: float,
+        intended_price: float,
+        actual_avg_price: float,
+        time_to_fill_ms: int,
+        slippage: float,
+        pre_fill_depth: float,
+        post_fill_depth: float = None,
+        order_type: str = "GTC",
+        order_id: str = None,
+        fill_ratio: float = None,
+        persistence_ratio: float = None,
+    ) -> None:
+        """Save a fill record for slippage analysis.
+
+        Args:
+            token_id: Token that was traded
+            condition_id: Market condition ID
+            asset: Asset symbol (BTC, ETH, SOL)
+            side: "BUY" or "SELL"
+            intended_size: Shares we intended to trade
+            filled_size: Shares actually filled
+            intended_price: Price we tried to get
+            actual_avg_price: Average fill price achieved
+            time_to_fill_ms: Milliseconds from order to fill
+            slippage: Price slippage (positive = worse)
+            pre_fill_depth: Depth before order
+            post_fill_depth: Depth after order (optional)
+            order_type: Order type (GTC, FOK, etc.)
+            order_id: Exchange order ID
+            fill_ratio: filled_size / intended_size
+            persistence_ratio: filled_size / pre_fill_depth
+        """
+        # Calculate ratios if not provided
+        if fill_ratio is None and intended_size > 0:
+            fill_ratio = filled_size / intended_size
+        if persistence_ratio is None and pre_fill_depth > 0:
+            persistence_ratio = filled_size / pre_fill_depth
+
+        async with self._lock:
+            await self._conn.execute(
+                """
+                INSERT INTO fill_records (
+                    token_id, condition_id, asset, side,
+                    intended_size, filled_size, intended_price, actual_avg_price,
+                    time_to_fill_ms, slippage, pre_fill_depth, post_fill_depth,
+                    order_type, order_id, fill_ratio, persistence_ratio
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    token_id, condition_id, asset, side,
+                    intended_size, filled_size, intended_price, actual_avg_price,
+                    time_to_fill_ms, slippage, pre_fill_depth, post_fill_depth,
+                    order_type, order_id, fill_ratio, persistence_ratio,
+                ),
+            )
+            await self._conn.commit()
+
+    async def save_liquidity_snapshot(
+        self,
+        token_id: str,
+        condition_id: str,
+        asset: str,
+        bid_levels: list,
+        ask_levels: list,
+        total_bid_depth: float,
+        total_ask_depth: float,
+    ) -> None:
+        """Save an order book depth snapshot.
+
+        Args:
+            token_id: Token ID
+            condition_id: Market condition ID
+            asset: Asset symbol
+            bid_levels: List of [price, size] tuples
+            ask_levels: List of [price, size] tuples
+            total_bid_depth: Sum of all bid sizes
+            total_ask_depth: Sum of all ask sizes
+        """
+        import json
+
+        async with self._lock:
+            await self._conn.execute(
+                """
+                INSERT INTO liquidity_snapshots (
+                    token_id, condition_id, asset,
+                    bid_levels, ask_levels,
+                    total_bid_depth, total_ask_depth
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    token_id, condition_id, asset,
+                    json.dumps(bid_levels), json.dumps(ask_levels),
+                    total_bid_depth, total_ask_depth,
+                ),
+            )
+            await self._conn.commit()
+
+    async def get_recent_fills(
+        self,
+        token_id: str = None,
+        asset: str = None,
+        limit: int = 100,
+        lookback_minutes: int = None,
+    ) -> List[Dict[str, Any]]:
+        """Get recent fill records for analysis.
+
+        Args:
+            token_id: Filter by token (optional)
+            asset: Filter by asset (optional)
+            limit: Maximum records to return
+            lookback_minutes: Only get fills from last N minutes (optional)
+
+        Returns:
+            List of fill record dicts
+        """
+        query = "SELECT * FROM fill_records WHERE 1=1"
+        params = []
+
+        if token_id:
+            query += " AND token_id = ?"
+            params.append(token_id)
+
+        if asset:
+            query += " AND asset = ?"
+            params.append(asset)
+
+        if lookback_minutes:
+            cutoff = (datetime.utcnow() - timedelta(minutes=lookback_minutes)).isoformat()
+            query += " AND timestamp >= ?"
+            params.append(cutoff)
+
+        query += " ORDER BY timestamp DESC LIMIT ?"
+        params.append(limit)
+
+        async with self._conn.execute(query, params) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    async def get_recent_snapshots(
+        self,
+        token_id: str = None,
+        asset: str = None,
+        limit: int = 100,
+        lookback_minutes: int = None,
+    ) -> List[Dict[str, Any]]:
+        """Get recent liquidity snapshots.
+
+        Args:
+            token_id: Filter by token (optional)
+            asset: Filter by asset (optional)
+            limit: Maximum records to return
+            lookback_minutes: Only get snapshots from last N minutes (optional)
+
+        Returns:
+            List of snapshot dicts
+        """
+        import json
+
+        query = "SELECT * FROM liquidity_snapshots WHERE 1=1"
+        params = []
+
+        if token_id:
+            query += " AND token_id = ?"
+            params.append(token_id)
+
+        if asset:
+            query += " AND asset = ?"
+            params.append(asset)
+
+        if lookback_minutes:
+            cutoff = (datetime.utcnow() - timedelta(minutes=lookback_minutes)).isoformat()
+            query += " AND timestamp >= ?"
+            params.append(cutoff)
+
+        query += " ORDER BY timestamp DESC LIMIT ?"
+        params.append(limit)
+
+        async with self._conn.execute(query, params) as cursor:
+            rows = await cursor.fetchall()
+            snapshots = []
+            for row in rows:
+                snapshot = dict(row)
+                # Parse JSON arrays
+                if snapshot.get("bid_levels"):
+                    snapshot["bid_levels"] = json.loads(snapshot["bid_levels"])
+                if snapshot.get("ask_levels"):
+                    snapshot["ask_levels"] = json.loads(snapshot["ask_levels"])
+                snapshots.append(snapshot)
+            return snapshots
+
+    async def get_slippage_stats(
+        self,
+        token_id: str = None,
+        asset: str = None,
+        lookback_minutes: int = 60,
+    ) -> Dict[str, Any]:
+        """Get aggregated slippage statistics.
+
+        Args:
+            token_id: Filter by token (optional)
+            asset: Filter by asset (optional)
+            lookback_minutes: Analysis window
+
+        Returns:
+            Dict with slippage statistics
+        """
+        query = """
+            SELECT
+                COUNT(*) as fill_count,
+                AVG(slippage) as avg_slippage,
+                MAX(slippage) as max_slippage,
+                MIN(slippage) as min_slippage,
+                AVG(fill_ratio) as avg_fill_ratio,
+                AVG(persistence_ratio) as avg_persistence_ratio,
+                AVG(time_to_fill_ms) as avg_time_to_fill_ms,
+                SUM(filled_size) as total_volume
+            FROM fill_records
+            WHERE timestamp >= ?
+        """
+        cutoff = (datetime.utcnow() - timedelta(minutes=lookback_minutes)).isoformat()
+        params = [cutoff]
+
+        if token_id:
+            query += " AND token_id = ?"
+            params.append(token_id)
+
+        if asset:
+            query += " AND asset = ?"
+            params.append(asset)
+
+        async with self._conn.execute(query, params) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else {}
+
+    async def get_depth_stats(
+        self,
+        token_id: str = None,
+        asset: str = None,
+        lookback_minutes: int = 60,
+    ) -> Dict[str, Any]:
+        """Get aggregated depth statistics.
+
+        Args:
+            token_id: Filter by token (optional)
+            asset: Filter by asset (optional)
+            lookback_minutes: Analysis window
+
+        Returns:
+            Dict with depth statistics
+        """
+        query = """
+            SELECT
+                COUNT(*) as snapshot_count,
+                AVG(total_ask_depth) as avg_ask_depth,
+                AVG(total_bid_depth) as avg_bid_depth,
+                MAX(total_ask_depth) as max_ask_depth,
+                MIN(total_ask_depth) as min_ask_depth
+            FROM liquidity_snapshots
+            WHERE timestamp >= ?
+        """
+        cutoff = (datetime.utcnow() - timedelta(minutes=lookback_minutes)).isoformat()
+        params = [cutoff]
+
+        if token_id:
+            query += " AND token_id = ?"
+            params.append(token_id)
+
+        if asset:
+            query += " AND asset = ?"
+            params.append(asset)
+
+        async with self._conn.execute(query, params) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else {}
+
+    async def cleanup_old_liquidity_data(self, days: int = 30) -> Dict[str, int]:
+        """Delete liquidity data older than specified days.
+
+        Args:
+            days: Delete data older than this many days
+
+        Returns:
+            Dict with counts of deleted records
+        """
+        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        deleted = {"fills": 0, "snapshots": 0}
+
+        async with self._lock:
+            cursor = await self._conn.execute(
+                "DELETE FROM fill_records WHERE timestamp < ?",
+                (cutoff,),
+            )
+            deleted["fills"] = cursor.rowcount
+
+            cursor = await self._conn.execute(
+                "DELETE FROM liquidity_snapshots WHERE timestamp < ?",
+                (cutoff,),
+            )
+            deleted["snapshots"] = cursor.rowcount
+
+            await self._conn.commit()
+
+        return deleted
 
     # ========== Summary Statistics ==========
 
