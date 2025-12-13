@@ -199,3 +199,156 @@ class TestOrderTypeUsageInCodebase:
                     assert 'orderType=OrderType.GTC' in content, (
                         f"{rel_path} should use orderType=OrderType.GTC (FOK has precision bugs)"
                     )
+
+
+class TestDecimalPrecision:
+    """Regression tests for decimal precision issues.
+
+    The Polymarket API requires:
+    - maker amount (size/shares): max 2 decimal places
+    - taker amount: max 4 decimal places
+
+    FOK orders have a bug in py-clob-client that causes precision errors.
+    See: https://github.com/Polymarket/py-clob-client/issues/121
+
+    Error message: "invalid amounts, the market buy orders maker amount supports
+    a max accuracy of 2 decimals, taker amount a max of 4 decimals"
+    """
+
+    def test_decimal_module_used_in_near_resolution(self):
+        """Verify near-resolution trades use Decimal for precise calculations."""
+        import src.strategies.gabagool as gabagool_module
+        source = inspect.getsource(gabagool_module.GabagoolStrategy._execute_near_resolution_trade)
+
+        assert "from decimal import Decimal" in source, (
+            "Near-resolution trades must use Decimal module for precision"
+        )
+        assert "ROUND_DOWN" in source, (
+            "Must use ROUND_DOWN to avoid rounding up beyond available funds"
+        )
+
+    def test_decimal_module_used_in_dual_leg(self):
+        """Verify dual-leg orders use Decimal for precise calculations."""
+        import src.client.polymarket as polymarket_module
+        source = inspect.getsource(polymarket_module.PolymarketClient.execute_dual_leg_order)
+
+        assert "from decimal import Decimal" in source, (
+            "Dual-leg orders must use Decimal module for precision"
+        )
+        assert "ROUND_DOWN" in source, (
+            "Must use ROUND_DOWN to avoid rounding up beyond available funds"
+        )
+
+    def test_decimal_module_used_in_market_order(self):
+        """Verify market orders use Decimal for precise calculations."""
+        import src.client.polymarket as polymarket_module
+        source = inspect.getsource(polymarket_module.PolymarketClient.create_market_order)
+
+        assert "from decimal import Decimal" in source, (
+            "Market orders must use Decimal module for precision"
+        )
+        assert "ROUND_DOWN" in source, (
+            "Must use ROUND_DOWN to avoid rounding up beyond available funds"
+        )
+
+    def test_no_round_function_in_order_calculations(self):
+        """Verify we don't use round() for order calculations (causes precision issues)."""
+        import os
+        import re
+
+        src_dir = os.path.join(os.path.dirname(__file__), '..', 'src')
+
+        # Pattern that catches round() being used with price/shares calculations
+        # This is a heuristic - round() near price/size/shares variables
+        bad_patterns = [
+            re.compile(r'shares\s*=\s*round\('),
+            re.compile(r'limit_price\s*=\s*round\('),
+            re.compile(r'size\s*=\s*round\('),
+        ]
+
+        violations = []
+
+        files_to_check = [
+            'client/polymarket.py',
+            'strategies/gabagool.py',
+        ]
+
+        for rel_path in files_to_check:
+            filepath = os.path.join(src_dir, rel_path)
+            if os.path.exists(filepath):
+                with open(filepath, 'r') as f:
+                    content = f.read()
+
+                for pattern in bad_patterns:
+                    matches = pattern.findall(content)
+                    if matches:
+                        violations.append(
+                            f"{rel_path}: Found round() for order calculation - use Decimal instead"
+                        )
+
+        assert not violations, (
+            f"Found round() used for order calculations which can cause precision issues:\n"
+            + "\n".join(violations)
+            + "\n\nUse Decimal with ROUND_DOWN instead for precise calculations."
+        )
+
+    def test_decimal_calculation_produces_clean_values(self):
+        """Test that our Decimal approach produces clean 2-decimal values."""
+        from decimal import Decimal, ROUND_DOWN
+
+        # Test case that was failing: $10 at $0.97 price
+        trade_size = Decimal("10.0")
+        price = Decimal("0.97")
+
+        # Calculate limit price (add 2 cents, cap at 0.99)
+        limit_price = min(price + Decimal("0.02"), Decimal("0.99"))
+        limit_price = limit_price.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+        # Calculate shares
+        shares = (trade_size / limit_price).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+        # Verify values have max 2 decimal places
+        assert limit_price == Decimal("0.99")
+        assert shares == Decimal("10.10")
+
+        # Verify the product (maker amount) is clean
+        maker_amount = shares * limit_price
+        assert maker_amount == Decimal("9.9990")  # 4 decimal places max
+
+        # Convert to float and verify no floating point issues
+        price_float = float(limit_price)
+        shares_float = float(shares)
+
+        assert f"{price_float:.2f}" == "0.99"
+        assert f"{shares_float:.2f}" == "10.10"
+
+    def test_gtc_used_instead_of_fok(self):
+        """Verify GTC is used instead of FOK due to precision bugs."""
+        import os
+
+        src_dir = os.path.join(os.path.dirname(__file__), '..', 'src')
+
+        files_to_check = [
+            'client/polymarket.py',
+            'strategies/gabagool.py',
+        ]
+
+        for rel_path in files_to_check:
+            filepath = os.path.join(src_dir, rel_path)
+            if os.path.exists(filepath):
+                with open(filepath, 'r') as f:
+                    content = f.read()
+
+                # Should NOT have FOK in post_order calls (except in comments)
+                # Count actual FOK usage in code (not comments)
+                lines = content.split('\n')
+                fok_in_code = 0
+                for line in lines:
+                    # Skip comments
+                    code_part = line.split('#')[0]
+                    if 'OrderType.FOK' in code_part and 'post_order' in code_part:
+                        fok_in_code += 1
+
+                assert fok_in_code == 0, (
+                    f"{rel_path} should use GTC instead of FOK in post_order calls"
+                )

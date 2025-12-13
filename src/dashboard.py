@@ -746,8 +746,13 @@ DASHBOARD_HTML = """
                 }
             }
 
+            // Sort markets by seconds_remaining (ascending - ending soonest first)
+            const sortedMarkets = Object.entries(markets).sort((a, b) => {
+                return (a[1].seconds_remaining || 0) - (b[1].seconds_remaining || 0);
+            });
+
             // Update or create rows for each market
-            for (const [id, m] of Object.entries(markets)) {
+            for (const [id, m] of sortedMarkets) {
                 foundCount++;
                 const isTradeable = m.seconds_remaining > 60;
                 if (isTradeable) tradeableCount++;
@@ -807,6 +812,9 @@ DASHBOARD_HTML = """
 
                 // Update row background based on tradeable status
                 row.style.background = isTradeable ? 'rgba(0, 255, 65, 0.05)' : 'rgba(255, 0, 64, 0.05)';
+
+                // Ensure row is in correct sorted position in DOM
+                table.appendChild(row);
             }
 
             document.getElementById('market-count').textContent = foundCount;

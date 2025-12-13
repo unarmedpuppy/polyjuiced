@@ -58,7 +58,7 @@ class GabagoolConfig:
 
     # Strategy settings
     enabled: bool = True
-    markets: List[str] = field(default_factory=lambda: ["BTC", "ETH"])
+    markets: List[str] = field(default_factory=lambda: ["BTC", "ETH", "SOL"])
     min_spread_threshold: float = 0.02  # 2 cents minimum to trade
 
     # Position sizing
@@ -100,7 +100,7 @@ class GabagoolConfig:
         """Load configuration from environment variables."""
         return cls(
             enabled=os.getenv("GABAGOOL_ENABLED", "true").lower() == "true",
-            markets=os.getenv("GABAGOOL_MARKETS", "BTC,ETH").split(","),
+            markets=os.getenv("GABAGOOL_MARKETS", "BTC,ETH,SOL").split(","),
             min_spread_threshold=float(os.getenv("GABAGOOL_MIN_SPREAD", "0.02")),
             max_trade_size_usd=float(os.getenv("GABAGOOL_MAX_TRADE_SIZE", "25.0")),
             max_per_window_usd=float(os.getenv("GABAGOOL_MAX_PER_WINDOW", "50.0")),
