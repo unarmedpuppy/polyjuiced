@@ -216,35 +216,41 @@ class PolymarketClient:
             except Exception:
                 price = 0.50  # Default to 50/50
 
-        import math
+        from decimal import Decimal, ROUND_DOWN
+
+        # Use Decimal for precise calculations
+        price_d = Decimal(str(price))
+        amount_d = Decimal(str(amount_usd))
+
         # Use aggressive limit price to ensure fill (max 2 decimals)
         if side.upper() == "BUY":
             # Buy at slightly above market to ensure fill
-            limit_price = math.floor(min(price + 0.02, 0.99) * 100) / 100
+            limit_price_d = min(price_d + Decimal("0.02"), Decimal("0.99"))
         else:
             # Sell at slightly below market to ensure fill
-            limit_price = math.floor(max(price - 0.02, 0.01) * 100) / 100
+            limit_price_d = max(price_d - Decimal("0.02"), Decimal("0.01"))
 
-        # Calculate shares from amount, truncate to 2 decimals (Polymarket API requirement)
-        shares = math.floor(amount_usd / limit_price * 100) / 100
+        limit_price_d = limit_price_d.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
-        # Convert to string and back to ensure clean float representation
-        price_str = f"{limit_price:.2f}"
-        size_str = f"{shares:.2f}"
+        # Calculate shares from amount with proper precision
+        shares_d = (amount_d / limit_price_d).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+        limit_price = float(limit_price_d)
+        shares = float(shares_d)
 
         log.info(
             "Placing aggressive limit order (workaround for market order bug)",
             token_id=token_id,
             amount_usd=amount_usd,
             side=side,
-            price=price_str,
-            shares=size_str,
+            price=f"{limit_price:.2f}",
+            shares=f"{shares:.2f}",
         )
 
         order_args = OrderArgs(
             token_id=token_id,
-            price=float(price_str),
-            size=float(size_str),
+            price=limit_price,
+            size=shares,
             side=side.upper(),
         )
 
@@ -468,39 +474,52 @@ class PolymarketClient:
         )
 
         def place_fok_order(token_id: str, amount_usd: float, label: str) -> Dict[str, Any]:
-            """Place a Fill-or-Kill order."""
-            import math
+            """Place a Fill-or-Kill order.
+
+            Note: FOK orders have decimal precision bugs in py-clob-client.
+            We use GTC instead which works. For arbitrage, we accept the risk
+            that orders might not fill immediately but the aggressive pricing
+            should ensure quick fills.
+            See: https://github.com/Polymarket/py-clob-client/issues/121
+            """
+            from decimal import Decimal, ROUND_DOWN
+
             try:
                 price = self.get_price(token_id, "buy")
             except Exception:
                 price = 0.50
 
-            # Aggressive price to ensure fill (max 2 decimals)
-            # Use floor to avoid rounding up beyond available liquidity
-            limit_price = math.floor(min(price + 0.03, 0.99) * 100) / 100
-            # Truncate shares to 2 decimals (Polymarket API requirement)
-            shares = math.floor(amount_usd / limit_price * 100) / 100
+            # Use Decimal for precise calculations
+            price_d = Decimal(str(price))
+            amount_d = Decimal(str(amount_usd))
 
-            # Convert to string and back to ensure clean float representation
-            price_str = f"{limit_price:.2f}"
-            size_str = f"{shares:.2f}"
+            # Aggressive price to ensure fill (max 2 decimals)
+            limit_price_d = min(price_d + Decimal("0.03"), Decimal("0.99"))
+            limit_price_d = limit_price_d.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+            # Calculate shares with proper precision
+            shares_d = (amount_d / limit_price_d).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+            limit_price = float(limit_price_d)
+            shares = float(shares_d)
 
             log.info(
-                f"Placing {label} FOK order",
+                f"Placing {label} GTC order (FOK has precision bugs)",
                 token_id=token_id[:20] + "...",
-                price=price_str,
-                shares=size_str,
+                price=f"{limit_price:.2f}",
+                shares=f"{shares:.2f}",
             )
 
             order_args = OrderArgs(
                 token_id=token_id,
-                price=float(price_str),
-                size=float(size_str),
+                price=limit_price,
+                size=shares,
                 side="BUY",
             )
 
             signed_order = self._client.create_order(order_args)
-            result = self._client.post_order(signed_order, orderType=OrderType.FOK)
+            # Use GTC instead of FOK due to decimal precision bugs
+            result = self._client.post_order(signed_order, orderType=OrderType.GTC)
             return result
 
         try:

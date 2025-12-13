@@ -1116,17 +1116,39 @@ class GabagoolStrategy(BaseStrategy):
             )
             return
 
-        # Calculate shares with proper decimal truncation
+        # Calculate shares with proper decimal truncation using Decimal for precision
         # Polymarket API requires: maker amount (size) max 2 decimals
-        # Use floor division to avoid rounding up beyond what we can afford
-        import math
-        shares = math.floor(trade_size / price * 100) / 100  # Truncate to 2 decimals
+        # The internal calculation (shares * price) must also be clean
+        from decimal import Decimal, ROUND_DOWN
+
+        # Use Decimal for precise calculations
+        trade_size_d = Decimal(str(trade_size))
+        price_d = Decimal(str(price))
+
+        # Calculate aggressive limit price (add 2 cents, cap at 0.99)
+        limit_price_d = min(price_d + Decimal("0.02"), Decimal("0.99"))
+        limit_price_d = limit_price_d.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+        # Calculate shares ensuring the product (shares * price) is also clean
+        # We need: shares * limit_price to have max 4 decimals (taker amount limit)
+        # Since limit_price has 2 decimals, shares should have max 2 decimals
+        shares_d = (trade_size_d / limit_price_d).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+        # Verify the product is clean
+        maker_amount = shares_d * limit_price_d
+        if maker_amount != maker_amount.quantize(Decimal("0.0001"), rounding=ROUND_DOWN):
+            # Round shares down further to ensure clean product
+            shares_d = shares_d - Decimal("0.01")
+
+        shares = float(shares_d)
+        limit_price = float(limit_price_d)
 
         log.info(
             "Executing near-resolution trade",
             asset=market.asset,
             side=side,
             price=f"${price:.2f}",
+            limit_price=f"${limit_price:.2f}",
             shares=f"{shares:.2f}",
             cost=f"${trade_size:.2f}",
         )
@@ -1134,7 +1156,7 @@ class GabagoolStrategy(BaseStrategy):
         if cfg.dry_run:
             add_log(
                 "info",
-                f"[DRY RUN] Near-res: {side} {shares:.2f} @ ${price:.2f}",
+                f"[DRY RUN] Near-res: {side} {shares:.2f} @ ${limit_price:.2f}",
                 asset=market.asset,
             )
             return
@@ -1143,23 +1165,17 @@ class GabagoolStrategy(BaseStrategy):
             # Place FOK order for the target side only (not a dual-leg arb)
             from py_clob_client.clob_types import OrderArgs, OrderType
 
-            # Slightly aggressive price to ensure fill (max 2 decimals)
-            limit_price = math.floor(min(price + 0.02, 0.99) * 100) / 100
-
-            # Ensure both price and size are properly formatted as floats with 2 decimals
-            # Convert via string to avoid floating point representation issues
-            size_str = f"{shares:.2f}"
-            price_str = f"{limit_price:.2f}"
-
             order_args = OrderArgs(
                 token_id=token_id,
-                price=float(price_str),
-                size=float(size_str),
+                price=limit_price,
+                size=shares,
                 side="BUY",
             )
 
+            # Use GTC instead of FOK - FOK has decimal precision bugs in py-clob-client
+            # See: https://github.com/Polymarket/py-clob-client/issues/121
             signed_order = self.client._client.create_order(order_args)
-            result = self.client._client.post_order(signed_order, orderType=OrderType.FOK)
+            result = self.client._client.post_order(signed_order, orderType=OrderType.GTC)
 
             status = result.get("status", "").upper()
             if status in ("MATCHED", "FILLED", "LIVE"):
