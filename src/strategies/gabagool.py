@@ -1148,11 +1148,10 @@ class GabagoolStrategy(BaseStrategy):
                 price=limit_price,
                 size=shares,
                 side="BUY",
-                order_type=OrderType.FOK,
             )
 
             signed_order = self.client._client.create_order(order_args)
-            result = self.client._client.post_order(signed_order)
+            result = self.client._client.post_order(signed_order, orderType=OrderType.FOK)
 
             status = result.get("status", "").upper()
             if status in ("MATCHED", "FILLED", "LIVE"):

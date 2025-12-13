@@ -485,11 +485,10 @@ class PolymarketClient:
                 price=limit_price,
                 size=shares,
                 side="BUY",
-                order_type=OrderType.FOK,  # Fill-or-Kill!
             )
 
             signed_order = self._client.create_order(order_args)
-            result = self._client.post_order(signed_order)
+            result = self._client.post_order(signed_order, orderType=OrderType.FOK)
             return result
 
         try:
