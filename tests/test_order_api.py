@@ -5,6 +5,9 @@ particularly around order placement and order types (FOK, GTC, etc.).
 
 Regression test for: OrderArgs.__init__() got an unexpected keyword argument 'order_type'
 The order_type parameter must be passed to post_order(), not OrderArgs().
+
+Note: We use GTC instead of FOK due to decimal precision bugs in py-clob-client.
+See: https://github.com/Polymarket/py-clob-client/issues/121
 """
 
 import inspect
@@ -110,9 +113,9 @@ class TestPolymarketClientOrderPlacement:
                 "OrderArgs should not receive order_type parameter"
             )
 
-            # Verify post_order receives orderType
-            assert "post_order(signed_order, orderType=OrderType.FOK)" in source, (
-                "post_order should receive orderType=OrderType.FOK"
+            # Verify post_order receives orderType (GTC due to FOK precision bugs)
+            assert "post_order(signed_order, orderType=OrderType.GTC)" in source, (
+                "post_order should receive orderType=OrderType.GTC (FOK has precision bugs)"
             )
 
     def test_near_resolution_trade_passes_order_type_to_post_order(self):
@@ -128,9 +131,9 @@ class TestPolymarketClientOrderPlacement:
             "OrderArgs should not receive order_type parameter in near_resolution_trade"
         )
 
-        # Verify post_order receives orderType
-        assert "post_order(signed_order, orderType=OrderType.FOK)" in source, (
-            "post_order should receive orderType=OrderType.FOK in near_resolution_trade"
+        # Verify post_order receives orderType (GTC due to FOK precision bugs)
+        assert "post_order(signed_order, orderType=OrderType.GTC)" in source, (
+            "post_order should receive orderType=OrderType.GTC (FOK has precision bugs)"
         )
 
 
@@ -165,7 +168,11 @@ class TestOrderTypeUsageInCodebase:
         )
 
     def test_post_order_has_order_type_where_needed(self):
-        """Verify post_order calls that need FOK have orderType parameter."""
+        """Verify post_order calls have orderType parameter.
+
+        Note: We use GTC instead of FOK due to decimal precision bugs in py-clob-client.
+        See: https://github.com/Polymarket/py-clob-client/issues/121
+        """
         import os
         import re
 
@@ -174,21 +181,21 @@ class TestOrderTypeUsageInCodebase:
         # Find all post_order calls
         post_order_pattern = re.compile(r'\.post_order\([^)]+\)')
 
-        fok_needed_files = [
+        order_type_needed_files = [
             'client/polymarket.py',  # execute_dual_leg_order
             'strategies/gabagool.py',  # _execute_near_resolution_trade
         ]
 
-        for rel_path in fok_needed_files:
+        for rel_path in order_type_needed_files:
             filepath = os.path.join(src_dir, rel_path)
             if os.path.exists(filepath):
                 with open(filepath, 'r') as f:
                     content = f.read()
 
-                # Check that FOK orders use orderType parameter
-                # Note: Not all post_order calls need FOK, but the ones in
+                # Check that orders use orderType parameter (GTC due to FOK bugs)
+                # Note: Not all post_order calls need explicit orderType, but the ones in
                 # execute_dual_leg_order and _execute_near_resolution_trade do
                 if 'execute_dual_leg_order' in content or '_execute_near_resolution_trade' in content:
-                    assert 'orderType=OrderType.FOK' in content, (
-                        f"{rel_path} should use orderType=OrderType.FOK for FOK orders"
+                    assert 'orderType=OrderType.GTC' in content, (
+                        f"{rel_path} should use orderType=OrderType.GTC (FOK has precision bugs)"
                     )
