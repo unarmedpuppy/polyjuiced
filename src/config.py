@@ -72,7 +72,7 @@ class GabagoolConfig:
     max_slippage_cents: float = 2.0  # Reject trade
 
     # Execution
-    order_timeout_seconds: float = 0.5
+    order_timeout_seconds: float = 10.0  # Increased - API needs time for tick-size, neg-risk, fee-rate calls
     ws_reconnect_delay_seconds: float = 1.0
 
     # Mode
@@ -108,7 +108,7 @@ class GabagoolConfig:
             max_daily_loss_usd=float(os.getenv("GABAGOOL_MAX_DAILY_LOSS", "5.0")),
             max_unhedged_exposure_usd=float(os.getenv("GABAGOOL_MAX_UNHEDGED", "10.0")),
             max_slippage_cents=float(os.getenv("GABAGOOL_MAX_SLIPPAGE", "2.0")),
-            order_timeout_seconds=float(os.getenv("GABAGOOL_ORDER_TIMEOUT", "0.5")),
+            order_timeout_seconds=float(os.getenv("GABAGOOL_ORDER_TIMEOUT", "10.0")),
             ws_reconnect_delay_seconds=float(os.getenv("GABAGOOL_WS_RECONNECT_DELAY", "1.0")),
             dry_run=os.getenv("GABAGOOL_DRY_RUN", "false").lower() == "true",
             # Directional trading

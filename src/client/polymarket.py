@@ -216,30 +216,35 @@ class PolymarketClient:
             except Exception:
                 price = 0.50  # Default to 50/50
 
-        # Use aggressive limit price to ensure fill
+        import math
+        # Use aggressive limit price to ensure fill (max 2 decimals)
         if side.upper() == "BUY":
             # Buy at slightly above market to ensure fill
-            limit_price = round(min(price + 0.02, 0.99), 2)
+            limit_price = math.floor(min(price + 0.02, 0.99) * 100) / 100
         else:
             # Sell at slightly below market to ensure fill
-            limit_price = round(max(price - 0.02, 0.01), 2)
+            limit_price = math.floor(max(price - 0.02, 0.01) * 100) / 100
 
-        # Calculate shares from amount
-        shares = round(amount_usd / limit_price, 2)
+        # Calculate shares from amount, truncate to 2 decimals (Polymarket API requirement)
+        shares = math.floor(amount_usd / limit_price * 100) / 100
+
+        # Convert to string and back to ensure clean float representation
+        price_str = f"{limit_price:.2f}"
+        size_str = f"{shares:.2f}"
 
         log.info(
             "Placing aggressive limit order (workaround for market order bug)",
             token_id=token_id,
             amount_usd=amount_usd,
             side=side,
-            price=limit_price,
-            shares=shares,
+            price=price_str,
+            shares=size_str,
         )
 
         order_args = OrderArgs(
             token_id=token_id,
-            price=limit_price,
-            size=shares,
+            price=float(price_str),
+            size=float(size_str),
             side=side.upper(),
         )
 
@@ -464,26 +469,33 @@ class PolymarketClient:
 
         def place_fok_order(token_id: str, amount_usd: float, label: str) -> Dict[str, Any]:
             """Place a Fill-or-Kill order."""
+            import math
             try:
                 price = self.get_price(token_id, "buy")
             except Exception:
                 price = 0.50
 
-            # Aggressive price to ensure fill
-            limit_price = round(min(price + 0.03, 0.99), 2)  # +3 cents for FOK
-            shares = round(amount_usd / limit_price, 2)
+            # Aggressive price to ensure fill (max 2 decimals)
+            # Use floor to avoid rounding up beyond available liquidity
+            limit_price = math.floor(min(price + 0.03, 0.99) * 100) / 100
+            # Truncate shares to 2 decimals (Polymarket API requirement)
+            shares = math.floor(amount_usd / limit_price * 100) / 100
+
+            # Convert to string and back to ensure clean float representation
+            price_str = f"{limit_price:.2f}"
+            size_str = f"{shares:.2f}"
 
             log.info(
                 f"Placing {label} FOK order",
                 token_id=token_id[:20] + "...",
-                price=limit_price,
-                shares=shares,
+                price=price_str,
+                shares=size_str,
             )
 
             order_args = OrderArgs(
                 token_id=token_id,
-                price=limit_price,
-                size=shares,
+                price=float(price_str),
+                size=float(size_str),
                 side="BUY",
             )
 

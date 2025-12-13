@@ -1116,15 +1116,18 @@ class GabagoolStrategy(BaseStrategy):
             )
             return
 
-        # Calculate shares
-        shares = round(trade_size / price, 2)
+        # Calculate shares with proper decimal truncation
+        # Polymarket API requires: maker amount (size) max 2 decimals
+        # Use floor division to avoid rounding up beyond what we can afford
+        import math
+        shares = math.floor(trade_size / price * 100) / 100  # Truncate to 2 decimals
 
         log.info(
             "Executing near-resolution trade",
             asset=market.asset,
             side=side,
             price=f"${price:.2f}",
-            shares=shares,
+            shares=f"{shares:.2f}",
             cost=f"${trade_size:.2f}",
         )
 
@@ -1140,13 +1143,18 @@ class GabagoolStrategy(BaseStrategy):
             # Place FOK order for the target side only (not a dual-leg arb)
             from py_clob_client.clob_types import OrderArgs, OrderType
 
-            # Slightly aggressive price to ensure fill
-            limit_price = round(min(price + 0.02, 0.99), 2)
+            # Slightly aggressive price to ensure fill (max 2 decimals)
+            limit_price = math.floor(min(price + 0.02, 0.99) * 100) / 100
+
+            # Ensure both price and size are properly formatted as floats with 2 decimals
+            # Convert via string to avoid floating point representation issues
+            size_str = f"{shares:.2f}"
+            price_str = f"{limit_price:.2f}"
 
             order_args = OrderArgs(
                 token_id=token_id,
-                price=limit_price,
-                size=shares,
+                price=float(price_str),
+                size=float(size_str),
                 side="BUY",
             )
 
