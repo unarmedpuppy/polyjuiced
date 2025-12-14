@@ -2115,8 +2115,8 @@ class GabagoolStrategy(BaseStrategy):
             )
             return True
 
-        # Check daily exposure limit
-        if self._daily_exposure >= self.gabagool_config.max_daily_exposure_usd:
+        # Check daily exposure limit (0 = unlimited)
+        if self.gabagool_config.max_daily_exposure_usd > 0 and self._daily_exposure >= self.gabagool_config.max_daily_exposure_usd:
             log.info("Daily exposure limit reached")
             return True
 
