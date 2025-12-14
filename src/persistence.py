@@ -885,6 +885,49 @@ class Database:
 
         return points
 
+    async def reset_all_trade_data(self) -> Dict[str, int]:
+        """Reset all trade history data.
+
+        This clears trades, daily_stats, and logs.
+        Keeps markets table intact (market discovery data is useful).
+
+        Returns:
+            Dict with counts of deleted records per table
+        """
+        deleted = {
+            "trades": 0,
+            "daily_stats": 0,
+            "logs": 0,
+            "fill_records": 0,
+            "liquidity_snapshots": 0,
+        }
+
+        async with self._lock:
+            # Clear trades
+            cursor = await self._conn.execute("DELETE FROM trades")
+            deleted["trades"] = cursor.rowcount
+
+            # Clear daily stats
+            cursor = await self._conn.execute("DELETE FROM daily_stats")
+            deleted["daily_stats"] = cursor.rowcount
+
+            # Clear logs
+            cursor = await self._conn.execute("DELETE FROM logs")
+            deleted["logs"] = cursor.rowcount
+
+            # Clear fill records
+            cursor = await self._conn.execute("DELETE FROM fill_records")
+            deleted["fill_records"] = cursor.rowcount
+
+            # Clear liquidity snapshots
+            cursor = await self._conn.execute("DELETE FROM liquidity_snapshots")
+            deleted["liquidity_snapshots"] = cursor.rowcount
+
+            await self._conn.commit()
+
+        log.info("Reset all trade data", deleted=deleted)
+        return deleted
+
 
 # Global database instance
 _db: Optional[Database] = None
