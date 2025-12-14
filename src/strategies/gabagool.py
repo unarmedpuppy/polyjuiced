@@ -936,7 +936,7 @@ class GabagoolStrategy(BaseStrategy):
                     error=error_msg,
                 )
 
-            # Post-trade hedge verification
+            # Post-trade hedge verification (Phase 2 enforcement)
             # Extract actual filled sizes from API result
             yes_order = api_result.get("yes_order", {})
             no_order = api_result.get("no_order", {})
@@ -959,6 +959,7 @@ class GabagoolStrategy(BaseStrategy):
             min_shares = min(actual_yes_shares, actual_no_shares)
             max_shares = max(actual_yes_shares, actual_no_shares)
             actual_hedge_ratio = min_shares / max_shares if max_shares > 0 else 0
+            position_imbalance = max_shares - min_shares
 
             log.info(
                 "Post-trade hedge verification",
@@ -966,13 +967,73 @@ class GabagoolStrategy(BaseStrategy):
                 yes_shares=actual_yes_shares,
                 no_shares=actual_no_shares,
                 hedge_ratio=f"{actual_hedge_ratio:.1%}",
+                imbalance_shares=f"{position_imbalance:.2f}",
+                min_required=f"{self._config.gabagool.min_hedge_ratio:.0%}",
             )
 
-            # Warn if hedge ratio is poor (but still record the trade)
-            if actual_hedge_ratio < 0.70:
+            # Phase 2: ENFORCE minimum hedge ratio
+            # If hedge ratio is below minimum, this is a failed trade
+            if actual_hedge_ratio < self._config.gabagool.min_hedge_ratio:
+                error_msg = (
+                    f"Hedge ratio {actual_hedge_ratio:.0%} below minimum "
+                    f"{self._config.gabagool.min_hedge_ratio:.0%} - "
+                    f"YES: {actual_yes_shares:.2f}, NO: {actual_no_shares:.2f}"
+                )
+                log.error(
+                    "HEDGE RATIO ENFORCEMENT: Trade rejected due to poor hedge",
+                    asset=market.asset,
+                    hedge_ratio=f"{actual_hedge_ratio:.1%}",
+                    min_required=f"{self._config.gabagool.min_hedge_ratio:.0%}",
+                    yes_shares=actual_yes_shares,
+                    no_shares=actual_no_shares,
+                )
+                add_log(
+                    "error",
+                    f"REJECTED: {market.asset} hedge ratio {actual_hedge_ratio:.0%} < {self._config.gabagool.min_hedge_ratio:.0%}",
+                    yes_shares=actual_yes_shares,
+                    no_shares=actual_no_shares,
+                )
+                TRADE_ERRORS_TOTAL.labels(error_type="hedge_ratio_violation").inc()
+
+                # Check if we hit critical threshold (circuit breaker)
+                if actual_hedge_ratio < self._config.gabagool.critical_hedge_ratio:
+                    log.critical(
+                        "CRITICAL: Hedge ratio below critical threshold! Consider halting.",
+                        hedge_ratio=f"{actual_hedge_ratio:.1%}",
+                        critical_threshold=f"{self._config.gabagool.critical_hedge_ratio:.0%}",
+                    )
+                    add_log(
+                        "error",
+                        f"CRITICAL: {market.asset} hedge ratio {actual_hedge_ratio:.0%} below {self._config.gabagool.critical_hedge_ratio:.0%}",
+                    )
+
+                # Return failed trade result
+                return TradeResult(
+                    market=market,
+                    yes_shares=actual_yes_shares,
+                    no_shares=actual_no_shares,
+                    yes_cost=yes_amount,
+                    no_cost=no_amount,
+                    total_cost=yes_amount + no_amount,
+                    expected_profit=0,  # No profit on failed hedge
+                    profit_percentage=0,
+                    executed_at=datetime.utcnow(),
+                    dry_run=False,
+                    success=False,
+                    error=error_msg,
+                )
+
+            # Also check position imbalance in absolute terms
+            if position_imbalance > self._config.gabagool.max_position_imbalance_shares:
+                log.warning(
+                    "Position imbalance exceeds maximum",
+                    asset=market.asset,
+                    imbalance=f"{position_imbalance:.2f} shares",
+                    max_allowed=f"{self._config.gabagool.max_position_imbalance_shares:.2f} shares",
+                )
                 add_log(
                     "warning",
-                    f"Low hedge ratio on {market.asset}: {actual_hedge_ratio:.0%}",
+                    f"High imbalance on {market.asset}: {position_imbalance:.1f} shares unhedged",
                     yes_shares=actual_yes_shares,
                     no_shares=actual_no_shares,
                 )

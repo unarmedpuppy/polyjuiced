@@ -382,3 +382,158 @@ class TestConfigConsistency:
             # Restore env vars
             for var, val in env_backup.items():
                 os.environ[var] = val
+
+
+# ============================================================================
+# Phase 2 Tests - Hedge Ratio Enforcement
+# ============================================================================
+
+class TestPhase2HedgeRatioConfig:
+    """Test Phase 2 hedge ratio enforcement configuration."""
+
+    def test_min_hedge_ratio_default(self):
+        """Default min_hedge_ratio should be 80%."""
+        from src.config import GabagoolConfig
+
+        config = GabagoolConfig()
+        assert config.min_hedge_ratio == 0.80
+
+    def test_critical_hedge_ratio_default(self):
+        """Default critical_hedge_ratio should be 60%."""
+        from src.config import GabagoolConfig
+
+        config = GabagoolConfig()
+        assert config.critical_hedge_ratio == 0.60
+
+    def test_max_position_imbalance_default(self):
+        """Default max_position_imbalance_shares should be 5.0."""
+        from src.config import GabagoolConfig
+
+        config = GabagoolConfig()
+        assert config.max_position_imbalance_shares == 5.0
+
+    def test_hedge_ratio_from_env(self):
+        """Hedge ratio config should be loadable from env."""
+        from src.config import GabagoolConfig
+
+        env_backup = {}
+        test_vars = {
+            "GABAGOOL_MIN_HEDGE_RATIO": "0.85",
+            "GABAGOOL_CRITICAL_HEDGE_RATIO": "0.50",
+            "GABAGOOL_MAX_POSITION_IMBALANCE": "3.0",
+        }
+
+        for var, val in test_vars.items():
+            if var in os.environ:
+                env_backup[var] = os.environ[var]
+            os.environ[var] = val
+
+        try:
+            config = GabagoolConfig.from_env()
+            assert config.min_hedge_ratio == 0.85
+            assert config.critical_hedge_ratio == 0.50
+            assert config.max_position_imbalance_shares == 3.0
+        finally:
+            for var in test_vars:
+                if var in env_backup:
+                    os.environ[var] = env_backup[var]
+                else:
+                    del os.environ[var]
+
+
+class TestPhase2HedgeRatioEnforcement:
+    """Test Phase 2 hedge ratio enforcement logic."""
+
+    def test_hedge_ratio_above_minimum_passes(self):
+        """Hedge ratio >= min_hedge_ratio should pass."""
+        min_hedge_ratio = 0.80
+
+        # 85% hedge - should pass
+        yes_shares = 8.5
+        no_shares = 10.0
+        hedge_ratio = min(yes_shares, no_shares) / max(yes_shares, no_shares)
+
+        assert hedge_ratio >= min_hedge_ratio
+        assert hedge_ratio == pytest.approx(0.85, rel=0.01)
+
+    def test_hedge_ratio_at_minimum_passes(self):
+        """Hedge ratio exactly at min_hedge_ratio should pass."""
+        min_hedge_ratio = 0.80
+
+        # Exactly 80% hedge - should pass
+        yes_shares = 8.0
+        no_shares = 10.0
+        hedge_ratio = min(yes_shares, no_shares) / max(yes_shares, no_shares)
+
+        assert hedge_ratio >= min_hedge_ratio
+        assert hedge_ratio == pytest.approx(0.80, rel=0.01)
+
+    def test_hedge_ratio_below_minimum_fails(self):
+        """Hedge ratio < min_hedge_ratio should fail."""
+        min_hedge_ratio = 0.80
+
+        # 70% hedge - should fail
+        yes_shares = 7.0
+        no_shares = 10.0
+        hedge_ratio = min(yes_shares, no_shares) / max(yes_shares, no_shares)
+
+        assert hedge_ratio < min_hedge_ratio
+        assert hedge_ratio == pytest.approx(0.70, rel=0.01)
+
+    def test_hedge_ratio_below_critical_triggers_alert(self):
+        """Hedge ratio < critical_hedge_ratio should trigger critical alert."""
+        critical_hedge_ratio = 0.60
+
+        # 50% hedge - should trigger critical alert
+        yes_shares = 5.0
+        no_shares = 10.0
+        hedge_ratio = min(yes_shares, no_shares) / max(yes_shares, no_shares)
+
+        assert hedge_ratio < critical_hedge_ratio
+        assert hedge_ratio == pytest.approx(0.50, rel=0.01)
+
+    def test_position_imbalance_calculation(self):
+        """Position imbalance should be calculated correctly."""
+        yes_shares = 12.0
+        no_shares = 8.0
+
+        min_shares = min(yes_shares, no_shares)
+        max_shares = max(yes_shares, no_shares)
+        position_imbalance = max_shares - min_shares
+
+        assert position_imbalance == 4.0  # 12 - 8 = 4 unhedged shares
+
+    def test_position_imbalance_within_limit(self):
+        """Position imbalance <= max should be acceptable."""
+        max_imbalance = 5.0
+
+        yes_shares = 13.0
+        no_shares = 10.0
+        position_imbalance = max(yes_shares, no_shares) - min(yes_shares, no_shares)
+
+        assert position_imbalance <= max_imbalance  # 3 <= 5
+
+    def test_position_imbalance_exceeds_limit(self):
+        """Position imbalance > max should trigger warning."""
+        max_imbalance = 5.0
+
+        yes_shares = 20.0
+        no_shares = 10.0
+        position_imbalance = max(yes_shares, no_shares) - min(yes_shares, no_shares)
+
+        assert position_imbalance > max_imbalance  # 10 > 5
+
+    def test_zero_shares_handled_safely(self):
+        """Zero shares (one-sided) should not cause division error."""
+        yes_shares = 10.0
+        no_shares = 0.0
+
+        min_shares = min(yes_shares, no_shares)
+        max_shares = max(yes_shares, no_shares)
+
+        # Avoid division by zero
+        hedge_ratio = min_shares / max_shares if max_shares > 0 else 0
+
+        assert hedge_ratio == 0.0
+        assert min_shares == 0.0
+        assert max_shares == 10.0

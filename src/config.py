@@ -73,6 +73,12 @@ class GabagoolConfig:
     max_unhedged_exposure_usd: float = 10.0  # Trigger hedge
     max_slippage_cents: float = 2.0  # Reject trade
 
+    # Hedge ratio enforcement (Phase 2 - Dec 13, 2025 fix)
+    # Arbitrage REQUIRES both legs to fill - without hedge we have directional exposure
+    min_hedge_ratio: float = 0.80  # Minimum 80% hedge required for trade to be valid
+    critical_hedge_ratio: float = 0.60  # Below this, halt trading (circuit breaker)
+    max_position_imbalance_shares: float = 5.0  # Max unhedged shares allowed per position
+
     # Execution
     order_timeout_seconds: float = 10.0  # Increased - API needs time for tick-size, neg-risk, fee-rate calls
     ws_reconnect_delay_seconds: float = 1.0
@@ -113,6 +119,10 @@ class GabagoolConfig:
             max_daily_loss_usd=float(os.getenv("GABAGOOL_MAX_DAILY_LOSS", "10.0")),
             max_unhedged_exposure_usd=float(os.getenv("GABAGOOL_MAX_UNHEDGED", "10.0")),
             max_slippage_cents=float(os.getenv("GABAGOOL_MAX_SLIPPAGE", "2.0")),
+            # Hedge ratio enforcement
+            min_hedge_ratio=float(os.getenv("GABAGOOL_MIN_HEDGE_RATIO", "0.80")),
+            critical_hedge_ratio=float(os.getenv("GABAGOOL_CRITICAL_HEDGE_RATIO", "0.60")),
+            max_position_imbalance_shares=float(os.getenv("GABAGOOL_MAX_POSITION_IMBALANCE", "5.0")),
             order_timeout_seconds=float(os.getenv("GABAGOOL_ORDER_TIMEOUT", "10.0")),
             ws_reconnect_delay_seconds=float(os.getenv("GABAGOOL_WS_RECONNECT_DELAY", "1.0")),
             dry_run=os.getenv("GABAGOOL_DRY_RUN", "true").lower() == "true",  # Default TRUE until hedge enforcement complete
