@@ -99,18 +99,14 @@ DASHBOARD_HTML = """
             z-index: 1000;
         }
 
-        @keyframes flicker {
-            0%, 100% { opacity: 1; }
-            92% { opacity: 1; }
-            93% { opacity: 0.8; }
-            94% { opacity: 1; }
-        }
+        /* Removed flicker animation - caused annoying UI flashing */
+        /* @keyframes flicker { ... } */
 
         .container {
             max-width: 1600px;
             margin: 0 auto;
             padding: 20px;
-            animation: flicker 4s infinite;
+            /* animation: flicker 4s infinite; - DISABLED: caused UI flashing */
         }
 
         .header {
