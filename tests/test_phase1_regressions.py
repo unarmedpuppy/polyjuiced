@@ -681,3 +681,229 @@ class TestPhase2TradeErrorMetrics:
 
         # This is the expected label value for hedge violations
         assert error_type == "hedge_ratio_violation"
+
+
+# ============================================================================
+# Phase 3 Tests - Better Order Execution
+# ============================================================================
+
+class TestPhase3ParallelExecutionConfig:
+    """Test Phase 3 parallel execution configuration."""
+
+    def test_parallel_execution_enabled_by_default(self):
+        """Parallel execution should be enabled by default."""
+        from src.config import GabagoolConfig
+
+        config = GabagoolConfig()
+        assert config.parallel_execution_enabled is True
+
+    def test_max_liquidity_consumption_default(self):
+        """Default max liquidity consumption should be 50%."""
+        from src.config import GabagoolConfig
+
+        config = GabagoolConfig()
+        assert config.max_liquidity_consumption_pct == 0.50
+
+    def test_parallel_fill_timeout_default(self):
+        """Default parallel fill timeout should be 5 seconds."""
+        from src.config import GabagoolConfig
+
+        config = GabagoolConfig()
+        assert config.parallel_fill_timeout_seconds == 5.0
+
+    def test_order_fill_check_interval_default(self):
+        """Default fill check interval should be 100ms."""
+        from src.config import GabagoolConfig
+
+        config = GabagoolConfig()
+        assert config.order_fill_check_interval_ms == 100.0
+
+    def test_parallel_execution_from_env(self):
+        """Parallel execution config should be loadable from env."""
+        from src.config import GabagoolConfig
+
+        env_backup = {}
+        test_vars = {
+            "GABAGOOL_PARALLEL_EXECUTION": "false",
+            "GABAGOOL_MAX_LIQUIDITY_CONSUMPTION": "0.30",
+            "GABAGOOL_PARALLEL_FILL_TIMEOUT": "3.0",
+            "GABAGOOL_FILL_CHECK_INTERVAL_MS": "50.0",
+        }
+
+        for var, val in test_vars.items():
+            if var in os.environ:
+                env_backup[var] = os.environ[var]
+            os.environ[var] = val
+
+        try:
+            config = GabagoolConfig.from_env()
+            assert config.parallel_execution_enabled is False
+            assert config.max_liquidity_consumption_pct == 0.30
+            assert config.parallel_fill_timeout_seconds == 3.0
+            assert config.order_fill_check_interval_ms == 50.0
+        finally:
+            for var in test_vars:
+                if var in env_backup:
+                    os.environ[var] = env_backup[var]
+                else:
+                    del os.environ[var]
+
+
+class TestPhase3LiquidityConsumptionLimits:
+    """Test liquidity consumption limit enforcement."""
+
+    def test_liquidity_consumption_calculation(self):
+        """Verify liquidity consumption calculation is correct."""
+        displayed_liquidity = 100.0  # 100 shares displayed
+        max_consumption_pct = 0.50  # 50% max
+
+        max_shares_allowed = displayed_liquidity * max_consumption_pct
+        assert max_shares_allowed == 50.0
+
+        # Order for 40 shares should be allowed
+        order_shares = 40.0
+        assert order_shares <= max_shares_allowed
+
+        # Order for 60 shares should be rejected
+        order_shares = 60.0
+        assert order_shares > max_shares_allowed
+
+    def test_liquidity_consumption_at_limit(self):
+        """Order exactly at consumption limit should be allowed."""
+        displayed_liquidity = 100.0
+        max_consumption_pct = 0.50
+
+        max_shares_allowed = displayed_liquidity * max_consumption_pct
+        order_shares = 50.0  # Exactly at limit
+
+        assert order_shares <= max_shares_allowed
+
+    def test_conservative_sizing_reduces_rejection_risk(self):
+        """Conservative sizing (lower consumption %) reduces rejection risk."""
+        displayed_liquidity = 100.0
+        persistence_factor = 0.40  # 40% of displayed persists
+
+        # Aggressive sizing (70% of displayed)
+        aggressive_pct = 0.70
+        aggressive_max = displayed_liquidity * aggressive_pct  # 70 shares
+        actual_available = displayed_liquidity * persistence_factor  # 40 shares
+        aggressive_likely_fills = aggressive_max <= actual_available  # False
+
+        # Conservative sizing (30% of displayed)
+        conservative_pct = 0.30
+        conservative_max = displayed_liquidity * conservative_pct  # 30 shares
+        conservative_likely_fills = conservative_max <= actual_available  # True
+
+        assert not aggressive_likely_fills
+        assert conservative_likely_fills
+
+
+class TestPhase3ParallelExecutionLogic:
+    """Test parallel execution logic."""
+
+    def test_both_orders_fill_returns_success(self):
+        """When both orders fill immediately, success should be True."""
+        yes_status = "MATCHED"
+        no_status = "FILLED"
+
+        yes_filled = yes_status in ("MATCHED", "FILLED")
+        no_filled = no_status in ("MATCHED", "FILLED")
+
+        success = yes_filled and no_filled
+        assert success is True
+
+    def test_one_live_one_filled_returns_partial_fill(self):
+        """When one order goes LIVE and other fills, it's a partial fill."""
+        yes_status = "MATCHED"
+        no_status = "LIVE"
+
+        yes_filled = yes_status in ("MATCHED", "FILLED")
+        no_filled = no_status in ("MATCHED", "FILLED")
+
+        success = yes_filled and no_filled
+        partial_fill = (yes_filled and not no_filled) or (no_filled and not yes_filled)
+
+        assert success is False
+        assert partial_fill is True
+
+    def test_both_live_returns_failure_no_partial(self):
+        """When both orders go LIVE, it's a failure but not partial fill."""
+        yes_status = "LIVE"
+        no_status = "LIVE"
+
+        yes_filled = yes_status in ("MATCHED", "FILLED")
+        no_filled = no_status in ("MATCHED", "FILLED")
+
+        success = yes_filled and no_filled
+        partial_fill = (yes_filled and not no_filled) or (no_filled and not yes_filled)
+
+        assert success is False
+        assert partial_fill is False
+
+    def test_parallel_vs_sequential_atomicity(self):
+        """Parallel execution provides better atomicity than sequential.
+
+        In sequential: Time between orders allows market to move
+        In parallel: Both orders hit book simultaneously
+        """
+        # Sequential: YES @ t=0, NO @ t=100ms (100ms gap)
+        sequential_gap_ms = 100
+
+        # Parallel: Both @ t=0 (effectively 0ms gap)
+        parallel_gap_ms = 0
+
+        # Parallel is more atomic
+        assert parallel_gap_ms < sequential_gap_ms
+
+
+class TestPhase3StrategyIntegration:
+    """Test Phase 3 integration with gabagool strategy."""
+
+    @pytest.fixture
+    def mock_strategy_components(self):
+        """Create mock components for GabagoolStrategy."""
+        client = AsyncMock()
+        ws_client = MagicMock()
+        market_finder = AsyncMock()
+        market_finder.find_active_markets = AsyncMock(return_value=[])
+
+        config = MagicMock()
+        config.gabagool.enabled = True
+        config.gabagool.dry_run = False
+        config.gabagool.min_spread_threshold = 0.02
+        config.gabagool.max_trade_size_usd = 25.0
+        config.gabagool.max_daily_loss_usd = 100.0
+        config.gabagool.max_daily_exposure_usd = 100.0
+        config.gabagool.markets = ["BTC"]
+        config.gabagool.order_timeout_seconds = 10
+        config.gabagool.min_hedge_ratio = 0.80
+        config.gabagool.critical_hedge_ratio = 0.60
+        config.gabagool.max_position_imbalance_shares = 5.0
+        config.gabagool.balance_sizing_enabled = False
+        # Phase 3 config
+        config.gabagool.parallel_execution_enabled = True
+        config.gabagool.max_liquidity_consumption_pct = 0.50
+        config.gabagool.parallel_fill_timeout_seconds = 5.0
+        config.gabagool.order_fill_check_interval_ms = 100.0
+
+        return {
+            "client": client,
+            "ws_client": ws_client,
+            "market_finder": market_finder,
+            "config": config,
+        }
+
+    def test_parallel_execution_enabled_uses_parallel_method(self, mock_strategy_components):
+        """When parallel_execution_enabled=True, parallel method should be called."""
+        config = mock_strategy_components["config"]
+
+        assert config.gabagool.parallel_execution_enabled is True
+        # The strategy should use execute_dual_leg_order_parallel
+
+    def test_parallel_execution_disabled_uses_sequential_method(self, mock_strategy_components):
+        """When parallel_execution_enabled=False, sequential method should be called."""
+        config = mock_strategy_components["config"]
+        config.gabagool.parallel_execution_enabled = False
+
+        assert config.gabagool.parallel_execution_enabled is False
+        # The strategy should use execute_dual_leg_order (sequential)

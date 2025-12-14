@@ -83,6 +83,13 @@ class GabagoolConfig:
     order_timeout_seconds: float = 10.0  # Increased - API needs time for tick-size, neg-risk, fee-rate calls
     ws_reconnect_delay_seconds: float = 1.0
 
+    # Phase 3: Better order execution (Dec 13, 2025)
+    # Parallel execution places both orders simultaneously for true atomicity
+    parallel_execution_enabled: bool = True  # Use parallel order placement
+    max_liquidity_consumption_pct: float = 0.50  # Only consume 50% of displayed liquidity
+    order_fill_check_interval_ms: float = 100.0  # Check fill status every 100ms
+    parallel_fill_timeout_seconds: float = 5.0  # Timeout for both legs to fill in parallel mode
+
     # Mode
     dry_run: bool = True  # DRY RUN mode - no real trades until hedge enforcement is implemented
 
@@ -125,6 +132,11 @@ class GabagoolConfig:
             max_position_imbalance_shares=float(os.getenv("GABAGOOL_MAX_POSITION_IMBALANCE", "5.0")),
             order_timeout_seconds=float(os.getenv("GABAGOOL_ORDER_TIMEOUT", "10.0")),
             ws_reconnect_delay_seconds=float(os.getenv("GABAGOOL_WS_RECONNECT_DELAY", "1.0")),
+            # Phase 3: Better order execution
+            parallel_execution_enabled=os.getenv("GABAGOOL_PARALLEL_EXECUTION", "true").lower() == "true",
+            max_liquidity_consumption_pct=float(os.getenv("GABAGOOL_MAX_LIQUIDITY_CONSUMPTION", "0.50")),
+            order_fill_check_interval_ms=float(os.getenv("GABAGOOL_FILL_CHECK_INTERVAL_MS", "100.0")),
+            parallel_fill_timeout_seconds=float(os.getenv("GABAGOOL_PARALLEL_FILL_TIMEOUT", "5.0")),
             dry_run=os.getenv("GABAGOOL_DRY_RUN", "true").lower() == "true",  # Default TRUE until hedge enforcement complete
             # Directional trading
             directional_enabled=os.getenv("GABAGOOL_DIRECTIONAL_ENABLED", "false").lower() == "true",

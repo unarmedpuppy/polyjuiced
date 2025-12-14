@@ -893,6 +893,336 @@ class PolymarketClient:
                 "error": str(e),
             }
 
+    async def execute_dual_leg_order_parallel(
+        self,
+        yes_token_id: str,
+        no_token_id: str,
+        yes_amount_usd: float,
+        no_amount_usd: float,
+        timeout_seconds: float = 5.0,
+        max_liquidity_consumption_pct: float = 0.50,
+        condition_id: str = "",
+        asset: str = "",
+    ) -> Dict[str, Any]:
+        """Execute YES and NO orders in PARALLEL for true atomic execution.
+
+        Phase 3 improvement: Instead of sequential (YES then NO), place both
+        orders simultaneously. If either fails to fill within timeout, cancel both.
+
+        This provides better atomicity because:
+        1. Both orders hit the book at nearly the same time
+        2. Less time for market conditions to change between legs
+        3. Cleaner failure mode - if either fails, we cancel both
+
+        Args:
+            yes_token_id: YES token ID
+            no_token_id: NO token ID
+            yes_amount_usd: Amount to spend on YES
+            no_amount_usd: Amount to spend on NO
+            timeout_seconds: Timeout for both orders to fill
+            max_liquidity_consumption_pct: Max % of displayed liquidity to consume
+            condition_id: Market condition ID (for logging)
+            asset: Asset symbol (for logging)
+
+        Returns:
+            Dict with 'yes_order', 'no_order', 'success', 'partial_fill' keys
+        """
+        log.info(
+            "Executing PARALLEL dual-leg arbitrage order",
+            yes_amount=yes_amount_usd,
+            no_amount=no_amount_usd,
+            timeout=timeout_seconds,
+        )
+
+        # Pre-flight liquidity check with configurable consumption limit
+        try:
+            yes_book = self.get_order_book(yes_token_id)
+            no_book = self.get_order_book(no_token_id)
+
+            yes_asks = yes_book.get("asks", [])
+            no_asks = no_book.get("asks", [])
+
+            if not yes_asks or not no_asks:
+                log.warning("Insufficient liquidity - no asks on one or both sides")
+                return {
+                    "yes_order": None,
+                    "no_order": None,
+                    "success": False,
+                    "partial_fill": False,
+                    "error": "Insufficient liquidity - no asks available",
+                }
+
+            # Calculate available liquidity (top 3 levels)
+            yes_displayed = sum(float(ask.get("size", 0)) for ask in yes_asks[:3])
+            no_displayed = sum(float(ask.get("size", 0)) for ask in no_asks[:3])
+
+            yes_price = float(yes_asks[0].get("price", 0.5))
+            no_price = float(no_asks[0].get("price", 0.5))
+            yes_shares_needed = yes_amount_usd / yes_price if yes_price > 0 else 0
+            no_shares_needed = no_amount_usd / no_price if no_price > 0 else 0
+
+            # Enforce max liquidity consumption
+            max_yes_shares = yes_displayed * max_liquidity_consumption_pct
+            max_no_shares = no_displayed * max_liquidity_consumption_pct
+
+            if yes_shares_needed > max_yes_shares:
+                log.warning(
+                    "YES order would consume too much liquidity",
+                    needed=f"{yes_shares_needed:.1f}",
+                    max_allowed=f"{max_yes_shares:.1f}",
+                    pct=f"{max_liquidity_consumption_pct*100:.0f}%",
+                )
+                return {
+                    "yes_order": None,
+                    "no_order": None,
+                    "success": False,
+                    "partial_fill": False,
+                    "error": f"YES order would consume {yes_shares_needed/yes_displayed*100:.0f}% of liquidity (max {max_liquidity_consumption_pct*100:.0f}%)",
+                }
+
+            if no_shares_needed > max_no_shares:
+                log.warning(
+                    "NO order would consume too much liquidity",
+                    needed=f"{no_shares_needed:.1f}",
+                    max_allowed=f"{max_no_shares:.1f}",
+                    pct=f"{max_liquidity_consumption_pct*100:.0f}%",
+                )
+                return {
+                    "yes_order": None,
+                    "no_order": None,
+                    "success": False,
+                    "partial_fill": False,
+                    "error": f"NO order would consume {no_shares_needed/no_displayed*100:.0f}% of liquidity (max {max_liquidity_consumption_pct*100:.0f}%)",
+                }
+
+            log.info(
+                "Liquidity check passed for parallel execution",
+                yes_consumption=f"{yes_shares_needed/yes_displayed*100:.0f}%",
+                no_consumption=f"{no_shares_needed/no_displayed*100:.0f}%",
+            )
+
+            pre_fill_yes_depth = yes_displayed
+            pre_fill_no_depth = no_displayed
+
+        except Exception as e:
+            log.warning("Liquidity check failed, proceeding anyway", error=str(e))
+            pre_fill_yes_depth = 0.0
+            pre_fill_no_depth = 0.0
+            yes_price = 0.5
+            no_price = 0.5
+
+        def place_order_sync(token_id: str, amount_usd: float, label: str, price_hint: float) -> Dict[str, Any]:
+            """Place a single order synchronously (for use in thread pool)."""
+            from decimal import Decimal, ROUND_DOWN
+
+            start_time_ms = int(time.time() * 1000)
+
+            # Use provided price hint or fetch
+            try:
+                price = self.get_price(token_id, "buy")
+            except Exception:
+                price = price_hint
+
+            price_d = Decimal(str(price))
+            amount_d = Decimal(str(amount_usd))
+
+            # Aggressive price to ensure fill (+3 cents, max 0.99)
+            limit_price_d = min(price_d + Decimal("0.03"), Decimal("0.99"))
+            limit_price_d = limit_price_d.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+            shares_d = (amount_d / limit_price_d).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+            limit_price = float(limit_price_d)
+            shares = float(shares_d)
+
+            log.info(
+                f"Placing {label} order (parallel)",
+                price=f"{limit_price:.2f}",
+                shares=f"{shares:.2f}",
+            )
+
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=limit_price,
+                size=shares,
+                side="BUY",
+            )
+
+            signed_order = self._client.create_order(order_args)
+            result = self._client.post_order(signed_order, orderType=OrderType.GTC)
+
+            result["_intended_size"] = shares
+            result["_intended_price"] = limit_price
+            result["_start_time_ms"] = start_time_ms
+            result["_label"] = label
+
+            return result
+
+        try:
+            # PARALLEL EXECUTION: Place both orders simultaneously
+            yes_task = asyncio.create_task(
+                asyncio.to_thread(place_order_sync, yes_token_id, yes_amount_usd, "YES", yes_price)
+            )
+            no_task = asyncio.create_task(
+                asyncio.to_thread(place_order_sync, no_token_id, no_amount_usd, "NO", no_price)
+            )
+
+            # Wait for both with timeout
+            try:
+                yes_result, no_result = await asyncio.wait_for(
+                    asyncio.gather(yes_task, no_task),
+                    timeout=timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                log.error("Parallel order placement timed out")
+                # Cancel any pending tasks
+                yes_task.cancel()
+                no_task.cancel()
+                # Try to cancel any orders that might have been placed
+                try:
+                    self.cancel_all_orders()
+                except Exception:
+                    pass
+                return {
+                    "yes_order": None,
+                    "no_order": None,
+                    "success": False,
+                    "partial_fill": False,
+                    "error": "Parallel order placement timed out",
+                }
+
+            # Check fill status for both orders
+            yes_status = yes_result.get("status", "").upper()
+            no_status = no_result.get("status", "").upper()
+            yes_filled = yes_status in ("MATCHED", "FILLED")
+            no_filled = no_status in ("MATCHED", "FILLED")
+
+            yes_order_id = yes_result.get("id") or yes_result.get("order_id")
+            no_order_id = no_result.get("id") or no_result.get("order_id")
+
+            log.info(
+                "Parallel order results",
+                yes_status=yes_status,
+                no_status=no_status,
+                yes_filled=yes_filled,
+                no_filled=no_filled,
+            )
+
+            # Case 1: Both filled immediately - success!
+            if yes_filled and no_filled:
+                yes_size_matched = float(yes_result.get("size_matched", 0) or yes_result.get("matched_size", 0) or 0)
+                no_size_matched = float(no_result.get("size_matched", 0) or no_result.get("matched_size", 0) or 0)
+                log.info(
+                    "Both legs filled successfully (parallel)",
+                    yes_size=yes_size_matched,
+                    no_size=no_size_matched,
+                )
+                return {
+                    "yes_order": yes_result,
+                    "no_order": no_result,
+                    "success": True,
+                    "partial_fill": False,
+                    "yes_filled_size": yes_size_matched or float(yes_result.get("_intended_size", 0)),
+                    "no_filled_size": no_size_matched or float(no_result.get("_intended_size", 0)),
+                }
+
+            # Case 2: One or both went LIVE (on book, not filled)
+            # Cancel both orders to maintain atomicity
+            log.warning(
+                "One or both orders went LIVE - cancelling both for atomicity",
+                yes_status=yes_status,
+                no_status=no_status,
+            )
+
+            cancelled_yes = False
+            cancelled_no = False
+
+            if yes_order_id:
+                try:
+                    self._client.cancel(yes_order_id)
+                    cancelled_yes = True
+                    log.info("Cancelled YES order", order_id=yes_order_id[:20] + "...")
+                except Exception as e:
+                    log.warning("Failed to cancel YES order", error=str(e))
+
+            if no_order_id:
+                try:
+                    self._client.cancel(no_order_id)
+                    cancelled_no = True
+                    log.info("Cancelled NO order", order_id=no_order_id[:20] + "...")
+                except Exception as e:
+                    log.warning("Failed to cancel NO order", error=str(e))
+
+            # Determine if we have a partial fill situation
+            # (one filled before we could cancel)
+            partial_fill = (yes_filled and not no_filled) or (no_filled and not yes_filled)
+
+            if partial_fill:
+                # We have a problem - one leg filled, other didn't
+                # Need to unwind the filled leg
+                if yes_filled and not cancelled_yes:
+                    log.error("PARTIAL FILL: YES filled but NO didn't - attempting unwind")
+                    # Try to sell back YES
+                    yes_size = yes_result.get("_intended_size") or yes_result.get("size")
+                    if yes_size:
+                        try:
+                            from decimal import Decimal, ROUND_DOWN
+                            sell_price = max(yes_price - 0.02, 0.01)
+                            sell_price_d = Decimal(str(sell_price)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+                            sell_args = OrderArgs(
+                                token_id=yes_token_id,
+                                price=float(sell_price_d),
+                                size=float(yes_size),
+                                side="SELL",
+                            )
+                            signed_sell = self._client.create_order(sell_args)
+                            self._client.post_order(signed_sell, orderType=OrderType.GTC)
+                            log.info("Unwound YES position")
+                        except Exception as e:
+                            log.error("Failed to unwind YES - MANUAL INTERVENTION NEEDED", error=str(e))
+
+                elif no_filled and not cancelled_no:
+                    log.error("PARTIAL FILL: NO filled but YES didn't - attempting unwind")
+                    no_size = no_result.get("_intended_size") or no_result.get("size")
+                    if no_size:
+                        try:
+                            from decimal import Decimal, ROUND_DOWN
+                            sell_price = max(no_price - 0.02, 0.01)
+                            sell_price_d = Decimal(str(sell_price)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+                            sell_args = OrderArgs(
+                                token_id=no_token_id,
+                                price=float(sell_price_d),
+                                size=float(no_size),
+                                side="SELL",
+                            )
+                            signed_sell = self._client.create_order(sell_args)
+                            self._client.post_order(signed_sell, orderType=OrderType.GTC)
+                            log.info("Unwound NO position")
+                        except Exception as e:
+                            log.error("Failed to unwind NO - MANUAL INTERVENTION NEEDED", error=str(e))
+
+            return {
+                "yes_order": yes_result,
+                "no_order": no_result,
+                "success": False,
+                "partial_fill": partial_fill,
+                "error": f"Orders did not fill atomically (YES:{yes_status}, NO:{no_status})",
+            }
+
+        except Exception as e:
+            log.error("Parallel dual-leg order failed", error=str(e))
+            try:
+                self.cancel_all_orders()
+            except Exception:
+                pass
+            return {
+                "yes_order": None,
+                "no_order": None,
+                "success": False,
+                "partial_fill": False,
+                "error": str(e),
+            }
+
     # =========================================================================
     # API Key Management
     # =========================================================================

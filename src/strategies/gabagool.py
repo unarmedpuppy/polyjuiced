@@ -881,16 +881,36 @@ class GabagoolStrategy(BaseStrategy):
             return result
 
         # Execute real trade
+        # Phase 3: Use parallel execution if enabled for better atomicity
         try:
-            api_result = await self.client.execute_dual_leg_order(
-                yes_token_id=market.yes_token_id,
-                no_token_id=market.no_token_id,
-                yes_amount_usd=yes_amount,
-                no_amount_usd=no_amount,
-                timeout_seconds=self.gabagool_config.order_timeout_seconds,
-                condition_id=market.condition_id,
-                asset=market.asset,
-            )
+            if self.gabagool_config.parallel_execution_enabled:
+                log.info(
+                    "Using PARALLEL execution mode",
+                    asset=market.asset,
+                    timeout=self.gabagool_config.parallel_fill_timeout_seconds,
+                    max_liquidity_pct=f"{self.gabagool_config.max_liquidity_consumption_pct*100:.0f}%",
+                )
+                api_result = await self.client.execute_dual_leg_order_parallel(
+                    yes_token_id=market.yes_token_id,
+                    no_token_id=market.no_token_id,
+                    yes_amount_usd=yes_amount,
+                    no_amount_usd=no_amount,
+                    timeout_seconds=self.gabagool_config.parallel_fill_timeout_seconds,
+                    max_liquidity_consumption_pct=self.gabagool_config.max_liquidity_consumption_pct,
+                    condition_id=market.condition_id,
+                    asset=market.asset,
+                )
+            else:
+                # Legacy sequential execution
+                api_result = await self.client.execute_dual_leg_order(
+                    yes_token_id=market.yes_token_id,
+                    no_token_id=market.no_token_id,
+                    yes_amount_usd=yes_amount,
+                    no_amount_usd=no_amount,
+                    timeout_seconds=self.gabagool_config.order_timeout_seconds,
+                    condition_id=market.condition_id,
+                    asset=market.asset,
+                )
 
             if not api_result.get("success"):
                 error_msg = api_result.get("error", "Unknown error")
