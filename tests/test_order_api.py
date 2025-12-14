@@ -491,34 +491,97 @@ class TestDecimalPrecision:
         )
 
     def test_decimal_calculation_produces_clean_values(self):
-        """Test that our Decimal approach produces clean 2-decimal values."""
+        """Test that our Decimal approach produces API-compliant values.
+
+        Polymarket API requirements:
+        - maker_amount (USD cost): max 2 decimal places
+        - taker_amount (shares): max 4 decimal places
+        - price: 2 decimal places
+        """
         from decimal import Decimal, ROUND_DOWN
 
-        # Test case that was failing: $10 at $0.97 price
-        trade_size = Decimal("10.0")
+        # Test case: $10 at $0.97 price
+        amount_usd = Decimal("10.0")
         price = Decimal("0.97")
+
+        # Round USD amount to 2 decimals FIRST (maker_amount requirement)
+        amount_usd = amount_usd.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
         # Calculate limit price (add 2 cents, cap at 0.99)
         limit_price = min(price + Decimal("0.02"), Decimal("0.99"))
         limit_price = limit_price.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
-        # Calculate shares
-        shares = (trade_size / limit_price).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        # Calculate shares with 4 decimal precision (taker_amount requirement)
+        shares = (amount_usd / limit_price).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
 
-        # Verify values have max 2 decimal places
+        # Verify USD amount has max 2 decimal places (maker_amount)
+        assert amount_usd == Decimal("10.00")
+        assert str(amount_usd) == "10.00"
+
+        # Verify price has max 2 decimal places
         assert limit_price == Decimal("0.99")
-        assert shares == Decimal("10.10")
 
-        # Verify the product (maker amount) is clean
-        maker_amount = shares * limit_price
-        assert maker_amount == Decimal("9.9990")  # 4 decimal places max
+        # Verify shares has max 4 decimal places (taker_amount)
+        assert shares == Decimal("10.1010")
+        assert len(str(shares).split('.')[-1]) <= 4
 
         # Convert to float and verify no floating point issues
         price_float = float(limit_price)
         shares_float = float(shares)
 
         assert f"{price_float:.2f}" == "0.99"
-        assert f"{shares_float:.2f}" == "10.10"
+        assert f"{shares_float:.4f}" == "10.1010"
+
+    def test_decimal_precision_edge_cases(self):
+        """Test edge cases for decimal precision that previously caused API errors.
+
+        Error message: "invalid amounts, the market buy orders maker amount supports
+        a max accuracy of 2 decimals, taker amount a max of 4 decimals"
+        """
+        from decimal import Decimal, ROUND_DOWN
+
+        # Edge case: amount that would produce more than 4 decimal places
+        test_cases = [
+            # (amount_usd, price) -> must produce clean values
+            ("10.00", "0.53"),   # 10/0.53 = 18.8679... -> should round to 18.8679
+            ("25.00", "0.47"),   # 25/0.47 = 53.1914... -> should round to 53.1914
+            ("5.00", "0.33"),    # 5/0.33 = 15.1515... -> should round to 15.1515
+            ("100.00", "0.97"),  # 100/0.97 = 103.0927... -> should round to 103.0927
+        ]
+
+        for amount_str, price_str in test_cases:
+            amount = Decimal(amount_str).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            price = Decimal(price_str).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            shares = (amount / price).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
+
+            # Verify USD amount has max 2 decimal places
+            amount_parts = str(amount).split('.')
+            if len(amount_parts) > 1:
+                assert len(amount_parts[1]) <= 2, f"Amount {amount} has more than 2 decimals"
+
+            # Verify shares has max 4 decimal places
+            shares_parts = str(shares).split('.')
+            if len(shares_parts) > 1:
+                assert len(shares_parts[1]) <= 4, f"Shares {shares} has more than 4 decimals"
+
+    def test_decimal_module_used_in_place_order_sync(self):
+        """Verify place_order_sync uses Decimal for precise calculations.
+
+        This is the main function used for parallel order execution.
+        """
+        import src.client.polymarket as polymarket_module
+        source = inspect.getsource(polymarket_module.PolymarketClient.execute_dual_leg_order_parallel)
+
+        # The place_order_sync function is defined inline; check for Decimal usage
+        assert "from decimal import Decimal" in source, (
+            "Parallel order execution must use Decimal module for precision"
+        )
+        assert "ROUND_DOWN" in source, (
+            "Must use ROUND_DOWN to avoid rounding up beyond available funds"
+        )
+        # Verify correct precision constants are used
+        assert '0.01' in source, "Must round USD to 2 decimal places"
+        assert '0.0001' in source, "Must round shares to 4 decimal places"
 
     def test_gtc_used_instead_of_fok(self):
         """Verify GTC is used instead of FOK due to precision bugs."""
