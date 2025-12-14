@@ -950,35 +950,44 @@ DASHBOARD_HTML = """
             if (data.stats) {
                 const s = data.stats;
 
-                const pnlEl = document.getElementById('daily-pnl');
-                pnlEl.textContent = '$' + s.daily_pnl.toFixed(2);
-                pnlEl.className = 'stat-value ' + (s.daily_pnl >= 0 ? 'positive' : 'negative');
+                // Helper to update text only if changed
+                function updateText(id, value) {
+                    const el = document.getElementById(id);
+                    if (el && el.textContent !== value) el.textContent = value;
+                }
 
-                document.getElementById('daily-exposure').textContent = '$' + s.daily_exposure.toFixed(2);
-                document.getElementById('wins').textContent = s.wins || 0;
-                document.getElementById('losses').textContent = s.losses || 0;
-                document.getElementById('pending').textContent = s.pending || 0;
+                // Helper to update class only if changed
+                function updateClass(el, newClass) {
+                    if (el && el.className !== newClass) el.className = newClass;
+                }
+
+                const pnlEl = document.getElementById('daily-pnl');
+                const pnlText = '$' + s.daily_pnl.toFixed(2);
+                const pnlClass = 'stat-value ' + (s.daily_pnl >= 0 ? 'positive' : 'negative');
+                if (pnlEl.textContent !== pnlText) pnlEl.textContent = pnlText;
+                updateClass(pnlEl, pnlClass);
+
+                updateText('daily-exposure', '$' + s.daily_exposure.toFixed(2));
+                updateText('wins', String(s.wins || 0));
+                updateText('losses', String(s.losses || 0));
+                updateText('pending', String(s.pending || 0));
 
                 const wsEl = document.getElementById('ws-status');
-                wsEl.className = 'status-dot ' + (s.websocket === 'CONNECTED' ? '' : 'error');
+                updateClass(wsEl, 'status-dot ' + (s.websocket === 'CONNECTED' ? '' : 'error'));
 
                 // Update wallet balance
                 if (s.wallet_balance !== undefined) {
-                    document.getElementById('wallet-balance').textContent = s.wallet_balance.toFixed(2);
+                    updateText('wallet-balance', s.wallet_balance.toFixed(2));
                 }
 
                 // Update strategy status indicators
-                const arbEl = document.getElementById('arb-status');
-                arbEl.className = 'status-dot ' + (s.arbitrage_enabled ? '' : 'error');
-
-                const dirEl = document.getElementById('dir-status');
-                dirEl.className = 'status-dot ' + (s.directional_enabled ? '' : 'error');
-
-                const nrEl = document.getElementById('nr-status');
-                nrEl.className = 'status-dot ' + (s.near_resolution_enabled ? '' : 'error');
+                updateClass(document.getElementById('arb-status'), 'status-dot ' + (s.arbitrage_enabled ? '' : 'error'));
+                updateClass(document.getElementById('dir-status'), 'status-dot ' + (s.directional_enabled ? '' : 'error'));
+                updateClass(document.getElementById('nr-status'), 'status-dot ' + (s.near_resolution_enabled ? '' : 'error'));
 
                 if (s.dry_run) {
-                    document.getElementById('dry-run-banner').style.display = 'block';
+                    const banner = document.getElementById('dry-run-banner');
+                    if (banner.style.display !== 'block') banner.style.display = 'block';
                 }
             }
 
