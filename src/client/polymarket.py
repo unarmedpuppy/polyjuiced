@@ -232,9 +232,14 @@ class PolymarketClient:
 
         from decimal import Decimal, ROUND_DOWN
 
-        # Use Decimal for precise calculations
+        # Polymarket requires:
+        # - maker_amount (USD): 2 decimal places max
+        # - taker_amount (shares): 4 decimal places max
+        # - price: 2 decimal places
+
+        # Round USD amount to 2 decimals FIRST (maker_amount requirement)
+        amount_d = Decimal(str(amount_usd)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
         price_d = Decimal(str(price))
-        amount_d = Decimal(str(amount_usd))
 
         # Use aggressive limit price to ensure fill (max 2 decimals)
         if side.upper() == "BUY":
@@ -246,8 +251,8 @@ class PolymarketClient:
 
         limit_price_d = limit_price_d.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
-        # Calculate shares from amount with proper precision
-        shares_d = (amount_d / limit_price_d).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        # Calculate shares from amount with proper precision (4 decimals for taker_amount)
+        shares_d = (amount_d / limit_price_d).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
 
         limit_price = float(limit_price_d)
         shares = float(shares_d)
@@ -255,10 +260,10 @@ class PolymarketClient:
         log.info(
             "Placing aggressive limit order (workaround for market order bug)",
             token_id=token_id,
-            amount_usd=amount_usd,
+            amount_usd=float(amount_d),
             side=side,
             price=f"{limit_price:.2f}",
-            shares=f"{shares:.2f}",
+            shares=f"{shares:.4f}",
         )
 
         order_args = OrderArgs(
@@ -650,9 +655,14 @@ class PolymarketClient:
             except Exception:
                 price = 0.50
 
-            # Use Decimal for precise calculations
+            # Polymarket requires:
+            # - maker_amount (USD): 2 decimal places max
+            # - taker_amount (shares): 4 decimal places max
+            # - price: 2 decimal places
+
+            # Round USD amount to 2 decimals FIRST (maker_amount requirement)
+            amount_d = Decimal(str(amount_usd)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
             price_d = Decimal(str(price))
-            amount_d = Decimal(str(amount_usd))
 
             # DEPRECATED: This 3¢ slippage destroys arbitrage profit!
             # This is kept for backwards compatibility only.
@@ -660,8 +670,8 @@ class PolymarketClient:
             limit_price_d = min(price_d + Decimal("0.03"), Decimal("0.99"))
             limit_price_d = limit_price_d.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
-            # Calculate shares with proper precision
-            shares_d = (amount_d / limit_price_d).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            # Calculate shares with proper precision (4 decimals for taker_amount)
+            shares_d = (amount_d / limit_price_d).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
 
             limit_price = float(limit_price_d)
             shares = float(shares_d)
@@ -670,7 +680,7 @@ class PolymarketClient:
                 f"Placing {label} GTC order (FOK has precision bugs)",
                 token_id=token_id[:20] + "...",
                 price=f"{limit_price:.2f}",
-                shares=f"{shares:.2f}",
+                shares=f"{shares:.4f}",
             )
 
             order_args = OrderArgs(
@@ -1058,29 +1068,41 @@ class PolymarketClient:
             - DO NOT add slippage - the arbitrage profit depends on exact prices
             - DO NOT re-fetch price from API - we trust the opportunity detection
             - If we can't fill at this price, we simply don't fill (that's OK)
+
+            Polymarket decimal requirements:
+            - maker_amount (USD cost): max 2 decimal places
+            - taker_amount (shares): max 4 decimal places
+            - price: 2 decimal places
             """
             from decimal import Decimal, ROUND_DOWN
 
             start_time_ms = int(time.time() * 1000)
 
+            # Polymarket requires:
+            # - maker_amount (USD): 2 decimal places max
+            # - taker_amount (shares): 4 decimal places max
+            # - price: 2 decimal places
+
+            # Round USD amount to 2 decimals FIRST (maker_amount requirement)
+            amount_d = Decimal(str(amount_usd)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
             # Use the limit price EXACTLY as provided - NO slippage, NO re-fetching
-            price_d = Decimal(str(limit_price))
-            amount_d = Decimal(str(amount_usd))
-
             # Ensure price has 2 decimal places (Polymarket requirement)
-            price_d = price_d.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            price_d = Decimal(str(limit_price)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
-            # Calculate shares from amount and price
-            shares_d = (amount_d / price_d).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            # Calculate shares from rounded amount and price
+            # Round to 4 decimals (taker_amount max precision)
+            shares_d = (amount_d / price_d).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
 
             final_price = float(price_d)
             shares = float(shares_d)
+            final_amount = float(amount_d)
 
             log.info(
                 f"Placing {label} order at EXACT limit (no slippage)",
                 limit_price=f"${final_price:.2f}",
-                shares=f"{shares:.2f}",
-                amount_usd=f"${amount_usd:.2f}",
+                shares=f"{shares:.4f}",
+                amount_usd=f"${final_amount:.2f}",
             )
 
             order_args = OrderArgs(
