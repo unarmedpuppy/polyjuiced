@@ -1,11 +1,11 @@
-"""Position sizing calculations for Gabagool strategy."""
+"""Position sizing calculations for Mega Marble strategy."""
 
 from dataclasses import dataclass
 from typing import Optional
 
 import structlog
 
-from ..config import GabagoolConfig
+from ..config import MegaMarbleConfig
 
 log = structlog.get_logger()
 
@@ -32,11 +32,11 @@ class PositionSize:
 class PositionSizer:
     """Calculates optimal position sizes for arbitrage trades."""
 
-    def __init__(self, config: GabagoolConfig):
+    def __init__(self, config: MegaMarbleConfig):
         """Initialize position sizer.
 
         Args:
-            config: Gabagool strategy configuration
+            config: Mega Marble strategy configuration
         """
         self.config = config
 

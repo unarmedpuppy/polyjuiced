@@ -1,6 +1,6 @@
 """Trading strategies for Polymarket bot."""
 
 from .base import BaseStrategy
-from .gabagool import GabagoolStrategy
+from .mega_marble import MegaMarbleStrategy
 
-__all__ = ["BaseStrategy", "GabagoolStrategy"]
+__all__ = ["BaseStrategy", "MegaMarbleStrategy"]
