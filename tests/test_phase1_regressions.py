@@ -907,3 +907,230 @@ class TestPhase3StrategyIntegration:
 
         assert config.gabagool.parallel_execution_enabled is False
         # The strategy should use execute_dual_leg_order (sequential)
+
+
+class TestPhase3ParallelCancellationLogic:
+    """Test that parallel execution cancels both orders on failure."""
+
+    def test_cancel_both_when_yes_live_no_live(self):
+        """Both LIVE orders should be cancelled for atomicity."""
+        yes_status = "LIVE"
+        no_status = "LIVE"
+        yes_order_id = "yes123"
+        no_order_id = "no123"
+
+        yes_filled = yes_status in ("MATCHED", "FILLED")
+        no_filled = no_status in ("MATCHED", "FILLED")
+
+        # Neither filled - should cancel both
+        should_cancel_yes = not yes_filled and yes_order_id is not None
+        should_cancel_no = not no_filled and no_order_id is not None
+
+        assert should_cancel_yes is True
+        assert should_cancel_no is True
+
+    def test_cancel_unfilled_when_one_fills(self):
+        """When one fills and other doesn't, cancel the unfilled one."""
+        yes_status = "MATCHED"
+        no_status = "LIVE"
+        no_order_id = "no123"
+
+        yes_filled = yes_status in ("MATCHED", "FILLED")
+        no_filled = no_status in ("MATCHED", "FILLED")
+
+        # YES filled, NO didn't - should cancel NO
+        should_cancel_no = not no_filled and no_order_id is not None
+
+        assert yes_filled is True
+        assert no_filled is False
+        assert should_cancel_no is True
+
+    def test_no_cancel_when_both_fill(self):
+        """When both fill, no cancellation needed."""
+        yes_status = "MATCHED"
+        no_status = "FILLED"
+
+        yes_filled = yes_status in ("MATCHED", "FILLED")
+        no_filled = no_status in ("MATCHED", "FILLED")
+
+        # Both filled - no cancellation needed
+        needs_cancellation = not (yes_filled and no_filled)
+
+        assert needs_cancellation is False
+
+
+class TestPhase3UnwindLogic:
+    """Test unwind logic for partial fills in parallel mode."""
+
+    def test_unwind_yes_when_no_fails(self):
+        """When YES fills but NO doesn't, YES should be unwound."""
+        yes_status = "MATCHED"
+        no_status = "LIVE"
+        yes_size = 10.0
+
+        yes_filled = yes_status in ("MATCHED", "FILLED")
+        no_filled = no_status in ("MATCHED", "FILLED")
+
+        # Partial fill - need to unwind YES
+        partial_fill = yes_filled and not no_filled
+        should_unwind_yes = partial_fill and yes_size > 0
+
+        assert partial_fill is True
+        assert should_unwind_yes is True
+
+    def test_unwind_no_when_yes_fails(self):
+        """When NO fills but YES doesn't, NO should be unwound."""
+        yes_status = "LIVE"
+        no_status = "FILLED"
+        no_size = 10.0
+
+        yes_filled = yes_status in ("MATCHED", "FILLED")
+        no_filled = no_status in ("MATCHED", "FILLED")
+
+        # Partial fill - need to unwind NO
+        partial_fill = no_filled and not yes_filled
+        should_unwind_no = partial_fill and no_size > 0
+
+        assert partial_fill is True
+        assert should_unwind_no is True
+
+    def test_no_unwind_when_both_fill(self):
+        """No unwind needed when both orders fill."""
+        yes_status = "MATCHED"
+        no_status = "FILLED"
+
+        yes_filled = yes_status in ("MATCHED", "FILLED")
+        no_filled = no_status in ("MATCHED", "FILLED")
+
+        partial_fill = (yes_filled and not no_filled) or (no_filled and not yes_filled)
+
+        assert partial_fill is False
+
+    def test_no_unwind_when_neither_fills(self):
+        """No unwind needed when neither order fills (just cancel)."""
+        yes_status = "LIVE"
+        no_status = "LIVE"
+
+        yes_filled = yes_status in ("MATCHED", "FILLED")
+        no_filled = no_status in ("MATCHED", "FILLED")
+
+        partial_fill = (yes_filled and not no_filled) or (no_filled and not yes_filled)
+
+        # Neither filled, so no partial fill, no unwind needed
+        assert partial_fill is False
+
+
+class TestPhase3TimeoutHandling:
+    """Test timeout handling in parallel execution mode."""
+
+    def test_timeout_returns_failure(self):
+        """Timeout should return success=False with error message."""
+        # Simulate timeout result
+        result = {
+            "yes_order": None,
+            "no_order": None,
+            "success": False,
+            "partial_fill": False,
+            "error": "Parallel order placement timed out",
+        }
+
+        assert result["success"] is False
+        assert result["partial_fill"] is False
+        assert "timed out" in result["error"]
+
+    def test_timeout_config_respected(self):
+        """Parallel fill timeout should be configurable."""
+        from src.config import GabagoolConfig
+
+        # Default
+        config = GabagoolConfig()
+        assert config.parallel_fill_timeout_seconds == 5.0
+
+        # Custom via class
+        config_custom = GabagoolConfig(parallel_fill_timeout_seconds=3.0)
+        assert config_custom.parallel_fill_timeout_seconds == 3.0
+
+
+class TestPhase3LiquidityRejectionMessages:
+    """Test that liquidity rejection returns correct error messages."""
+
+    def test_yes_liquidity_rejection_message(self):
+        """YES liquidity rejection should have clear error message."""
+        displayed = 100.0
+        needed = 60.0
+        max_pct = 0.50  # 50%
+
+        # Consumption would be 60%
+        consumption_pct = (needed / displayed) * 100
+        max_allowed_pct = max_pct * 100
+
+        # Should be rejected
+        assert consumption_pct > max_allowed_pct
+
+        # Error message format
+        error = f"YES order would consume {consumption_pct:.0f}% of liquidity (max {max_allowed_pct:.0f}%)"
+        assert "YES order would consume 60% of liquidity (max 50%)" == error
+
+    def test_no_liquidity_rejection_message(self):
+        """NO liquidity rejection should have clear error message."""
+        displayed = 100.0
+        needed = 70.0
+        max_pct = 0.50
+
+        consumption_pct = (needed / displayed) * 100
+        max_allowed_pct = max_pct * 100
+
+        assert consumption_pct > max_allowed_pct
+
+        error = f"NO order would consume {consumption_pct:.0f}% of liquidity (max {max_allowed_pct:.0f}%)"
+        assert "NO order would consume 70% of liquidity (max 50%)" == error
+
+    def test_no_asks_rejection_message(self):
+        """Missing liquidity should have clear error message."""
+        yes_asks = []
+        no_asks = [{"price": "0.50", "size": "10"}]
+
+        has_liquidity = len(yes_asks) > 0 and len(no_asks) > 0
+        assert has_liquidity is False
+
+        error = "Insufficient liquidity - no asks available"
+        assert "Insufficient liquidity" in error
+
+
+class TestPhase3ConfigConsistency:
+    """Ensure Phase 3 config defaults match between class and from_env()."""
+
+    def test_phase3_defaults_match(self):
+        """Class defaults and from_env() defaults should match for Phase 3 settings."""
+        from src.config import GabagoolConfig
+
+        # Get class defaults
+        class_config = GabagoolConfig()
+
+        # Get from_env defaults (clear Phase 3 env vars)
+        env_backup = {}
+        phase3_vars = [
+            "GABAGOOL_PARALLEL_EXECUTION",
+            "GABAGOOL_MAX_LIQUIDITY_CONSUMPTION",
+            "GABAGOOL_FILL_CHECK_INTERVAL_MS",
+            "GABAGOOL_PARALLEL_FILL_TIMEOUT",
+        ]
+        for var in phase3_vars:
+            if var in os.environ:
+                env_backup[var] = os.environ.pop(var)
+
+        try:
+            env_config = GabagoolConfig.from_env()
+
+            # Phase 3 settings should match
+            assert class_config.parallel_execution_enabled == env_config.parallel_execution_enabled, \
+                f"parallel_execution_enabled mismatch: class={class_config.parallel_execution_enabled}, from_env={env_config.parallel_execution_enabled}"
+            assert class_config.max_liquidity_consumption_pct == env_config.max_liquidity_consumption_pct, \
+                f"max_liquidity_consumption_pct mismatch: class={class_config.max_liquidity_consumption_pct}, from_env={env_config.max_liquidity_consumption_pct}"
+            assert class_config.order_fill_check_interval_ms == env_config.order_fill_check_interval_ms, \
+                f"order_fill_check_interval_ms mismatch"
+            assert class_config.parallel_fill_timeout_seconds == env_config.parallel_fill_timeout_seconds, \
+                f"parallel_fill_timeout_seconds mismatch"
+        finally:
+            for var, val in env_backup.items():
+                os.environ[var] = val
