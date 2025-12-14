@@ -9,6 +9,7 @@ Named after the successful Polymarket trader @gabagool22.
 """
 
 import asyncio
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
@@ -16,6 +17,8 @@ from typing import Any, Dict, List, Optional, TYPE_CHECKING
 import structlog
 
 from ..client.polymarket import PolymarketClient
+from ..persistence import Database
+from ..events import trade_events, EventTypes
 
 if TYPE_CHECKING:
     from ..liquidity.collector import LiquidityCollector
@@ -45,6 +48,14 @@ from ..monitoring.order_book import (
     MarketState,
     MultiMarketTracker,
     OrderBookTracker,
+)
+from ..position_manager import (
+    ActivePosition,
+    ActivePositionManager,
+    RebalancingConfig,
+    TradeTelemetry,
+    create_active_position,
+    create_telemetry,
 )
 from .base import BaseStrategy
 
@@ -159,6 +170,7 @@ class GabagoolStrategy(BaseStrategy):
         ws_client: PolymarketWebSocket,
         market_finder: MarketFinder,
         config: AppConfig,
+        db: Optional[Database] = None,
     ):
         """Initialize Gabagool strategy.
 
@@ -167,11 +179,13 @@ class GabagoolStrategy(BaseStrategy):
             ws_client: WebSocket client for streaming
             market_finder: Market discovery service
             config: Application configuration
+            db: Database instance for trade persistence (Phase 2)
         """
         super().__init__(client, config)
         self.ws = ws_client
         self.market_finder = market_finder
         self.gabagool_config: GabagoolConfig = config.gabagool
+        self._db: Optional[Database] = db
 
         self._tracker: Optional[MultiMarketTracker] = None
         self._active_markets: Dict[str, Market15Min] = {}
@@ -207,6 +221,10 @@ class GabagoolStrategy(BaseStrategy):
         self._last_snapshot_time: float = 0
         # Snapshot interval (every 30 seconds)
         self._snapshot_interval: float = 30.0
+        # Active position manager for rebalancing
+        self._position_manager: Optional[ActivePositionManager] = None
+        # Pending telemetry for trades being executed: {condition_id: TradeTelemetry}
+        self._pending_telemetry: Dict[str, TradeTelemetry] = {}
 
     def set_liquidity_collector(self, collector: "LiquidityCollector") -> None:
         """Set the liquidity collector for data collection.
@@ -218,6 +236,133 @@ class GabagoolStrategy(BaseStrategy):
         # Also attach to client for fill logging
         self.client.set_liquidity_collector(collector)
         log.info("Liquidity collector attached to strategy")
+
+    def set_database(self, db: Database) -> None:
+        """Set the database instance for trade persistence.
+
+        Phase 2: Strategy owns persistence - dashboard is read-only.
+
+        Args:
+            db: Database instance
+        """
+        self._db = db
+        log.info("Database attached to strategy for trade persistence")
+
+    async def _record_trade(
+        self,
+        trade_id: str,
+        market: Market15Min,
+        opportunity: ArbitrageOpportunity,
+        yes_amount: float,
+        no_amount: float,
+        actual_yes_shares: float,
+        actual_no_shares: float,
+        hedge_ratio: float,
+        execution_status: str,
+        yes_order_status: str,
+        no_order_status: str,
+        expected_profit: float,
+        dry_run: bool = False,
+        pre_fill_yes_depth: float = None,
+        pre_fill_no_depth: float = None,
+    ) -> None:
+        """Record a trade to the database.
+
+        Phase 2: Strategy owns persistence - this is the authoritative record.
+        Dashboard receives updates via events (Phase 6) or polling.
+
+        Args:
+            trade_id: Unique trade identifier
+            market: Market the trade was executed on
+            opportunity: Original opportunity that triggered the trade
+            yes_amount: USD spent on YES leg
+            no_amount: USD spent on NO leg
+            actual_yes_shares: Actual YES shares filled
+            actual_no_shares: Actual NO shares filled
+            hedge_ratio: min(yes,no)/max(yes,no)
+            execution_status: 'full_fill', 'partial_fill', 'one_leg_only', 'failed'
+            yes_order_status: 'MATCHED', 'LIVE', 'FAILED'
+            no_order_status: 'MATCHED', 'LIVE', 'FAILED'
+            expected_profit: Expected profit based on spread
+            dry_run: Whether this is a dry run
+            pre_fill_yes_depth: Liquidity depth available on YES side before execution (Phase 5)
+            pre_fill_no_depth: Liquidity depth available on NO side before execution (Phase 5)
+        """
+        if not self._db:
+            log.warning("No database configured - trade not persisted", trade_id=trade_id)
+            return
+
+        market_end_time = None
+        if hasattr(market, "end_time") and market.end_time:
+            market_end_time = market.end_time.strftime("%H:%M UTC")
+
+        try:
+            await self._db.save_arbitrage_trade(
+                trade_id=trade_id,
+                asset=market.asset,
+                condition_id=market.condition_id,
+                yes_price=opportunity.yes_price,
+                no_price=opportunity.no_price,
+                yes_cost=yes_amount,
+                no_cost=no_amount,
+                spread=opportunity.spread_cents,
+                expected_profit=expected_profit,
+                yes_shares=actual_yes_shares,
+                no_shares=actual_no_shares,
+                hedge_ratio=hedge_ratio,
+                execution_status=execution_status,
+                yes_order_status=yes_order_status,
+                no_order_status=no_order_status,
+                market_end_time=market_end_time,
+                market_slug=market.slug,
+                dry_run=dry_run,
+                # Phase 5: Pre-fill liquidity data
+                yes_book_depth_total=pre_fill_yes_depth,
+                no_book_depth_total=pre_fill_no_depth,
+            )
+
+            # Also update daily stats
+            await self._db.update_daily_stats(
+                trades_delta=1,
+                exposure_delta=yes_amount + no_amount,
+            )
+
+            log.info(
+                "Trade recorded to database",
+                trade_id=trade_id,
+                asset=market.asset,
+                execution_status=execution_status,
+                hedge_ratio=f"{hedge_ratio:.0%}" if hedge_ratio else "N/A",
+            )
+
+            # Phase 6: Emit event for dashboard (strategy owns events)
+            await trade_events.emit(EventTypes.TRADE_CREATED, {
+                "trade_id": trade_id,
+                "asset": market.asset,
+                "condition_id": market.condition_id,
+                "yes_price": opportunity.yes_price,
+                "no_price": opportunity.no_price,
+                "yes_cost": yes_amount,
+                "no_cost": no_amount,
+                "spread": opportunity.spread_cents,
+                "expected_profit": expected_profit,
+                "yes_shares": actual_yes_shares,
+                "no_shares": actual_no_shares,
+                "hedge_ratio": hedge_ratio,
+                "execution_status": execution_status,
+                "yes_order_status": yes_order_status,
+                "no_order_status": no_order_status,
+                "market_end_time": market_end_time,
+                "market_slug": market.slug,
+                "dry_run": dry_run,
+            })
+
+        except Exception as e:
+            log.error(
+                "Failed to record trade to database",
+                trade_id=trade_id,
+                error=str(e),
+            )
 
     async def start(self) -> None:
         """Start the Gabagool strategy."""
@@ -245,6 +390,27 @@ class GabagoolStrategy(BaseStrategy):
 
         # Register callback for real-time price updates to dashboard
         self._tracker._tracker.on_state_change(self._on_market_state_change)
+
+        # Initialize active position manager for rebalancing
+        rebalancing_config = RebalancingConfig(
+            rebalance_threshold=self.gabagool_config.min_hedge_ratio,
+            min_profit_per_share=0.02,  # $0.02 minimum profit per share
+            max_rebalance_wait_seconds=60.0,  # Don't rebalance in last minute
+            prefer_sell_over_buy=True,  # Capital efficient
+            allow_partial_rebalance=True,
+            max_rebalance_trades=5,
+            max_position_size_usd=self.gabagool_config.max_trade_size_usd,
+            min_spread_dollars=self.gabagool_config.min_spread_threshold,
+        )
+        self._position_manager = ActivePositionManager(
+            client=self.client,
+            db=self._db,
+            config=rebalancing_config,
+        )
+        log.info("Active position manager initialized for rebalancing")
+
+        # Load unclaimed positions from database (from previous sessions)
+        await self._load_unclaimed_positions()
 
         # Update dashboard with strategy status
         update_stats(
@@ -301,6 +467,7 @@ class GabagoolStrategy(BaseStrategy):
         """Handle real-time price updates from WebSocket (called from sync context).
 
         Broadcasts price updates to dashboard with throttling (max 2 updates/sec per market).
+        Also triggers rebalancing evaluation for active positions (real-time, WebSocket-driven).
         """
         import time as time_module
 
@@ -324,6 +491,17 @@ class GabagoolStrategy(BaseStrategy):
 
             # Broadcast the update via SSE
             update_markets(dashboard.active_markets)
+
+        # Trigger rebalancing evaluation for active positions (WebSocket-driven, real-time)
+        # Queue for async execution since this callback is synchronous
+        if self._position_manager and self._position_manager.positions:
+            try:
+                asyncio.create_task(
+                    self._position_manager.on_price_update(condition_id, state)
+                )
+            except RuntimeError:
+                # No event loop running - skip rebalancing check
+                pass
 
     async def _queue_processor_loop(self) -> None:
         """Dedicated async task for processing opportunity queue.
@@ -597,6 +775,15 @@ class GabagoolStrategy(BaseStrategy):
         OPPORTUNITIES_DETECTED.labels(market=opportunity.market.asset).inc()
         self._opportunities_detected += 1
         update_stats(opportunities_detected=self._opportunities_detected)
+
+        # Create telemetry for timing analysis
+        telemetry = create_telemetry(
+            trade_id=f"pending-{opportunity.market.condition_id[:8]}",  # Temp ID
+            opportunity_spread=opportunity.spread_cents,
+            yes_price=opportunity.yes_price,
+            no_price=opportunity.no_price,
+        )
+        self._pending_telemetry[opportunity.market.condition_id] = telemetry
 
         # Update price metrics
         YES_PRICE.labels(
@@ -934,7 +1121,7 @@ class GabagoolStrategy(BaseStrategy):
                 expected_profit=f"${expected_profit:.2f}",
             )
 
-            # Add to dashboard trade history
+            # Add to dashboard trade history (kept for backward compat during transition)
             trade_id = add_trade(
                 asset=market.asset,
                 yes_price=opportunity.yes_price,
@@ -945,6 +1132,23 @@ class GabagoolStrategy(BaseStrategy):
                 expected_profit=expected_profit,
                 market_end_time=market_end_time,
                 market_slug=market.slug,
+                dry_run=True,
+            )
+
+            # Phase 2: Strategy owns persistence - record dry run trade to DB
+            await self._record_trade(
+                trade_id=trade_id,
+                market=market,
+                opportunity=opportunity,
+                yes_amount=yes_amount,
+                no_amount=no_amount,
+                actual_yes_shares=yes_shares,  # In dry run, intended = actual
+                actual_no_shares=no_shares,
+                hedge_ratio=1.0,  # Perfect hedge assumed in dry run
+                execution_status="full_fill",  # Assumed success in dry run
+                yes_order_status="SIMULATED",
+                no_order_status="SIMULATED",
+                expected_profit=expected_profit,
                 dry_run=True,
             )
 
@@ -969,11 +1173,20 @@ class GabagoolStrategy(BaseStrategy):
 
         # Execute real trade
         # Phase 3: Use parallel execution if enabled for better atomicity
+
+        # Record order_placed telemetry
+        telemetry = self._pending_telemetry.get(market.condition_id)
+        if telemetry:
+            telemetry.record_order_placed()
+
         try:
             if self.gabagool_config.parallel_execution_enabled:
                 log.info(
-                    "Using PARALLEL execution mode",
+                    "Using PARALLEL execution mode with EXACT pricing (no slippage)",
                     asset=market.asset,
+                    yes_price=f"${opportunity.yes_price:.2f}",
+                    no_price=f"${opportunity.no_price:.2f}",
+                    total_cost=f"${opportunity.yes_price + opportunity.no_price:.2f}",
                     timeout=self.gabagool_config.parallel_fill_timeout_seconds,
                     max_liquidity_pct=f"{self.gabagool_config.max_liquidity_consumption_pct*100:.0f}%",
                 )
@@ -982,6 +1195,8 @@ class GabagoolStrategy(BaseStrategy):
                     no_token_id=market.no_token_id,
                     yes_amount_usd=yes_amount,
                     no_amount_usd=no_amount,
+                    yes_price=opportunity.yes_price,  # EXACT price from opportunity, no slippage
+                    no_price=opportunity.no_price,    # EXACT price from opportunity, no slippage
                     timeout_seconds=self.gabagool_config.parallel_fill_timeout_seconds,
                     max_liquidity_consumption_pct=self.gabagool_config.max_liquidity_consumption_pct,
                     condition_id=market.condition_id,
@@ -1016,6 +1231,35 @@ class GabagoolStrategy(BaseStrategy):
                         up_price=opportunity.yes_price,
                         down_price=opportunity.no_price,
                         spread=opportunity.spread_cents,
+                    )
+
+                    # Phase 2: Record partial fills - these are CRITICAL to track!
+                    # Extract what actually filled from the API result
+                    yes_order = api_result.get("yes_order", {})
+                    no_order = api_result.get("no_order", {})
+                    partial_yes = float(yes_order.get("size_matched", 0) or 0)
+                    partial_no = float(no_order.get("size_matched", 0) or 0)
+
+                    # Generate a trade_id for this partial fill
+                    partial_trade_id = f"partial-{uuid.uuid4().hex[:8]}"
+
+                    await self._record_trade(
+                        trade_id=partial_trade_id,
+                        market=market,
+                        opportunity=opportunity,
+                        yes_amount=partial_yes * opportunity.yes_price if partial_yes > 0 else 0,
+                        no_amount=partial_no * opportunity.no_price if partial_no > 0 else 0,
+                        actual_yes_shares=partial_yes,
+                        actual_no_shares=partial_no,
+                        hedge_ratio=min(partial_yes, partial_no) / max(partial_yes, partial_no) if max(partial_yes, partial_no) > 0 else 0,
+                        execution_status="one_leg_only" if (partial_yes == 0 or partial_no == 0) else "partial_fill",
+                        yes_order_status=yes_order.get("status", "UNKNOWN"),
+                        no_order_status=no_order.get("status", "UNKNOWN"),
+                        expected_profit=0,  # No expected profit on partial fill
+                        dry_run=False,
+                        # Phase 5: Pre-fill liquidity data
+                        pre_fill_yes_depth=api_result.get("pre_fill_yes_depth"),
+                        pre_fill_no_depth=api_result.get("pre_fill_no_depth"),
                     )
                 else:
                     # Normal rejection (FOK didn't fill) - this is fine
@@ -1151,7 +1395,21 @@ class GabagoolStrategy(BaseStrategy):
             total_cost = yes_amount + no_amount
             expected_profit = min_shares - total_cost
 
-            # Add to dashboard trade history
+            # Determine execution status for recording
+            yes_order_status = yes_order.get("status", "UNKNOWN")
+            no_order_status = no_order.get("status", "UNKNOWN")
+
+            if actual_yes_shares > 0 and actual_no_shares > 0:
+                if actual_hedge_ratio >= 0.95:  # Near-perfect hedge
+                    execution_status = "full_fill"
+                else:
+                    execution_status = "partial_fill"
+            elif actual_yes_shares > 0 or actual_no_shares > 0:
+                execution_status = "one_leg_only"
+            else:
+                execution_status = "failed"
+
+            # Add to dashboard trade history (kept for backward compat during transition)
             trade_id = add_trade(
                 asset=market.asset,
                 yes_price=opportunity.yes_price,
@@ -1163,6 +1421,26 @@ class GabagoolStrategy(BaseStrategy):
                 market_end_time=market_end_time,
                 market_slug=market.slug,
                 dry_run=False,
+            )
+
+            # Phase 2: Strategy owns persistence - record trade directly to DB
+            await self._record_trade(
+                trade_id=trade_id,
+                market=market,
+                opportunity=opportunity,
+                yes_amount=yes_amount,
+                no_amount=no_amount,
+                actual_yes_shares=actual_yes_shares,
+                actual_no_shares=actual_no_shares,
+                hedge_ratio=actual_hedge_ratio,
+                execution_status=execution_status,
+                yes_order_status=yes_order_status,
+                no_order_status=no_order_status,
+                expected_profit=expected_profit,
+                dry_run=False,
+                # Phase 5: Pre-fill liquidity data
+                pre_fill_yes_depth=api_result.get("pre_fill_yes_depth"),
+                pre_fill_no_depth=api_result.get("pre_fill_no_depth"),
             )
 
             result = TradeResult(
@@ -1184,7 +1462,7 @@ class GabagoolStrategy(BaseStrategy):
             self._pending_trades[trade_id] = result
 
             # Track positions for auto-settlement
-            self._track_position(
+            await self._track_position(
                 market=market,
                 token_id=market.yes_token_id,
                 shares=yes_shares,
@@ -1193,7 +1471,7 @@ class GabagoolStrategy(BaseStrategy):
                 side="YES",
                 trade_id=trade_id,
             )
-            self._track_position(
+            await self._track_position(
                 market=market,
                 token_id=market.no_token_id,
                 shares=no_shares,
@@ -1211,6 +1489,37 @@ class GabagoolStrategy(BaseStrategy):
                 condition_id=market.condition_id,
                 asset=market.asset,
             )
+
+            # Update telemetry with fill info and add to active position manager
+            telemetry = self._pending_telemetry.pop(market.condition_id, None)
+            if telemetry and self._position_manager:
+                # Update telemetry with actual trade ID and fill data
+                telemetry.trade_id = trade_id
+                telemetry.record_order_filled(actual_yes_shares, actual_no_shares)
+
+                # Create active position for rebalancing management
+                active_position = create_active_position(
+                    trade_id=trade_id,
+                    market=market,
+                    yes_shares=actual_yes_shares,
+                    no_shares=actual_no_shares,
+                    yes_price=opportunity.yes_price,
+                    no_price=opportunity.no_price,
+                    telemetry=telemetry,
+                    budget=yes_amount + no_amount,
+                )
+
+                # Add to position manager for active monitoring
+                await self._position_manager.add_position(active_position)
+
+                log.info(
+                    "Position added to active management",
+                    trade_id=trade_id,
+                    asset=market.asset,
+                    hedge_ratio=f"{active_position.hedge_ratio:.0%}",
+                    needs_rebalancing=active_position.needs_rebalancing,
+                    execution_latency_ms=telemetry.execution_latency_ms,
+                )
 
             return result
 
@@ -1231,7 +1540,7 @@ class GabagoolStrategy(BaseStrategy):
                 error=str(e),
             )
 
-    def _track_position(
+    async def _track_position(
         self,
         market: Market15Min,
         token_id: str,
@@ -1242,6 +1551,8 @@ class GabagoolStrategy(BaseStrategy):
         trade_id: Optional[str] = None,
     ) -> None:
         """Track a position for auto-settlement.
+
+        Saves to both in-memory dict AND database for persistence across restarts.
 
         Args:
             market: Market the position is in
@@ -1264,10 +1575,29 @@ class GabagoolStrategy(BaseStrategy):
             trade_id=trade_id,
         )
 
+        # Track in-memory for current session
         if market.condition_id not in self._tracked_positions:
             self._tracked_positions[market.condition_id] = []
 
         self._tracked_positions[market.condition_id].append(position)
+
+        # Persist to database for survival across restarts
+        if self.db and trade_id:
+            try:
+                await self.db.add_to_settlement_queue(
+                    trade_id=trade_id,
+                    condition_id=market.condition_id,
+                    token_id=token_id,
+                    side=side,
+                    asset=market.asset,
+                    shares=shares,
+                    entry_price=entry_price,
+                    entry_cost=entry_cost,
+                    market_end_time=market.end_time,
+                )
+            except Exception as e:
+                log.error("Failed to persist position to settlement queue", error=str(e))
+
         log.debug(
             "Position tracked for settlement",
             asset=market.asset,
@@ -1276,12 +1606,86 @@ class GabagoolStrategy(BaseStrategy):
             condition_id=market.condition_id[:20] + "...",
         )
 
+    async def _load_unclaimed_positions(self) -> None:
+        """Load unclaimed positions from database on startup.
+
+        This recovers positions from previous sessions that still need to be claimed.
+        These positions are loaded into memory for processing by _check_settlement.
+        """
+        if not self.db:
+            log.debug("No database configured, skipping position load")
+            return
+
+        try:
+            unclaimed = await self.db.get_unclaimed_positions()
+
+            if not unclaimed:
+                log.info("No unclaimed positions found in database")
+                return
+
+            loaded_count = 0
+            for pos in unclaimed:
+                condition_id = pos["condition_id"]
+
+                # Skip if already in memory (shouldn't happen on fresh start)
+                if condition_id in self._tracked_positions:
+                    for existing in self._tracked_positions[condition_id]:
+                        if existing.token_id == pos["token_id"]:
+                            continue
+
+                # Parse market_end_time from string if needed
+                market_end_time = pos["market_end_time"]
+                if isinstance(market_end_time, str):
+                    market_end_time = datetime.fromisoformat(market_end_time.replace("Z", "+00:00"))
+
+                # Create TrackedPosition from database record
+                position = TrackedPosition(
+                    condition_id=condition_id,
+                    token_id=pos["token_id"],
+                    shares=pos["shares"],
+                    entry_price=pos["entry_price"],
+                    entry_cost=pos["entry_cost"],
+                    market_end_time=market_end_time,
+                    side=pos["side"],
+                    asset=pos["asset"],
+                    trade_id=pos["trade_id"],
+                    claimed=False,
+                )
+
+                # Add to in-memory tracking
+                if condition_id not in self._tracked_positions:
+                    self._tracked_positions[condition_id] = []
+                self._tracked_positions[condition_id].append(position)
+                loaded_count += 1
+
+            log.info(
+                "Loaded unclaimed positions from database",
+                count=loaded_count,
+                unique_markets=len(set(p["condition_id"] for p in unclaimed)),
+            )
+
+            # Log stats
+            stats = await self.db.get_settlement_stats()
+            log.info(
+                "Settlement queue stats",
+                total=stats["total"],
+                unclaimed=stats["unclaimed"],
+                claimed=stats["claimed"],
+                total_proceeds=f"${stats['total_proceeds']:.2f}",
+                total_profit=f"${stats['total_profit']:.2f}",
+            )
+
+        except Exception as e:
+            log.error("Failed to load unclaimed positions from database", error=str(e))
+
     async def _check_settlement(self) -> None:
         """Check for positions that need settlement (claiming winnings).
 
         This method:
         1. Cancels stale GTC orders for markets that have ended
-        2. Attempts to claim winnings by selling resolved positions at 0.99
+        2. Loads claimable positions from database (survives restarts)
+        3. Attempts to claim winnings by selling resolved positions at 0.99
+        4. Updates database with claim results
         """
         if self.gabagool_config.dry_run:
             # Skip settlement in dry run mode
@@ -1301,7 +1705,20 @@ class GabagoolStrategy(BaseStrategy):
         except Exception as e:
             log.error("Failed to cancel stale orders", error=str(e))
 
-        # 2. Check for positions to claim
+        # 2. Load claimable positions from database (positions from previous runs)
+        db_positions = []
+        if self.db:
+            try:
+                db_positions = await self.db.get_claimable_positions(wait_minutes=10)
+                if db_positions:
+                    log.debug(
+                        "Found claimable positions in database",
+                        count=len(db_positions),
+                    )
+            except Exception as e:
+                log.error("Failed to load positions from database", error=str(e))
+
+        # 3. Process in-memory positions (current session)
         positions_to_remove = []
 
         for condition_id, positions in self._tracked_positions.items():
@@ -1322,53 +1739,46 @@ class GabagoolStrategy(BaseStrategy):
                     continue
 
                 # Try to claim this position
-                log.info(
-                    "Attempting to claim resolved position",
+                await self._attempt_claim_position(
+                    token_id=position.token_id,
+                    shares=position.shares,
+                    entry_cost=position.entry_cost,
                     asset=position.asset,
                     side=position.side,
-                    shares=position.shares,
-                    condition_id=condition_id[:20] + "...",
+                    condition_id=condition_id,
+                    trade_id=position.trade_id,
+                    position_obj=position,
                 )
 
-                try:
-                    claim_result = await self.client.claim_resolved_position(
-                        token_id=position.token_id,
-                        shares=position.shares,
-                        timeout_seconds=self.gabagool_config.order_timeout_seconds,
-                    )
+        # 4. Process database positions (from previous runs/restarts)
+        for db_pos in db_positions:
+            # Skip if already in memory (already processed above)
+            condition_id = db_pos["condition_id"]
+            token_id = db_pos["token_id"]
 
-                    if claim_result["success"]:
-                        position.claimed = True
-                        proceeds = claim_result["proceeds"]
-                        profit = proceeds - position.entry_cost
+            # Check if this position is already tracked in memory
+            already_tracked = False
+            if condition_id in self._tracked_positions:
+                for mem_pos in self._tracked_positions[condition_id]:
+                    if mem_pos.token_id == token_id:
+                        already_tracked = True
+                        break
 
-                        add_log(
-                            "success",
-                            f"Claimed {position.asset} {position.side}: +${proceeds:.2f}",
-                            profit=f"${profit:.2f}",
-                        )
+            if already_tracked:
+                continue
 
-                        # Update wallet balance
-                        try:
-                            balance_info = self.client.get_balance()
-                            update_stats(wallet_balance=balance_info.get("balance", 0.0))
-                        except Exception:
-                            pass
-
-                    else:
-                        # Log but don't mark as claimed - will retry next cycle
-                        log.warning(
-                            "Failed to claim position, will retry",
-                            error=claim_result.get("error"),
-                            asset=position.asset,
-                        )
-
-                except Exception as e:
-                    log.error(
-                        "Error claiming position",
-                        error=str(e),
-                        asset=position.asset,
-                    )
+            # Try to claim this database position
+            await self._attempt_claim_position(
+                token_id=token_id,
+                shares=db_pos["shares"],
+                entry_cost=db_pos["entry_cost"],
+                asset=db_pos["asset"],
+                side=db_pos["side"],
+                condition_id=condition_id,
+                trade_id=db_pos["trade_id"],
+                position_obj=None,  # No in-memory object
+                db_position_id=db_pos["id"],
+            )
 
         # Clean up fully claimed positions (all positions for a market claimed)
         for condition_id, positions in list(self._tracked_positions.items()):
@@ -1381,6 +1791,112 @@ class GabagoolStrategy(BaseStrategy):
                 "Removed fully settled market",
                 condition_id=condition_id[:20] + "...",
             )
+
+    async def _attempt_claim_position(
+        self,
+        token_id: str,
+        shares: float,
+        entry_cost: float,
+        asset: str,
+        side: str,
+        condition_id: str,
+        trade_id: Optional[str] = None,
+        position_obj: Optional[TrackedPosition] = None,
+        db_position_id: Optional[int] = None,
+    ) -> bool:
+        """Attempt to claim a resolved position.
+
+        Returns True if claim was successful.
+        """
+        log.info(
+            "Attempting to claim resolved position",
+            asset=asset,
+            side=side,
+            shares=shares,
+            condition_id=condition_id[:20] + "...",
+        )
+
+        try:
+            claim_result = await self.client.claim_resolved_position(
+                token_id=token_id,
+                shares=shares,
+                timeout_seconds=self.gabagool_config.order_timeout_seconds,
+            )
+
+            if claim_result["success"]:
+                proceeds = claim_result["proceeds"]
+                profit = proceeds - entry_cost
+
+                # Mark in-memory position as claimed
+                if position_obj:
+                    position_obj.claimed = True
+
+                # Update database
+                if self.db and trade_id:
+                    try:
+                        await self.db.mark_position_claimed(
+                            trade_id=trade_id,
+                            token_id=token_id,
+                            proceeds=proceeds,
+                            profit=profit,
+                        )
+                    except Exception as e:
+                        log.error("Failed to update claim in database", error=str(e))
+
+                add_log(
+                    "success",
+                    f"Claimed {asset} {side}: +${proceeds:.2f}",
+                    profit=f"${profit:.2f}",
+                )
+
+                # Update wallet balance
+                try:
+                    balance_info = self.client.get_balance()
+                    update_stats(wallet_balance=balance_info.get("balance", 0.0))
+                except Exception:
+                    pass
+
+                return True
+
+            else:
+                # Log failure and record in database for retry
+                error_msg = claim_result.get("error", "Unknown error")
+                log.warning(
+                    "Failed to claim position, will retry",
+                    error=error_msg,
+                    asset=asset,
+                )
+
+                if self.db and trade_id:
+                    try:
+                        await self.db.record_claim_attempt(
+                            trade_id=trade_id,
+                            token_id=token_id,
+                            error=error_msg,
+                        )
+                    except Exception as e:
+                        log.error("Failed to record claim attempt", error=str(e))
+
+                return False
+
+        except Exception as e:
+            log.error(
+                "Error claiming position",
+                error=str(e),
+                asset=asset,
+            )
+
+            if self.db and trade_id:
+                try:
+                    await self.db.record_claim_attempt(
+                        trade_id=trade_id,
+                        token_id=token_id,
+                        error=str(e),
+                    )
+                except Exception:
+                    pass
+
+            return False
 
     async def _take_liquidity_snapshots(self) -> None:
         """Take periodic order book depth snapshots for all active markets.
@@ -1765,7 +2281,7 @@ class GabagoolStrategy(BaseStrategy):
                 )
 
                 # Track position for auto-settlement
-                self._track_position(
+                await self._track_position(
                     market=market,
                     token_id=token_id,
                     shares=shares,

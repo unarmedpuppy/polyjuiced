@@ -36,6 +36,7 @@ class Database:
         self._conn.row_factory = aiosqlite.Row
 
         await self._create_tables()
+        await self._migrate_schema()
         log.info("Database connected", path=str(self.db_path))
 
     async def close(self) -> None:
@@ -48,6 +49,8 @@ class Database:
         """Create database tables if they don't exist."""
         await self._conn.executescript("""
             -- Trades table
+            -- IMPORTANT: Strategy owns persistence - dashboard is read-only
+            -- See docs/STRATEGY_ARCHITECTURE.md for data flow
             CREATE TABLE IF NOT EXISTS trades (
                 id TEXT PRIMARY KEY,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -64,7 +67,19 @@ class Database:
                 actual_profit REAL,
                 status TEXT DEFAULT 'pending',
                 market_end_time TEXT,
-                dry_run BOOLEAN DEFAULT 0
+                dry_run BOOLEAN DEFAULT 0,
+                -- Phase 2 fields: actual execution data (added 2025-12-14)
+                yes_shares REAL,              -- Actual YES shares filled
+                no_shares REAL,               -- Actual NO shares filled
+                hedge_ratio REAL,             -- min(yes,no)/max(yes,no) - 1.0 = perfect hedge
+                execution_status TEXT,        -- 'full_fill', 'partial_fill', 'one_leg_only', 'failed'
+                yes_order_status TEXT,        -- 'MATCHED', 'LIVE', 'FAILED'
+                no_order_status TEXT,         -- 'MATCHED', 'LIVE', 'FAILED'
+                -- Liquidity context at execution time (Phase 7)
+                yes_liquidity_at_price REAL,  -- Shares available at our limit price (YES)
+                no_liquidity_at_price REAL,   -- Shares available at our limit price (NO)
+                yes_book_depth_total REAL,    -- Total YES order book depth
+                no_book_depth_total REAL      -- Total NO order book depth
             );
 
             -- Markets table (track discovered markets)
@@ -158,7 +173,138 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_snapshots_timestamp ON liquidity_snapshots(timestamp);
             CREATE INDEX IF NOT EXISTS idx_snapshots_token ON liquidity_snapshots(token_id);
             CREATE INDEX IF NOT EXISTS idx_snapshots_asset ON liquidity_snapshots(asset);
+
+            -- =========================================================================
+            -- Trade Telemetry Tables (for active position management)
+            -- See docs/REBALANCING_STRATEGY.md for rationale
+            -- =========================================================================
+
+            -- Detailed timing telemetry for each trade
+            CREATE TABLE IF NOT EXISTS trade_telemetry (
+                trade_id TEXT PRIMARY KEY,
+
+                -- Opportunity timing
+                opportunity_detected_at TIMESTAMP,
+                opportunity_spread REAL,
+                opportunity_yes_price REAL,
+                opportunity_no_price REAL,
+
+                -- Execution timing
+                order_placed_at TIMESTAMP,
+                order_filled_at TIMESTAMP,
+                execution_latency_ms REAL,
+                fill_latency_ms REAL,
+
+                -- Initial position state
+                initial_yes_shares REAL,
+                initial_no_shares REAL,
+                initial_hedge_ratio REAL,
+
+                -- Rebalancing tracking
+                rebalance_started_at TIMESTAMP,
+                rebalance_attempts INTEGER DEFAULT 0,
+                position_balanced_at TIMESTAMP,
+
+                -- Resolution
+                resolved_at TIMESTAMP,
+                final_yes_shares REAL,
+                final_no_shares REAL,
+                final_hedge_ratio REAL,
+                actual_profit REAL,
+
+                -- Foreign key to trades table
+                FOREIGN KEY (trade_id) REFERENCES trades(id)
+            );
+
+            -- Individual rebalancing trades
+            CREATE TABLE IF NOT EXISTS rebalance_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_id TEXT NOT NULL,
+                attempted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                action TEXT NOT NULL,              -- SELL_YES, BUY_NO, SELL_NO, BUY_YES
+                shares REAL NOT NULL,
+                price REAL NOT NULL,
+                status TEXT NOT NULL,              -- SUCCESS, FAILED, PARTIAL
+                filled_shares REAL DEFAULT 0,
+                profit REAL DEFAULT 0,
+                error TEXT,
+                order_id TEXT,
+
+                FOREIGN KEY (trade_id) REFERENCES trades(id)
+            );
+
+            -- Indexes for telemetry queries
+            CREATE INDEX IF NOT EXISTS idx_telemetry_detected ON trade_telemetry(opportunity_detected_at);
+            CREATE INDEX IF NOT EXISTS idx_telemetry_resolved ON trade_telemetry(resolved_at);
+            CREATE INDEX IF NOT EXISTS idx_rebalance_trade_id ON rebalance_trades(trade_id);
+            CREATE INDEX IF NOT EXISTS idx_rebalance_status ON rebalance_trades(status);
+
+            -- =========================================================================
+            -- Position Settlement Queue (survives restarts)
+            -- Tracks positions that need to be claimed/sold after market resolution
+            -- =========================================================================
+
+            CREATE TABLE IF NOT EXISTS settlement_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                trade_id TEXT NOT NULL,
+                condition_id TEXT NOT NULL,
+                token_id TEXT NOT NULL,
+                side TEXT NOT NULL,            -- YES or NO
+                asset TEXT NOT NULL,
+                shares REAL NOT NULL,
+                entry_price REAL NOT NULL,
+                entry_cost REAL NOT NULL,
+                market_end_time TIMESTAMP NOT NULL,
+                claimed BOOLEAN DEFAULT 0,
+                claimed_at TIMESTAMP,
+                claim_proceeds REAL,
+                claim_profit REAL,
+                claim_attempts INTEGER DEFAULT 0,
+                last_claim_error TEXT,
+                UNIQUE(trade_id, token_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_settlement_unclaimed ON settlement_queue(claimed, market_end_time);
+            CREATE INDEX IF NOT EXISTS idx_settlement_condition ON settlement_queue(condition_id);
         """)
+        await self._conn.commit()
+
+    async def _migrate_schema(self) -> None:
+        """Apply schema migrations for existing databases.
+
+        This adds new columns to existing tables without losing data.
+        Safe to run multiple times (idempotent).
+        """
+        # Phase 2 migration: Add execution tracking columns to trades table
+        migrations = [
+            ("trades", "yes_shares", "REAL"),
+            ("trades", "no_shares", "REAL"),
+            ("trades", "hedge_ratio", "REAL"),
+            ("trades", "execution_status", "TEXT"),
+            ("trades", "yes_order_status", "TEXT"),
+            ("trades", "no_order_status", "TEXT"),
+            ("trades", "yes_liquidity_at_price", "REAL"),
+            ("trades", "no_liquidity_at_price", "REAL"),
+            ("trades", "yes_book_depth_total", "REAL"),
+            ("trades", "no_book_depth_total", "REAL"),
+        ]
+
+        for table, column, col_type in migrations:
+            try:
+                # Check if column exists
+                cursor = await self._conn.execute(f"PRAGMA table_info({table})")
+                columns = await cursor.fetchall()
+                column_names = [col[1] for col in columns]
+
+                if column not in column_names:
+                    await self._conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {column} {col_type}"
+                    )
+                    log.info(f"Migration: Added column {column} to {table}")
+            except Exception as e:
+                log.debug(f"Migration skipped for {table}.{column}: {e}")
+
         await self._conn.commit()
 
     # ========== Trade Operations ==========
@@ -195,6 +341,100 @@ class Database:
                 ),
             )
             await self._conn.commit()
+
+    async def save_arbitrage_trade(
+        self,
+        trade_id: str,
+        asset: str,
+        condition_id: str,
+        yes_price: float,
+        no_price: float,
+        yes_cost: float,
+        no_cost: float,
+        spread: float,
+        expected_profit: float,
+        yes_shares: float,
+        no_shares: float,
+        hedge_ratio: float,
+        execution_status: str,
+        yes_order_status: str,
+        no_order_status: str,
+        market_end_time: str = None,
+        market_slug: str = None,
+        dry_run: bool = False,
+        yes_liquidity_at_price: float = None,
+        no_liquidity_at_price: float = None,
+        yes_book_depth_total: float = None,
+        no_book_depth_total: float = None,
+    ) -> None:
+        """Save an arbitrage trade with full execution details.
+
+        This is the primary method for strategy to persist trades.
+        Dashboard should NOT call this - it's read-only.
+
+        Args:
+            trade_id: Unique trade identifier
+            asset: Asset symbol (BTC, ETH, SOL)
+            condition_id: Market condition ID
+            yes_price: Limit price used for YES leg
+            no_price: Limit price used for NO leg
+            yes_cost: USD spent on YES
+            no_cost: USD spent on NO
+            spread: Spread in cents at execution
+            expected_profit: Expected profit based on spread
+            yes_shares: Actual YES shares filled
+            no_shares: Actual NO shares filled
+            hedge_ratio: min(yes,no)/max(yes,no) - 1.0 = perfect hedge
+            execution_status: 'full_fill', 'partial_fill', 'one_leg_only', 'failed'
+            yes_order_status: 'MATCHED', 'LIVE', 'FAILED'
+            no_order_status: 'MATCHED', 'LIVE', 'FAILED'
+            market_end_time: Market resolution time
+            market_slug: Market slug for reference
+            dry_run: Whether this is a dry run trade
+            yes_liquidity_at_price: Shares available at our YES limit (optional)
+            no_liquidity_at_price: Shares available at our NO limit (optional)
+            yes_book_depth_total: Total YES book depth (optional)
+            no_book_depth_total: Total NO book depth (optional)
+        """
+        # Determine status based on execution
+        if execution_status == 'failed':
+            status = 'failed'
+        elif execution_status == 'full_fill':
+            status = 'pending'  # Awaiting market resolution
+        else:
+            # partial_fill or one_leg_only - still pending but flagged
+            status = 'pending'
+
+        async with self._lock:
+            await self._conn.execute(
+                """
+                INSERT INTO trades (
+                    id, asset, condition_id, yes_price, no_price, yes_cost, no_cost,
+                    spread, expected_profit, market_end_time, market_slug, dry_run,
+                    yes_shares, no_shares, hedge_ratio, execution_status,
+                    yes_order_status, no_order_status, status,
+                    yes_liquidity_at_price, no_liquidity_at_price,
+                    yes_book_depth_total, no_book_depth_total
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    trade_id, asset, condition_id, yes_price, no_price, yes_cost, no_cost,
+                    spread, expected_profit, market_end_time, market_slug, dry_run,
+                    yes_shares, no_shares, hedge_ratio, execution_status,
+                    yes_order_status, no_order_status, status,
+                    yes_liquidity_at_price, no_liquidity_at_price,
+                    yes_book_depth_total, no_book_depth_total,
+                ),
+            )
+            await self._conn.commit()
+
+        log.debug(
+            "Arbitrage trade saved",
+            trade_id=trade_id,
+            asset=asset,
+            execution_status=execution_status,
+            hedge_ratio=f"{hedge_ratio:.2%}" if hedge_ratio else "N/A",
+        )
 
     async def resolve_trade(
         self,
@@ -942,6 +1182,404 @@ class Database:
             Dict with counts of deleted records per table
         """
         return await self.reset_trade_history(preserve_liquidity_data=False)
+
+    # ========== Trade Telemetry Operations ==========
+
+    async def save_trade_telemetry(self, telemetry: Dict[str, Any]) -> None:
+        """Save trade telemetry data.
+
+        Args:
+            telemetry: Dict with telemetry fields from TradeTelemetry.to_dict()
+        """
+        async with self._lock:
+            await self._conn.execute(
+                """
+                INSERT OR REPLACE INTO trade_telemetry (
+                    trade_id,
+                    opportunity_detected_at, opportunity_spread,
+                    opportunity_yes_price, opportunity_no_price,
+                    order_placed_at, order_filled_at,
+                    execution_latency_ms, fill_latency_ms,
+                    initial_yes_shares, initial_no_shares, initial_hedge_ratio,
+                    rebalance_started_at, rebalance_attempts, position_balanced_at,
+                    resolved_at, final_yes_shares, final_no_shares,
+                    final_hedge_ratio, actual_profit
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    telemetry.get("trade_id"),
+                    telemetry.get("opportunity_detected_at"),
+                    telemetry.get("opportunity_spread"),
+                    telemetry.get("opportunity_yes_price"),
+                    telemetry.get("opportunity_no_price"),
+                    telemetry.get("order_placed_at"),
+                    telemetry.get("order_filled_at"),
+                    telemetry.get("execution_latency_ms"),
+                    telemetry.get("fill_latency_ms"),
+                    telemetry.get("initial_yes_shares"),
+                    telemetry.get("initial_no_shares"),
+                    telemetry.get("initial_hedge_ratio"),
+                    telemetry.get("rebalance_started_at"),
+                    telemetry.get("rebalance_attempts"),
+                    telemetry.get("position_balanced_at"),
+                    telemetry.get("resolved_at"),
+                    telemetry.get("final_yes_shares"),
+                    telemetry.get("final_no_shares"),
+                    telemetry.get("final_hedge_ratio"),
+                    telemetry.get("actual_profit"),
+                ),
+            )
+            await self._conn.commit()
+
+    async def save_rebalance_trade(
+        self,
+        trade_id: str,
+        attempted_at: str,
+        action: str,
+        shares: float,
+        price: float,
+        status: str,
+        filled_shares: float = 0,
+        profit: float = 0,
+        error: str = None,
+        order_id: str = None,
+    ) -> int:
+        """Save a rebalancing trade record.
+
+        Args:
+            trade_id: Parent trade ID
+            attempted_at: When the rebalance was attempted
+            action: SELL_YES, BUY_NO, SELL_NO, BUY_YES
+            shares: Number of shares attempted
+            price: Price per share
+            status: SUCCESS, FAILED, PARTIAL
+            filled_shares: Shares actually filled
+            profit: Profit from the trade
+            error: Error message if failed
+            order_id: Exchange order ID
+
+        Returns:
+            ID of the inserted record
+        """
+        async with self._lock:
+            cursor = await self._conn.execute(
+                """
+                INSERT INTO rebalance_trades (
+                    trade_id, attempted_at, action, shares, price,
+                    status, filled_shares, profit, error, order_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    trade_id, attempted_at, action, shares, price,
+                    status, filled_shares, profit, error, order_id,
+                ),
+            )
+            await self._conn.commit()
+            return cursor.lastrowid
+
+    async def get_trade_telemetry(self, trade_id: str) -> Optional[Dict[str, Any]]:
+        """Get telemetry for a specific trade.
+
+        Args:
+            trade_id: Trade ID
+
+        Returns:
+            Telemetry dict or None
+        """
+        async with self._conn.execute(
+            "SELECT * FROM trade_telemetry WHERE trade_id = ?",
+            (trade_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def get_rebalance_trades(self, trade_id: str) -> List[Dict[str, Any]]:
+        """Get all rebalancing trades for a position.
+
+        Args:
+            trade_id: Parent trade ID
+
+        Returns:
+            List of rebalance trade records
+        """
+        async with self._conn.execute(
+            """
+            SELECT * FROM rebalance_trades
+            WHERE trade_id = ?
+            ORDER BY attempted_at ASC
+            """,
+            (trade_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    async def get_execution_latency_stats(
+        self,
+        lookback_hours: int = 24,
+    ) -> Dict[str, Any]:
+        """Get execution latency statistics.
+
+        Args:
+            lookback_hours: How many hours to analyze
+
+        Returns:
+            Dict with latency statistics
+        """
+        cutoff = (datetime.utcnow() - timedelta(hours=lookback_hours)).isoformat()
+
+        async with self._conn.execute(
+            """
+            SELECT
+                COUNT(*) as total_trades,
+                AVG(execution_latency_ms) as avg_execution_latency_ms,
+                MIN(execution_latency_ms) as min_execution_latency_ms,
+                MAX(execution_latency_ms) as max_execution_latency_ms,
+                AVG(fill_latency_ms) as avg_fill_latency_ms,
+                COUNT(CASE WHEN rebalance_started_at IS NOT NULL THEN 1 END) as trades_needing_rebalance,
+                COUNT(CASE WHEN position_balanced_at IS NOT NULL THEN 1 END) as successfully_balanced,
+                AVG(rebalance_attempts) as avg_rebalance_attempts
+            FROM trade_telemetry
+            WHERE opportunity_detected_at >= ?
+            """,
+            (cutoff,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else {}
+
+    async def get_rebalancing_success_rate(
+        self,
+        lookback_hours: int = 24,
+    ) -> Dict[str, Any]:
+        """Get rebalancing success rate statistics.
+
+        Args:
+            lookback_hours: How many hours to analyze
+
+        Returns:
+            Dict with success rate statistics
+        """
+        cutoff = (datetime.utcnow() - timedelta(hours=lookback_hours)).isoformat()
+
+        async with self._conn.execute(
+            """
+            SELECT
+                COUNT(*) as total_rebalance_trades,
+                SUM(CASE WHEN status = 'SUCCESS' THEN 1 ELSE 0 END) as successful,
+                SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) as failed,
+                SUM(CASE WHEN status = 'PARTIAL' THEN 1 ELSE 0 END) as partial,
+                AVG(CASE WHEN status = 'SUCCESS' THEN profit ELSE NULL END) as avg_profit_on_success,
+                SUM(CASE WHEN status = 'SUCCESS' THEN profit ELSE 0 END) as total_rebalance_profit
+            FROM rebalance_trades
+            WHERE attempted_at >= ?
+            """,
+            (cutoff,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else {}
+
+
+    # ========== Settlement Queue Operations ==========
+
+    async def add_to_settlement_queue(
+        self,
+        trade_id: str,
+        condition_id: str,
+        token_id: str,
+        side: str,
+        asset: str,
+        shares: float,
+        entry_price: float,
+        entry_cost: float,
+        market_end_time: datetime,
+    ) -> None:
+        """Add a position to the settlement queue.
+
+        Called after a successful trade to track positions for claiming
+        after market resolution.
+
+        Args:
+            trade_id: Associated trade ID
+            condition_id: Market condition ID
+            token_id: Token ID (YES or NO token)
+            side: "YES" or "NO"
+            asset: Asset symbol (BTC, ETH, SOL)
+            shares: Number of shares held
+            entry_price: Price per share at entry
+            entry_cost: Total cost (shares * entry_price)
+            market_end_time: When the market resolves
+        """
+        async with self._lock:
+            await self._conn.execute(
+                """
+                INSERT OR REPLACE INTO settlement_queue (
+                    trade_id, condition_id, token_id, side, asset,
+                    shares, entry_price, entry_cost, market_end_time
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    trade_id, condition_id, token_id, side, asset,
+                    shares, entry_price, entry_cost,
+                    market_end_time.isoformat() if market_end_time else None,
+                ),
+            )
+            await self._conn.commit()
+
+        log.debug(
+            "Added position to settlement queue",
+            trade_id=trade_id[:8] + "...",
+            asset=asset,
+            side=side,
+            shares=shares,
+        )
+
+    async def get_unclaimed_positions(self) -> List[Dict[str, Any]]:
+        """Get all positions that haven't been claimed yet.
+
+        Returns:
+            List of unclaimed position dicts
+        """
+        async with self._conn.execute(
+            """
+            SELECT * FROM settlement_queue
+            WHERE claimed = 0
+            ORDER BY market_end_time ASC
+            """,
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    async def get_claimable_positions(
+        self,
+        min_time_since_end_seconds: int = 600,
+    ) -> List[Dict[str, Any]]:
+        """Get positions ready to be claimed (market ended + wait period).
+
+        Args:
+            min_time_since_end_seconds: Minimum seconds after market end (default 10 min)
+
+        Returns:
+            List of positions ready for claiming
+        """
+        from datetime import datetime, timedelta
+
+        # Calculate cutoff - positions where market_end_time + wait_period < now
+        cutoff = (datetime.utcnow() - timedelta(seconds=min_time_since_end_seconds)).isoformat()
+
+        async with self._conn.execute(
+            """
+            SELECT * FROM settlement_queue
+            WHERE claimed = 0
+              AND market_end_time <= ?
+            ORDER BY market_end_time ASC
+            """,
+            (cutoff,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    async def mark_position_claimed(
+        self,
+        trade_id: str,
+        token_id: str,
+        proceeds: float,
+        profit: float,
+    ) -> None:
+        """Mark a position as successfully claimed.
+
+        Args:
+            trade_id: Trade ID
+            token_id: Token ID that was sold
+            proceeds: USD received from sale
+            profit: Profit (proceeds - entry_cost)
+        """
+        async with self._lock:
+            await self._conn.execute(
+                """
+                UPDATE settlement_queue
+                SET claimed = 1,
+                    claimed_at = CURRENT_TIMESTAMP,
+                    claim_proceeds = ?,
+                    claim_profit = ?
+                WHERE trade_id = ? AND token_id = ?
+                """,
+                (proceeds, profit, trade_id, token_id),
+            )
+            await self._conn.commit()
+
+        log.info(
+            "Position marked as claimed",
+            trade_id=trade_id[:8] + "...",
+            proceeds=f"${proceeds:.2f}",
+            profit=f"${profit:.2f}",
+        )
+
+    async def record_claim_attempt(
+        self,
+        trade_id: str,
+        token_id: str,
+        error: str = None,
+    ) -> None:
+        """Record a claim attempt (successful or not).
+
+        Args:
+            trade_id: Trade ID
+            token_id: Token ID
+            error: Error message if failed (None if successful)
+        """
+        async with self._lock:
+            await self._conn.execute(
+                """
+                UPDATE settlement_queue
+                SET claim_attempts = claim_attempts + 1,
+                    last_claim_error = ?
+                WHERE trade_id = ? AND token_id = ?
+                """,
+                (error, trade_id, token_id),
+            )
+            await self._conn.commit()
+
+    async def get_settlement_stats(self) -> Dict[str, Any]:
+        """Get settlement queue statistics.
+
+        Returns:
+            Dict with queue statistics
+        """
+        async with self._conn.execute(
+            """
+            SELECT
+                COUNT(*) as total_positions,
+                SUM(CASE WHEN claimed = 0 THEN 1 ELSE 0 END) as unclaimed,
+                SUM(CASE WHEN claimed = 1 THEN 1 ELSE 0 END) as claimed,
+                SUM(CASE WHEN claimed = 0 THEN shares * entry_price ELSE 0 END) as unclaimed_value,
+                SUM(CASE WHEN claimed = 1 THEN claim_profit ELSE 0 END) as total_claim_profit,
+                AVG(claim_attempts) as avg_claim_attempts
+            FROM settlement_queue
+            """,
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else {}
+
+    async def cleanup_old_claimed_positions(self, days: int = 30) -> int:
+        """Delete claimed positions older than specified days.
+
+        Args:
+            days: Delete positions claimed more than this many days ago
+
+        Returns:
+            Number of deleted records
+        """
+        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        async with self._lock:
+            cursor = await self._conn.execute(
+                """
+                DELETE FROM settlement_queue
+                WHERE claimed = 1 AND claimed_at < ?
+                """,
+                (cutoff,),
+            )
+            deleted = cursor.rowcount
+            await self._conn.commit()
+            return deleted
 
 
 # Global database instance
