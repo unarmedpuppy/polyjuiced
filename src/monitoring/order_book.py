@@ -84,11 +84,26 @@ class ArbitrageOpportunity:
     profit_percentage: float
     detected_at: datetime = field(default_factory=datetime.utcnow)
 
+    # Validity window for opportunities (seconds)
+    # Increased from 5s to 30s to handle API latency and async processing delays
+    VALIDITY_SECONDS: float = 30.0
+
     @property
     def is_valid(self) -> bool:
-        """Check if opportunity is still valid (recent)."""
+        """Check if opportunity is still valid (recent).
+
+        Opportunities are valid for VALIDITY_SECONDS (default 30s) to account for:
+        - API latency when placing orders
+        - Async queue processing delays
+        - Market refresh blocking the main loop
+        """
         age = (datetime.utcnow() - self.detected_at).total_seconds()
-        return age < 5  # Valid for 5 seconds
+        return age < self.VALIDITY_SECONDS
+
+    @property
+    def age_seconds(self) -> float:
+        """Get the age of this opportunity in seconds."""
+        return (datetime.utcnow() - self.detected_at).total_seconds()
 
 
 class OrderBookTracker:

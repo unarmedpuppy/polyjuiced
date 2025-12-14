@@ -199,6 +199,8 @@ class GabagoolStrategy(BaseStrategy):
         self._last_settlement_check: float = 0
         # Settlement check interval (every 60 seconds)
         self._settlement_check_interval: float = 60.0
+        # Dedicated queue processor task (runs independently of main loop)
+        self._queue_processor_task: Optional[asyncio.Task] = None
         # Liquidity collector for fill/depth logging (optional)
         self._liquidity_collector: Optional["LiquidityCollector"] = None
         # Last time we took depth snapshots
@@ -251,12 +253,31 @@ class GabagoolStrategy(BaseStrategy):
             near_resolution_enabled=self.gabagool_config.near_resolution_enabled,
         )
 
+        # Start DEDICATED queue processor task - runs independently of main loop
+        # This ensures opportunities are processed immediately without being blocked
+        # by market refresh, balance updates, or other slow operations
+        self._queue_processor_task = asyncio.create_task(
+            self._queue_processor_loop(),
+            name="opportunity-queue-processor"
+        )
+        log.info("Started dedicated opportunity queue processor task")
+
         # Start the main loop
         await self._run_loop()
 
     async def stop(self) -> None:
         """Stop the strategy."""
         self._running = False
+
+        # Cancel the dedicated queue processor task
+        if self._queue_processor_task and not self._queue_processor_task.done():
+            self._queue_processor_task.cancel()
+            try:
+                await self._queue_processor_task
+            except asyncio.CancelledError:
+                pass
+            log.info("Stopped opportunity queue processor task")
+
         log.info(
             "Stopping Gabagool strategy",
             daily_pnl=f"${self._daily_pnl:.2f}",
@@ -304,31 +325,87 @@ class GabagoolStrategy(BaseStrategy):
             # Broadcast the update via SSE
             update_markets(dashboard.active_markets)
 
-    async def _run_loop(self) -> None:
-        """Main strategy loop."""
-        last_balance_update = 0
-        last_market_update = 0
-        balance_update_interval = 30  # Update balance every 30 seconds
-        market_update_interval = 30  # Update markets every 30 seconds (don't block opportunities)
+    async def _queue_processor_loop(self) -> None:
+        """Dedicated async task for processing opportunity queue.
+
+        This runs INDEPENDENTLY of the main loop to ensure opportunities
+        are executed immediately without being blocked by:
+        - Market refresh (Gamma API calls)
+        - Balance updates
+        - Settlement checks
+        - Other slow operations
+
+        The task uses asyncio.Queue.get() with a short timeout to be responsive
+        while allowing clean shutdown.
+        """
+        log.info("Opportunity queue processor started")
 
         while self._running:
             try:
-                # PRIORITY 1: Process queued opportunities IMMEDIATELY
-                # These come from WebSocket callbacks and need instant execution
-                while not self._opportunity_queue.empty():
-                    try:
-                        opportunity = self._opportunity_queue.get_nowait()
-                        if opportunity.is_valid:
-                            log.info(
-                                "EXECUTING queued opportunity",
-                                asset=opportunity.market.asset,
-                                spread_cents=f"{opportunity.spread_cents:.1f}¢",
-                            )
-                            await self.on_opportunity(opportunity)
-                        else:
-                            log.debug("Queued opportunity expired", asset=opportunity.market.asset)
-                    except asyncio.QueueEmpty:
-                        break
+                # Wait for an opportunity with a short timeout
+                # This allows the task to check _running flag regularly for clean shutdown
+                try:
+                    opportunity = await asyncio.wait_for(
+                        self._opportunity_queue.get(),
+                        timeout=0.1  # 100ms timeout - very responsive
+                    )
+                except asyncio.TimeoutError:
+                    # No opportunity in queue, loop back to check _running
+                    continue
+
+                # Log the opportunity details
+                age = opportunity.age_seconds
+                if opportunity.is_valid:
+                    log.info(
+                        "EXECUTING queued opportunity (dedicated task)",
+                        asset=opportunity.market.asset,
+                        spread_cents=f"{opportunity.spread_cents:.1f}¢",
+                        age_seconds=f"{age:.2f}s",
+                        yes_price=f"${opportunity.yes_price:.3f}",
+                        no_price=f"${opportunity.no_price:.3f}",
+                    )
+                    await self.on_opportunity(opportunity)
+                else:
+                    # Opportunity expired - this is a bug we need to track
+                    log.warning(
+                        "OPPORTUNITY EXPIRED before execution",
+                        asset=opportunity.market.asset,
+                        spread_cents=f"{opportunity.spread_cents:.1f}¢",
+                        age_seconds=f"{age:.2f}s",
+                        validity_window=f"{opportunity.VALIDITY_SECONDS}s",
+                    )
+                    OPPORTUNITIES_SKIPPED.labels(reason="expired").inc()
+
+            except asyncio.CancelledError:
+                log.info("Opportunity queue processor cancelled")
+                raise
+            except Exception as e:
+                log.error(
+                    "Error in opportunity queue processor",
+                    error=str(e),
+                    exc_info=True,
+                )
+                # Brief sleep to avoid tight loop on repeated errors
+                await asyncio.sleep(0.5)
+
+        log.info("Opportunity queue processor stopped")
+
+    async def _run_loop(self) -> None:
+        """Main strategy loop.
+
+        Note: Opportunity queue processing is handled by _queue_processor_loop
+        which runs as a dedicated async task, ensuring immediate execution
+        without being blocked by operations in this loop.
+        """
+        last_balance_update = 0
+        last_market_update = 0
+        balance_update_interval = 30  # Update balance every 30 seconds
+        market_update_interval = 30  # Update markets every 30 seconds
+
+        while self._running:
+            try:
+                # Note: Queue processing moved to dedicated _queue_processor_loop task
+                # This loop now focuses on periodic maintenance tasks
 
                 # Reset daily counters if new day
                 self._check_daily_reset()
