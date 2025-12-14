@@ -1349,7 +1349,11 @@ class DashboardServer:
         })
 
     async def _handle_events(self, request: web.Request) -> web.StreamResponse:
-        """SSE endpoint for real-time updates."""
+        """SSE endpoint for real-time updates.
+
+        Sends periodic updates to ensure clients stay in sync even when
+        WebSocket real-time data isn't flowing.
+        """
         response = web.StreamResponse()
         response.headers["Content-Type"] = "text/event-stream"
         response.headers["Cache-Control"] = "no-cache"
@@ -1357,13 +1361,26 @@ class DashboardServer:
         await response.prepare(request)
 
         self._clients.append(response)
+        tick_count = 0
         try:
             while True:
                 await asyncio.sleep(1)
                 if response.task.done():
                     break
+
+                tick_count += 1
+                # Every 5 seconds, push current market data to this client
+                # This ensures UI stays updated even if WebSocket isn't providing real-time data
+                if tick_count >= 5 and active_markets:
+                    tick_count = 0
+                    try:
+                        message = f"data: {json.dumps({'markets': active_markets, 'stats': stats})}\n\n"
+                        await response.write(message.encode())
+                    except Exception:
+                        break
         finally:
-            self._clients.remove(response)
+            if response in self._clients:
+                self._clients.remove(response)
 
         return response
 
