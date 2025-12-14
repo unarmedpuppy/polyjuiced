@@ -591,7 +591,7 @@ DASHBOARD_HTML = """
                 </span>
             </div>
             <div class="panel-body" style="padding: 0;">
-                <div id="markets-list" style="max-height: 200px; overflow-y: auto;">
+                <div id="markets-list" style="max-height: 420px; overflow-y: auto;">
                     <div style="padding: 20px; text-align: center; color: var(--dim-green);">
                         Searching for markets...
                     </div>
