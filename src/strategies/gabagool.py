@@ -1582,9 +1582,9 @@ class GabagoolStrategy(BaseStrategy):
         self._tracked_positions[market.condition_id].append(position)
 
         # Persist to database for survival across restarts
-        if self.db and trade_id:
+        if self._db and trade_id:
             try:
-                await self.db.add_to_settlement_queue(
+                await self._db.add_to_settlement_queue(
                     trade_id=trade_id,
                     condition_id=market.condition_id,
                     token_id=token_id,
@@ -1612,12 +1612,12 @@ class GabagoolStrategy(BaseStrategy):
         This recovers positions from previous sessions that still need to be claimed.
         These positions are loaded into memory for processing by _check_settlement.
         """
-        if not self.db:
+        if not self._db:
             log.debug("No database configured, skipping position load")
             return
 
         try:
-            unclaimed = await self.db.get_unclaimed_positions()
+            unclaimed = await self._db.get_unclaimed_positions()
 
             if not unclaimed:
                 log.info("No unclaimed positions found in database")
@@ -1665,7 +1665,7 @@ class GabagoolStrategy(BaseStrategy):
             )
 
             # Log stats
-            stats = await self.db.get_settlement_stats()
+            stats = await self._db.get_settlement_stats()
             log.info(
                 "Settlement queue stats",
                 total=stats["total"],
@@ -1707,9 +1707,9 @@ class GabagoolStrategy(BaseStrategy):
 
         # 2. Load claimable positions from database (positions from previous runs)
         db_positions = []
-        if self.db:
+        if self._db:
             try:
-                db_positions = await self.db.get_claimable_positions(wait_minutes=10)
+                db_positions = await self._db.get_claimable_positions(wait_minutes=10)
                 if db_positions:
                     log.debug(
                         "Found claimable positions in database",
@@ -1832,9 +1832,9 @@ class GabagoolStrategy(BaseStrategy):
                     position_obj.claimed = True
 
                 # Update database
-                if self.db and trade_id:
+                if self._db and trade_id:
                     try:
-                        await self.db.mark_position_claimed(
+                        await self._db.mark_position_claimed(
                             trade_id=trade_id,
                             token_id=token_id,
                             proceeds=proceeds,
@@ -1867,9 +1867,9 @@ class GabagoolStrategy(BaseStrategy):
                     asset=asset,
                 )
 
-                if self.db and trade_id:
+                if self._db and trade_id:
                     try:
-                        await self.db.record_claim_attempt(
+                        await self._db.record_claim_attempt(
                             trade_id=trade_id,
                             token_id=token_id,
                             error=error_msg,
@@ -1886,9 +1886,9 @@ class GabagoolStrategy(BaseStrategy):
                 asset=asset,
             )
 
-            if self.db and trade_id:
+            if self._db and trade_id:
                 try:
-                    await self.db.record_claim_attempt(
+                    await self._db.record_claim_attempt(
                         trade_id=trade_id,
                         token_id=token_id,
                         error=str(e),
