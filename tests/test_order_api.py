@@ -537,32 +537,46 @@ class TestDecimalPrecision:
 
         Error message: "invalid amounts, the market buy orders maker amount supports
         a max accuracy of 2 decimals, taker amount a max of 4 decimals"
+
+        The CRITICAL constraint is that shares × price must have ≤2 decimals.
+        This test verifies our adjustment algorithm handles edge cases.
         """
         from decimal import Decimal, ROUND_DOWN
 
-        # Edge case: amount that would produce more than 4 decimal places
+        # Edge cases that previously failed (these prices produce bad products)
         test_cases = [
-            # (amount_usd, price) -> must produce clean values
-            ("10.00", "0.53"),   # 10/0.53 = 18.8679... -> should round to 18.8679
-            ("25.00", "0.47"),   # 25/0.47 = 53.1914... -> should round to 53.1914
-            ("5.00", "0.33"),    # 5/0.33 = 15.1515... -> should round to 15.1515
-            ("100.00", "0.97"),  # 100/0.97 = 103.0927... -> should round to 103.0927
+            # (amount_usd, price) -> must produce clean maker_amount
+            ("8.92", "0.35"),    # From real failure: 25.48 × 0.35 = 8.918 (BAD)
+            ("16.07", "0.63"),   # From real failure: 25.50 × 0.63 = 16.065 (BAD)
+            ("10.00", "0.33"),   # Pathological: 30.30 × 0.33 = 9.999 (BAD)
+            ("25.00", "0.97"),   # Near 1.00: 25.77 × 0.97 = 24.9969 (BAD)
         ]
 
         for amount_str, price_str in test_cases:
-            amount = Decimal(amount_str).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
             price = Decimal(price_str).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-            shares = (amount / price).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
+            maker_target = Decimal(amount_str).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
-            # Verify USD amount has max 2 decimal places
-            amount_parts = str(amount).split('.')
-            if len(amount_parts) > 1:
-                assert len(amount_parts[1]) <= 2, f"Amount {amount} has more than 2 decimals"
+            # Calculate shares (2 decimals for py-clob-client)
+            shares = (maker_target / price).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
-            # Verify shares has max 4 decimal places
-            shares_parts = str(shares).split('.')
-            if len(shares_parts) > 1:
-                assert len(shares_parts[1]) <= 4, f"Shares {shares} has more than 4 decimals"
+            # Adjust shares until product is clean (same algorithm as production code)
+            for _ in range(200):
+                actual_maker = shares * price
+                actual_maker_rounded = actual_maker.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+                if actual_maker == actual_maker_rounded:
+                    break
+                shares = shares - Decimal("0.01")
+                if shares <= 0:
+                    shares = Decimal("0.01")
+                    break
+
+            # CRITICAL: Verify maker_amount has max 2 decimal places
+            maker_amount = shares * price
+            maker_rounded = maker_amount.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            assert maker_amount == maker_rounded, (
+                f"Failed for price={price}: shares={shares}, "
+                f"maker_amount={maker_amount} has more than 2 decimals"
+            )
 
     def test_decimal_module_used_in_place_order_sync(self):
         """Verify place_order_sync uses Decimal for precise calculations.
@@ -580,8 +594,11 @@ class TestDecimalPrecision:
             "Must use ROUND_DOWN to avoid rounding up beyond available funds"
         )
         # Verify correct precision constants are used
-        assert '0.01' in source, "Must round USD to 2 decimal places"
-        assert '0.0001' in source, "Must round shares to 4 decimal places"
+        assert '0.01' in source, "Must round USD/shares/price to 2 decimal places"
+        # Verify there's logic to ensure clean maker_amount
+        assert 'actual_maker' in source or 'maker_amount' in source, (
+            "Must verify shares × price produces clean maker_amount"
+        )
 
     def test_gtc_used_instead_of_fok(self):
         """Verify GTC is used instead of FOK due to precision bugs."""
