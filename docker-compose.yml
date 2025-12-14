@@ -12,8 +12,10 @@ services:
       # Standard proxy env vars for httpx/requests libraries (required for py-clob-client)
       - HTTP_PROXY=http://media-download-gluetun:8888
       - HTTPS_PROXY=http://media-download-gluetun:8888
-      # Strategy settings - only arbitrage enabled, directional disabled
+      # Strategy settings - DRY RUN MODE until hedge enforcement complete
+      - GABAGOOL_DRY_RUN=true
       - GABAGOOL_DIRECTIONAL_ENABLED=false
+      - GABAGOOL_NEAR_RESOLUTION_ENABLED=false
     ports:
       - "8500:8000"  # Prometheus metrics
       - "8501:8080"  # Dashboard UI
