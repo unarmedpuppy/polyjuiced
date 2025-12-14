@@ -490,16 +490,31 @@ class Database:
             )
             await self._conn.commit()
 
-    async def get_recent_trades(self, limit: int = 50) -> List[Dict[str, Any]]:
-        """Get recent trades."""
-        async with self._conn.execute(
+    async def get_recent_trades(
+        self,
+        limit: int = 50,
+        exclude_dry_runs: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Get recent trades.
+
+        Args:
+            limit: Maximum number of trades to return
+            exclude_dry_runs: If True, only returns real (non-dry-run) trades
+        """
+        if exclude_dry_runs:
+            query = """
+                SELECT * FROM trades
+                WHERE dry_run = 0
+                ORDER BY created_at DESC
+                LIMIT ?
             """
-            SELECT * FROM trades
-            ORDER BY created_at DESC
-            LIMIT ?
-            """,
-            (limit,),
-        ) as cursor:
+        else:
+            query = """
+                SELECT * FROM trades
+                ORDER BY created_at DESC
+                LIMIT ?
+            """
+        async with self._conn.execute(query, (limit,)) as cursor:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
 
@@ -1067,7 +1082,7 @@ class Database:
     # ========== Summary Statistics ==========
 
     async def get_all_time_stats(self) -> Dict[str, Any]:
-        """Get all-time trading statistics."""
+        """Get all-time trading statistics (excludes dry runs)."""
         async with self._conn.execute(
             """
             SELECT
@@ -1081,13 +1096,14 @@ class Database:
                 MIN(actual_profit) as worst_trade,
                 SUM(yes_cost + no_cost) as total_volume
             FROM trades
+            WHERE dry_run = 0
             """,
         ) as cursor:
             row = await cursor.fetchone()
             return dict(row) if row else {}
 
     async def get_today_stats(self) -> Dict[str, Any]:
-        """Get today's trading statistics."""
+        """Get today's trading statistics (excludes dry runs)."""
         today = datetime.utcnow().strftime("%Y-%m-%d")
 
         async with self._conn.execute(
@@ -1100,7 +1116,7 @@ class Database:
                 SUM(CASE WHEN actual_profit IS NOT NULL THEN actual_profit ELSE 0 END) as pnl,
                 SUM(yes_cost + no_cost) as exposure
             FROM trades
-            WHERE date(created_at) = ?
+            WHERE date(created_at) = ? AND dry_run = 0
             """,
             (today,),
         ) as cursor:
@@ -1124,7 +1140,7 @@ class Database:
         else:
             cutoff = None
 
-        # Query resolved trades with actual profit
+        # Query resolved trades with actual profit (exclude dry runs)
         if cutoff:
             query = """
                 SELECT resolved_at, actual_profit
@@ -1132,6 +1148,7 @@ class Database:
                 WHERE status IN ('win', 'loss')
                   AND resolved_at IS NOT NULL
                   AND resolved_at >= ?
+                  AND dry_run = 0
                 ORDER BY resolved_at ASC
             """
             params = (cutoff,)
@@ -1141,6 +1158,7 @@ class Database:
                 FROM trades
                 WHERE status IN ('win', 'loss')
                   AND resolved_at IS NOT NULL
+                  AND dry_run = 0
                 ORDER BY resolved_at ASC
             """
             params = ()

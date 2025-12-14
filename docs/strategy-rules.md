@@ -289,9 +289,12 @@ This is the cost of the workaround.
 | Max Per Window | $50.00 | Limit per 15-min market |
 
 ### Slippage Protection
-- Max slippage: 2¢ from quoted price
-- Order timeout: 500ms
-- Reject trade if slippage exceeds limit
+- **UPDATED 2025-12-14**: Zero slippage policy
+- Use EXACT opportunity prices as limit prices
+- If we can't fill at the detected price, don't take the trade
+- Goal is **precision execution**, not guaranteed fills
+- A missed opportunity is better than a losing trade
+- FOK (Fill-or-Kill) orders ensure atomicity
 
 ### Position Tracking
 - Track arbitrage and directional positions separately
@@ -383,3 +386,6 @@ GABAGOOL_MAX_SLIPPAGE=0.02
 | 2024-12-13 | Removed daily exposure limit, set max daily loss to $10 (circuit breaker) |
 | 2024-12-13 | Arb position sizes now scale with available balance (25% of capital) |
 | 2024-12-13 | Disabled directional trading |
+| 2025-12-14 | **CRITICAL**: Changed slippage policy to ZERO slippage |
+| 2025-12-14 | Switched from GTC to FOK orders for atomicity |
+| 2025-12-14 | Prices now flow from opportunity detection to execution |

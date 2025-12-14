@@ -4,58 +4,71 @@
 import sqlite3
 import sys
 from datetime import datetime
+import os
 
 def main():
-    conn = sqlite3.connect("/app/data/trades.db")
-    conn.row_factory = sqlite3.Row
+    # Try multiple database paths
+    db_paths = [
+        "/app/data/gabagool.db",
+        "/app/data/trades.db",
+        "/app/data/polymarket.db",
+    ]
+
+    conn = None
+    for path in db_paths:
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            try:
+                conn = sqlite3.connect(path)
+                conn.row_factory = sqlite3.Row
+                c = conn.cursor()
+                c.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                tables = [r[0] for r in c.fetchall()]
+                print(f"Using database: {path}")
+                print(f"Tables: {tables}")
+                if "trades" in tables or "gabagool_trades" in tables:
+                    break
+                conn.close()
+                conn = None
+            except Exception as e:
+                print(f"Error with {path}: {e}")
+                if conn:
+                    conn.close()
+                conn = None
+
+    if not conn:
+        print("No valid database found!")
+        return
+
     c = conn.cursor()
 
-    # Check for unresolved trades
-    c.execute("""
-        SELECT trade_id, asset, condition_id, yes_shares, no_shares,
-               execution_status, resolved_at, created_at
-        FROM trades
-        WHERE resolved_at IS NULL
-        ORDER BY created_at DESC
-        LIMIT 20
-    """)
+    # Try to find the trades table name
+    c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%trade%'")
+    trade_tables = [r[0] for r in c.fetchall()]
+    print(f"Trade-related tables: {trade_tables}")
 
-    rows = c.fetchall()
-    print(f"=== Unresolved Trades ({len(rows)} found) ===")
-    for row in rows:
-        d = dict(row)
-        yes = float(d["yes_shares"] or 0)
-        no = float(d["no_shares"] or 0)
-        print(f"  {d['trade_id'][:8]}... {d['asset']:4} yes={yes:7.2f} no={no:7.2f} status={d['execution_status']}")
-        print(f"    condition: {d['condition_id'][:16]}...")
-        print(f"    created: {d['created_at']}")
+    # Check schema of first trade table
+    if trade_tables:
+        table = trade_tables[0]
+        c.execute(f"PRAGMA table_info({table})")
+        columns = [r[1] for r in c.fetchall()]
+        print(f"\nColumns in {table}: {columns}")
 
-    # Check recently resolved
-    c.execute("""
-        SELECT trade_id, asset, yes_shares, no_shares, resolved_at
-        FROM trades
-        WHERE resolved_at IS NOT NULL
-        ORDER BY resolved_at DESC
-        LIMIT 5
-    """)
+        # Get sample data
+        c.execute(f"SELECT * FROM {table} ORDER BY rowid DESC LIMIT 5")
+        rows = c.fetchall()
+        print(f"\nRecent rows ({len(rows)} shown):")
+        for row in rows:
+            print(f"  {dict(row)}")
 
-    rows = c.fetchall()
-    print(f"\n=== Recently Resolved ({len(rows)} shown) ===")
-    for row in rows:
-        d = dict(row)
-        yes = float(d["yes_shares"] or 0)
-        no = float(d["no_shares"] or 0)
-        print(f"  {d['trade_id'][:8]}... {d['asset']:4} yes={yes:7.2f} no={no:7.2f} resolved={d['resolved_at']}")
+    # Check for tracked_positions or similar
+    c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%position%'")
+    position_tables = [r[0] for r in c.fetchall()]
+    print(f"\nPosition-related tables: {position_tables}")
 
-    # Count totals
-    c.execute("SELECT COUNT(*) FROM trades WHERE resolved_at IS NULL")
-    unresolved = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM trades WHERE resolved_at IS NOT NULL")
-    resolved = c.fetchone()[0]
-
-    print(f"\n=== Summary ===")
-    print(f"  Total unresolved: {unresolved}")
-    print(f"  Total resolved: {resolved}")
+    # Check telemetry
+    c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%telemetry%'")
+    telemetry_tables = [r[0] for r in c.fetchall()]
+    print(f"Telemetry-related tables: {telemetry_tables}")
 
     conn.close()
 

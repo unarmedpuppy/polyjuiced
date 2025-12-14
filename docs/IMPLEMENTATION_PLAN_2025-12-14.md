@@ -41,52 +41,161 @@ Strategy → Database.save_trade() → Events/Callbacks
 
 ### Phase 1: Fix Dynamic Pricing (Critical)
 
-**Problem:** Bot uses hardcoded $0.53 limit price for both legs, causing one leg to sit on the order book unfilled.
+**Problem:** Bot uses the same limit price ($0.53) for both legs due to redundant price fetching. This causes one leg to fill while the other sits on the book.
+
+**Root Cause (see [STRATEGY_ARCHITECTURE.md](./STRATEGY_ARCHITECTURE.md#-critical-bug-identified-2025-12-14)):**
+
+The `execute_dual_leg_order_parallel()` function at `polymarket.py:896` has a subtle bug:
+
+1. **Strategy** (gabagool.py) calls execution with amounts but **NOT prices**
+2. **Execution** (polymarket.py) fetches order book prices (correct so far)
+3. **BUT** the inner `place_order_sync()` function calls `get_price()` **AGAIN** (line 1022)
+4. This returns the best ask for each token (~$0.50 for both)
+5. Both get +3¢ slippage → both become $0.53
 
 **Files to modify:**
-- `src/client/polymarket.py` - `execute_arbitrage_trade()` method
+- `src/client/polymarket.py` - `execute_dual_leg_order_parallel()` and `place_order_sync()`
+- `src/strategies/gabagool.py` - Pass prices through to execution
 
-**Current code pattern:**
+**Current code pattern (polymarket.py:1014-1030):**
 ```python
-# BROKEN: Same price for both legs
-limit_price = 0.53
-yes_order = create_order(price=limit_price, ...)
-no_order = create_order(price=limit_price, ...)
+def place_order_sync(token_id, amount_usd, label, price_hint):
+    # PROBLEM: Re-fetches price instead of using price_hint!
+    try:
+        price = self.get_price(token_id, "buy")  # ← REDUNDANT API CALL
+    except Exception:
+        price = price_hint  # Only used on error
+
+    # Both legs get same price ~$0.50 → both get $0.53 limit
+    limit_price_d = min(price_d + Decimal("0.03"), Decimal("0.99"))
 ```
 
-**Fix:**
+#### ⚠️ CRITICAL: Slippage Strategy
+
+**The old approach was fundamentally broken:**
+- Adding 3¢ slippage to each leg = 6¢ total slippage
+- On a 2¢ arbitrage opportunity, this turns profit into loss!
+- Example: YES=$0.49, NO=$0.49 (spread=2¢)
+  - Old: Buy YES@$0.52 + NO@$0.52 = $1.04 total → **GUARANTEED LOSS**
+  - Correct: Buy YES@$0.49 + NO@$0.49 = $0.98 total → **2¢ profit per share**
+
+**New slippage philosophy:**
+1. **NO slippage** - Use exact opportunity prices as limit prices
+2. If we can't fill at the detected price, **don't take the trade**
+3. The goal is **precision execution**, not guaranteed fills
+4. A missed opportunity is better than a losing trade
+
+**Why this works:**
+- We're buying at the ask price (what sellers are offering)
+- If our limit = ask, we should fill immediately if liquidity exists
+- If liquidity disappears before our order arrives, we simply don't fill
+- FOK (Fill-or-Kill) order type ensures atomicity
+
+---
+
+**Fix: Pass prices through from strategy with ZERO slippage**
+
+Modify `execute_dual_leg_order_parallel()` signature:
+
 ```python
-def execute_arbitrage_trade(
+# polymarket.py
+async def execute_dual_leg_order_parallel(
     self,
     yes_token_id: str,
     no_token_id: str,
-    yes_amount: float,
-    no_amount: float,
-    yes_price: float,  # Actual market price from opportunity
-    no_price: float,   # Actual market price from opportunity
-    slippage: float = 0.02,  # 2 cents default
-) -> DualLegResult:
-    """Execute arbitrage with dynamic pricing based on actual market prices."""
+    yes_amount_usd: float,
+    no_amount_usd: float,
+    yes_price: float,  # Exact price from opportunity detection
+    no_price: float,   # Exact price from opportunity detection
+    timeout_seconds: float = 5.0,
+    max_liquidity_consumption_pct: float = 0.50,
+    condition_id: str = "",
+    asset: str = "",
+) -> Dict[str, Any]:
+    """Execute YES and NO orders in PARALLEL for true atomic execution.
 
-    # Calculate limit prices from actual market prices + slippage
-    yes_limit = round(min(yes_price + slippage, 0.99), 2)
-    no_limit = round(min(no_price + slippage, 0.99), 2)
+    IMPORTANT: Prices are exact limit prices. NO slippage is added.
+    If we can't fill at these prices, we don't take the trade.
+    The goal is precision, not guaranteed fills.
+    """
+
+    # Use prices EXACTLY as provided - no slippage!
+    yes_limit = yes_price
+    no_limit = no_price
+
+    # Validate the arbitrage still makes sense
+    total_cost = yes_limit + no_limit
+    if total_cost >= 1.0:
+        log.warning(
+            "Arbitrage no longer valid - total cost >= $1.00",
+            yes_limit=yes_limit,
+            no_limit=no_limit,
+            total=total_cost,
+        )
+        return {"success": False, "error": "Arbitrage invalidated - prices sum to >= $1.00"}
 
     log.info(
-        "Executing arbitrage with dynamic pricing",
-        yes_market=f"${yes_price:.2f}",
+        "Executing arbitrage with EXACT pricing (no slippage)",
         yes_limit=f"${yes_limit:.2f}",
-        no_market=f"${no_price:.2f}",
         no_limit=f"${no_limit:.2f}",
+        total_cost=f"${total_cost:.2f}",
+        expected_profit_per_share=f"${1.0 - total_cost:.2f}",
     )
 
-    # ... rest of execution
+    # ... rest of execution with FOK orders
+```
+
+Update gabagool.py to pass exact prices:
+
+```python
+# gabagool.py around line 980
+api_result = await self.client.execute_dual_leg_order_parallel(
+    yes_token_id=market.yes_token_id,
+    no_token_id=market.no_token_id,
+    yes_amount_usd=yes_amount,
+    no_amount_usd=no_amount,
+    yes_price=opportunity.yes_price,  # EXACT price, no slippage
+    no_price=opportunity.no_price,    # EXACT price, no slippage
+    timeout_seconds=self.gabagool_config.parallel_fill_timeout_seconds,
+    max_liquidity_consumption_pct=self.gabagool_config.max_liquidity_consumption_pct,
+    condition_id=market.condition_id,
+    asset=market.asset,
+)
+```
+
+Update `place_order_sync()` to use price directly:
+
+```python
+# polymarket.py - place_order_sync inner function
+def place_order_sync(token_id: str, amount_usd: float, label: str, limit_price: float) -> Dict[str, Any]:
+    """Place order at EXACT limit price. No slippage, no re-fetching."""
+    from decimal import Decimal, ROUND_DOWN
+
+    # Use the limit price EXACTLY as provided
+    price_d = Decimal(str(limit_price))
+    amount_d = Decimal(str(amount_usd))
+
+    # DO NOT add slippage - price is already the exact limit we want
+    # DO NOT call get_price() - we already have the price
+
+    shares_d = (amount_d / price_d).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+    log.info(
+        f"Placing {label} order at EXACT limit",
+        limit_price=f"{float(price_d):.2f}",
+        shares=f"{float(shares_d):.2f}",
+    )
+
+    # ... rest of order creation
 ```
 
 **Validation:**
-- [ ] Prices logged match detected opportunity prices
-- [ ] Both legs use appropriate limit prices
+- [ ] Prices logged match detected opportunity prices EXACTLY (no slippage added)
+- [ ] Total cost (yes_price + no_price) is validated < $1.00 before execution
+- [ ] Expected profit per share is logged and matches spread
 - [ ] Test with dry run showing correct prices
+- [ ] No magic numbers (0.53, 0.03, etc.) in pricing code path
+- [ ] FOK orders used to ensure atomicity (no partial fills sitting on book)
 
 ---
 
@@ -561,15 +670,443 @@ async def on_trade_event(event_type: str, data: dict) -> None:
 
 ---
 
+## Phase 7: Record Liquidity Depth with Every Trade
+
+**Problem:** We have no visibility into available liquidity at trade time.
+
+**Files to modify:**
+- `src/persistence.py` - Add liquidity fields to trades table
+- `src/strategies/gabagool.py` - Capture and record liquidity snapshot
+- `src/monitoring/order_book.py` - Add method to get depth at price
+
+**Schema additions:**
+```sql
+-- Add to trades table
+yes_liquidity_at_price REAL,  -- Shares available at our limit price (YES side)
+no_liquidity_at_price REAL,   -- Shares available at our limit price (NO side)
+yes_book_depth_total REAL,    -- Total YES order book depth
+no_book_depth_total REAL,     -- Total NO order book depth
+```
+
+**Implementation:**
+```python
+# In gabagool.py - before executing trade
+
+async def _capture_liquidity_snapshot(
+    self,
+    market: Market15Min,
+    yes_limit_price: float,
+    no_limit_price: float,
+) -> dict:
+    """Capture liquidity available at our intended prices."""
+    yes_at_price = self._tracker.get_depth_at_price(
+        market.yes_token_id, "BUY", yes_limit_price
+    )
+    no_at_price = self._tracker.get_depth_at_price(
+        market.no_token_id, "BUY", no_limit_price
+    )
+    yes_total = self._tracker.get_total_depth(market.yes_token_id, "BUY")
+    no_total = self._tracker.get_total_depth(market.no_token_id, "BUY")
+
+    return {
+        "yes_liquidity_at_price": yes_at_price,
+        "no_liquidity_at_price": no_at_price,
+        "yes_book_depth_total": yes_total,
+        "no_book_depth_total": no_total,
+    }
+```
+
+**Validation:**
+- [ ] Every trade record includes liquidity snapshot
+- [ ] Can analyze correlation between liquidity and fill success
+- [ ] Dashboard shows liquidity warnings
+
+---
+
+## Phase 8: Comprehensive Regression Test Suite
+
+**Problem:** Hardcoded $0.53 price made it to production - testing is inadequate.
+
+**New test files:**
+- `tests/test_pricing_logic.py` - Ensure prices are never hardcoded
+- `tests/test_execution_flow.py` - Full execution path testing
+- `tests/test_order_parameters.py` - Validate all order parameters
+- `tests/test_invariants.py` - Assert business logic invariants
+
+### 8.1 Pricing Logic Tests
+
+```python
+# tests/test_pricing_logic.py
+
+import pytest
+from src.client.polymarket import PolymarketClient
+
+class TestPricingLogic:
+    """Ensure prices are NEVER hardcoded and always derived from market data."""
+
+    def test_limit_price_derived_from_market_price(self):
+        """Limit price must be based on actual market price + slippage."""
+        market_price = 0.35
+        slippage = 0.02
+
+        limit_price = calculate_limit_price(market_price, slippage, "BUY")
+
+        # Must be market price + slippage, NOT a hardcoded value
+        assert limit_price == pytest.approx(0.37, abs=0.001)
+        assert limit_price != 0.53  # Explicitly check not hardcoded
+
+    def test_yes_and_no_prices_differ(self):
+        """YES and NO legs must use different prices based on their markets."""
+        yes_market = 0.30
+        no_market = 0.68
+
+        yes_limit = calculate_limit_price(yes_market, 0.02, "BUY")
+        no_limit = calculate_limit_price(no_market, 0.02, "BUY")
+
+        assert yes_limit != no_limit
+        assert yes_limit == pytest.approx(0.32, abs=0.001)
+        assert no_limit == pytest.approx(0.70, abs=0.001)
+
+    def test_no_magic_numbers_in_pricing(self):
+        """Scan codebase for hardcoded price values."""
+        import re
+        from pathlib import Path
+
+        # Files to scan
+        src_files = Path("src").rglob("*.py")
+
+        magic_price_pattern = re.compile(
+            r'price\s*=\s*(0\.\d{2})\b',  # price = 0.XX
+            re.IGNORECASE
+        )
+
+        violations = []
+        for filepath in src_files:
+            content = filepath.read_text()
+            matches = magic_price_pattern.findall(content)
+            for match in matches:
+                # Allow 0.01, 0.02 (slippage), 0.99 (max), 0.00 (min)
+                if match not in ('0.01', '0.02', '0.99', '0.00'):
+                    violations.append(f"{filepath}: hardcoded price {match}")
+
+        assert not violations, f"Found hardcoded prices: {violations}"
+
+    def test_price_bounds(self):
+        """Prices must be within valid Polymarket range."""
+        for market_price in [0.01, 0.25, 0.50, 0.75, 0.99]:
+            limit = calculate_limit_price(market_price, 0.02, "BUY")
+            assert 0.01 <= limit <= 0.99, f"Invalid limit price: {limit}"
+```
+
+### 8.2 Execution Flow Tests
+
+```python
+# tests/test_execution_flow.py
+
+import pytest
+from unittest.mock import AsyncMock, MagicMock
+from src.strategies.gabagool import GabagoolStrategy
+
+class TestExecutionFlow:
+    """Test the complete execution path from opportunity to trade record."""
+
+    @pytest.fixture
+    def strategy(self):
+        """Create strategy with mocked dependencies."""
+        strategy = GabagoolStrategy(config=mock_config)
+        strategy._client = AsyncMock()
+        strategy._db = AsyncMock()
+        return strategy
+
+    async def test_opportunity_to_execution_uses_correct_prices(self, strategy):
+        """Verify prices flow correctly from opportunity to order."""
+        opportunity = MockOpportunity(
+            yes_price=0.30,
+            no_price=0.68,
+            spread_cents=2.0,
+        )
+
+        await strategy._execute_arbitrage(mock_market, opportunity)
+
+        # Verify the client was called with prices derived from opportunity
+        call_args = strategy._client.execute_arbitrage_trade.call_args
+        assert call_args.kwargs['yes_price'] == 0.30
+        assert call_args.kwargs['no_price'] == 0.68
+
+    async def test_partial_fill_is_recorded(self, strategy):
+        """Partial fills must be recorded, not silently dropped."""
+        strategy._client.execute_arbitrage_trade.return_value = DualLegResult(
+            success=False,
+            actual_yes_shares=10.0,
+            actual_no_shares=0.0,  # NO leg failed
+            hedge_ratio=0.0,
+        )
+
+        await strategy._execute_arbitrage(mock_market, mock_opportunity)
+
+        # Must still record the partial fill
+        strategy._db.save_trade.assert_called_once()
+        call_args = strategy._db.save_trade.call_args
+        assert call_args.kwargs['yes_shares'] == 10.0
+        assert call_args.kwargs['no_shares'] == 0.0
+        assert call_args.kwargs['hedge_ratio'] == 0.0
+
+    async def test_liquidity_snapshot_captured(self, strategy):
+        """Every trade must capture liquidity at execution time."""
+        await strategy._execute_arbitrage(mock_market, mock_opportunity)
+
+        call_args = strategy._db.save_trade.call_args
+        assert 'yes_liquidity_at_price' in call_args.kwargs
+        assert 'no_liquidity_at_price' in call_args.kwargs
+```
+
+### 8.3 Business Invariants Tests
+
+```python
+# tests/test_invariants.py
+
+import pytest
+
+class TestBusinessInvariants:
+    """Test invariants that must ALWAYS hold true."""
+
+    def test_arbitrage_requires_spread(self):
+        """Cannot execute arbitrage without positive spread."""
+        with pytest.raises(ValueError, match="spread"):
+            validate_arbitrage_opportunity(yes_price=0.50, no_price=0.52)
+
+    def test_total_cost_less_than_one_dollar(self):
+        """Arbitrage only works if YES + NO < $1.00."""
+        # Valid
+        assert is_valid_arbitrage(yes=0.30, no=0.68)  # 0.98 < 1.00
+
+        # Invalid
+        assert not is_valid_arbitrage(yes=0.50, no=0.52)  # 1.02 > 1.00
+
+    def test_shares_calculated_for_equal_pairs(self):
+        """Must buy equal shares of YES and NO for true arbitrage."""
+        yes_shares, no_shares = calculate_arbitrage_shares(
+            budget=10.0,
+            yes_price=0.30,
+            no_price=0.68,
+        )
+        assert yes_shares == pytest.approx(no_shares, rel=0.01)
+
+    def test_expected_profit_positive(self):
+        """Expected profit must be positive for valid arbitrage."""
+        profit = calculate_expected_profit(
+            yes_price=0.30,
+            no_price=0.68,
+            shares=10.0,
+        )
+        assert profit > 0
+
+    def test_dry_run_never_calls_exchange(self, mocker):
+        """Dry run must NEVER make real API calls."""
+        mock_post = mocker.patch('httpx.AsyncClient.post')
+
+        strategy = GabagoolStrategy(dry_run=True)
+        await strategy._execute_arbitrage(...)
+
+        # post() should never be called in dry run
+        mock_post.assert_not_called()
+```
+
+---
+
+## Phase 9: Strategy Code Path Documentation
+
+**Problem:** No visual documentation of how the strategy executes.
+
+**Create:** `docs/STRATEGY_ARCHITECTURE.md` - Living document updated with every code change.
+
+**Contents:**
+1. High-level flow diagram
+2. Function-by-function documentation
+3. Data flow diagrams
+4. State machine diagrams
+5. Error handling paths
+
+See [STRATEGY_ARCHITECTURE.md](./STRATEGY_ARCHITECTURE.md) for full documentation.
+
+**Maintenance rule:** Every PR that touches strategy code MUST update this document.
+
+---
+
+## Phase 10: Code Audit Checklist
+
+**Problem:** How did $0.53 get into production?
+
+### Immediate Audit Actions
+
+1. **Grep for magic numbers:**
+   ```bash
+   grep -rn "0\.[0-9][0-9]" src/ --include="*.py" | grep -v "0.01\|0.02\|0.99\|0.00"
+   ```
+
+2. **Review all hardcoded values:**
+   ```bash
+   grep -rn "price.*=" src/ --include="*.py"
+   grep -rn "amount.*=" src/ --include="*.py"
+   grep -rn "shares.*=" src/ --include="*.py"
+   ```
+
+3. **Check for TODO/FIXME/HACK comments:**
+   ```bash
+   grep -rn "TODO\|FIXME\|HACK\|XXX" src/ --include="*.py"
+   ```
+
+4. **Review recent commits for suspicious patterns:**
+   ```bash
+   git log --oneline -20 --all -- src/client/polymarket.py
+   git log -p --since="2025-12-01" -- src/client/polymarket.py
+   ```
+
+### Pre-Commit Hooks
+
+Add `.pre-commit-config.yaml`:
+```yaml
+repos:
+  - repo: local
+    hooks:
+      - id: no-magic-prices
+        name: Check for hardcoded prices
+        entry: python scripts/check_magic_numbers.py
+        language: python
+        files: \.py$
+
+      - id: test-pricing
+        name: Run pricing tests
+        entry: pytest tests/test_pricing_logic.py -v
+        language: python
+        pass_filenames: false
+```
+
+### CI Pipeline Additions
+
+```yaml
+# Add to CI workflow
+- name: Run invariant tests
+  run: pytest tests/test_invariants.py -v
+
+- name: Check for magic numbers
+  run: python scripts/check_magic_numbers.py
+
+- name: Verify strategy documentation is current
+  run: python scripts/check_docs_current.py
+```
+
+---
+
+## End-to-End Trade Scenario Tests
+
+These scenarios should be executed against the strategy to validate complete execution paths.
+
+### Scenario 1: Perfect Arbitrage Fill
+```
+Setup:
+- BTC market with YES=$0.48, NO=$0.49 (spread=3¢)
+- Both legs have 100+ shares liquidity
+- Budget: $20
+
+Expected:
+- Both FOK orders fill at exact prices (no slippage)
+- Trade recorded with execution_status='full_fill'
+- hedge_ratio=1.0
+- yes_shares ≈ no_shares ≈ 20.6
+- Expected profit: $0.62
+```
+
+### Scenario 2: FOK Rejection (Liquidity Disappeared)
+```
+Setup:
+- ETH market with YES=$0.30, NO=$0.68 (spread=2¢)
+- Only 5 shares liquidity on YES side
+- Budget: $20 (would need ~10 shares each side)
+
+Expected:
+- FOK orders rejected (insufficient liquidity)
+- Trade NOT recorded (no fill = no trade)
+- No partial exposure
+```
+
+### Scenario 3: One-Leg Partial Fill (if FOK fails atomically)
+```
+Setup:
+- SOL market with YES=$0.40, NO=$0.58 (spread=2¢)
+- YES fills 20 shares, NO fills 0 shares
+- (Note: With FOK this shouldn't happen, but test for safety)
+
+Expected:
+- Trade recorded with execution_status='one_leg_only'
+- hedge_ratio=0
+- yes_shares=20, no_shares=0
+- Dashboard shows PARTIAL FILL alert
+```
+
+### Scenario 4: Dry Run Recording
+```
+Setup:
+- GABAGOOL_DRY_RUN=true
+- BTC market with valid arbitrage opportunity
+
+Expected:
+- Trade recorded with dry_run=True
+- execution_status='full_fill' (simulated)
+- yes_order_status='SIMULATED', no_order_status='SIMULATED'
+- No real API calls made
+```
+
+### Scenario 5: Hedge Ratio Below Minimum
+```
+Setup:
+- min_hedge_ratio=0.80 (config)
+- BTC market executes with YES=20, NO=10 (hedge_ratio=0.5)
+
+Expected:
+- Trade rejected due to poor hedge
+- Error logged: "Hedge ratio 50% below minimum 80%"
+- If critical_hedge_ratio breached, consider circuit breaker
+```
+
+### Scenario 6: Price Invalidation Before Execution
+```
+Setup:
+- Opportunity detected at YES=$0.48, NO=$0.49 (spread=3¢)
+- Prices change before execution to YES=$0.52, NO=$0.50 (total=$1.02)
+
+Expected:
+- Pre-validation catches total >= $1.00
+- Trade rejected: "Arbitrage invalidated - prices sum to >= $1.00"
+- No orders placed
+```
+
+### Test Execution
+```bash
+# Run all Phase 2 tests
+pytest tests/test_phase2_persistence.py -v
+
+# Run end-to-end scenarios (when implemented)
+pytest tests/test_e2e_scenarios.py -v
+
+# Run all regression tests
+pytest tests/test_phase1_regressions.py tests/test_phase2_persistence.py -v
+```
+
+---
+
 ## Files Changed Summary
 
 | File | Changes |
 |------|---------|
 | `src/client/polymarket.py` | Dynamic pricing, fix unwind logic, return actual fills |
-| `src/strategies/gabagool.py` | Own persistence, emit events, liquidity check |
-| `src/persistence.py` | Add new fields (shares, hedge_ratio, status) |
-| `src/dashboard.py` | Remove persistence, subscribe to events |
-| `src/events.py` | New file - event emitter |
-| `tests/test_dynamic_pricing.py` | New test file |
-| `tests/test_partial_fills.py` | New test file |
-| `tests/test_unwind_logic.py` | New test file |
+| `src/strategies/gabagool.py` | Own persistence via _record_trade(), emit events, liquidity check |
+| `src/persistence.py` | Add new fields (shares, hedge_ratio, execution_status, liquidity), migration |
+| `src/dashboard.py` | Remove persistence, dashboard is READ-ONLY |
+| `src/events.py` | New file - event emitter (Phase 6) |
+| `docs/STRATEGY_ARCHITECTURE.md` | Living architecture documentation |
+| `tests/test_phase1_regressions.py` | Phase 1 regression tests |
+| `tests/test_phase2_persistence.py` | Phase 2 persistence/recording tests |
+| `tests/test_e2e_scenarios.py` | End-to-end trade scenario tests |
+| `scripts/check_magic_numbers.py` | Audit script |
+| `.pre-commit-config.yaml` | Pre-commit hooks |
