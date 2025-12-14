@@ -667,7 +667,7 @@ class TestPhase2TradeErrorMetrics:
 
     def test_trade_errors_total_metric_exists(self):
         """Verify TRADE_ERRORS_TOTAL metric is defined."""
-        from src.utils.metrics import TRADE_ERRORS_TOTAL
+        from src.metrics import TRADE_ERRORS_TOTAL
 
         # The metric should exist and be a Counter
         assert TRADE_ERRORS_TOTAL is not None
