@@ -2,19 +2,20 @@
 
 ## Executive Summary
 
-**Total P&L: -$4.61**
+**Status: Bot shut down, switched to DRY RUN mode pending fixes**
 
-| Metric | Value |
-|--------|-------|
-| Total Spent | $164.80 |
-| Total Redeemed | $158.06 |
-| Total Sold | $2.13 |
-| Losing Positions | $47.79 |
-| Net P&L | -$4.61 |
+**Total P&L: ~-$5 to -$10** (estimated, pending final resolution of 3:00PM trades)
 
 ### Key Finding
 
-The losses were primarily caused by **unhedged or poorly hedged positions** - NOT by the arbitrage strategy itself. When the bot executed proper hedged positions, profits were made. When only one side filled or positions were significantly imbalanced, losses occurred.
+**The core arbitrage strategy is sound.** The losses were caused by **execution failures** - one leg of the trade failing while the other succeeded, creating unhedged directional exposure.
+
+Out of 16 markets traded:
+- **10 markets (62.5%)** had ONE-SIDED positions (only UP or only DOWN)
+- **4 markets (25%)** had severely IMBALANCED positions (<70% hedge)
+- **Only 2 markets (12.5%)** had acceptable hedge ratios (>70%)
+
+This is a **critical execution bug**, not a strategy problem.
 
 ---
 
@@ -260,6 +261,113 @@ This happens when the bot doesn't recognize it already has a position in the mar
 
 ---
 
+## Root Cause Deep Dive
+
+### The Dual-Leg Execution Problem
+
+The `execute_dual_leg_order()` function attempts to:
+1. Place YES order first
+2. If YES fills → Place NO order
+3. If NO fails → Attempt to unwind YES
+
+**The problem**: This sequential approach fails in practice because:
+
+1. **GTC orders vs FOK**: We use GTC (Good-Till-Cancel) instead of FOK (Fill-or-Kill) due to decimal precision bugs in py-clob-client. GTC orders can partially fill or sit unfilled.
+
+2. **"LIVE" status ambiguity**: The code treats `LIVE` status as "filled" (`yes_filled = yes_status in ("MATCHED", "FILLED", "LIVE")`), but LIVE means the order is active on the book, not filled.
+
+3. **Unwind failures**: When the second leg fails, the unwind attempt also uses GTC orders which may not fill, leaving us exposed.
+
+4. **Directional trading interference**: Even with `directional_enabled: false`, the near-resolution trading feature was still creating one-sided positions.
+
+### Evidence from Trade Data
+
+**One-sided positions (10 markets)**:
+```
+BTC 9:30AM:  Only UP (9.43 shares)  - directional or failed dual-leg
+BTC 10:00AM: Only DOWN (3.85 shares) - directional
+BTC 10:15AM: Only DOWN (44.75 shares after sell) - UP was sold/unwound
+BTC 11:00AM: Only DOWN (9.61 shares) - directional
+BTC 2:30PM:  Only DOWN (4.80 shares) - directional
+SOL 9:45AM:  Only UP (10.10 shares) - directional
+SOL 10:00AM: Only UP (10.10 shares) - directional
+SOL 11:00AM: Only DOWN (12.99 shares) - directional
+ETH 2:15PM:  Only UP (16.22 shares) - directional
+ETH 3:00PM:  Only UP (5.29 shares) - directional
+```
+
+**Pattern**: Many of these show prices at $0.08-$0.30, which are the cheap "directional bet" prices. The near-resolution feature and/or directional trading were placing one-sided bets.
+
+**Imbalanced positions (4 markets)**:
+```
+BTC 10:30AM: UP 2.88 vs DOWN 10.10 (29% hedge)
+BTC 3:00PM:  UP 29.17 vs DOWN 17.98 (62% hedge)
+ETH 10:15AM: UP 30.32 vs DOWN 16.84 (56% hedge)
+SOL 2:15PM:  UP 31.76 vs DOWN 15.40 (48% hedge)
+```
+
+**Pattern**: Multiple separate buy orders on one side. The position stacking prevention wasn't working correctly, allowing 2-3 UP buys in a row.
+
+---
+
+## Action Plan
+
+### Phase 1: Immediate (Before Going Live Again)
+
+1. ✅ **Enable DRY RUN mode** - Done
+2. ⬜ **Disable near-resolution trading** - It's creating one-sided positions
+3. ⬜ **Fix LIVE status handling** - Only treat MATCHED/FILLED as filled
+4. ⬜ **Add post-trade hedge verification** - Check actual position after trade
+
+### Phase 2: Enforce Hedge Ratio (Critical)
+
+**New config parameters:**
+```python
+min_hedge_ratio: float = 0.80  # Minimum 80% hedge required
+max_position_imbalance_shares: float = 5.0  # Max unhedged shares allowed
+```
+
+**Implementation approach:**
+1. **Pre-trade**: Calculate expected hedge ratio, reject if <80%
+2. **During execution**: If first leg fills, second leg MUST fill or unwind
+3. **Post-trade**: Verify actual hedge ratio, rebalance if needed
+4. **Circuit breaker**: If hedge ratio drops below 60%, halt new trades
+
+### Phase 3: Better Order Execution
+
+**Option A: Truly atomic execution**
+- Use limit orders on both sides simultaneously
+- Cancel both if either doesn't fill within timeout
+- Requires careful price selection to ensure fills
+
+**Option B: Conservative sizing**
+- Size orders to only consume 20% of displayed liquidity
+- Higher probability of fills but smaller positions
+
+**Option C: External execution service**
+- Use a DEX aggregator or professional execution API
+- Higher reliability but adds dependency
+
+### Phase 4: Monitoring & Alerting
+
+1. **Real-time hedge ratio dashboard** - Show current hedge % per market
+2. **Alert on imbalance** - Notify if any position drops below 70% hedge
+3. **Daily P&L tracking** - Track actual vs expected profit
+4. **Fill rate metrics** - Track what % of dual-leg orders succeed
+
+---
+
+## Recommended Next Steps
+
+1. **Keep bot in DRY RUN mode** while we implement fixes
+2. **Implement hedge ratio enforcement** - This is the critical fix
+3. **Disable near-resolution trading** until we verify it's not the source
+4. **Add comprehensive logging** to understand why legs fail
+5. **Test in DRY RUN** for 1-2 days to verify fixes work
+6. **Go live with smaller position sizes** ($5 max per trade initially)
+
+---
+
 ## Appendix: All Trades by Time
 
 | Time | Market | Action | Shares | Side | Cost | Result |
@@ -292,3 +400,30 @@ This happens when the bot doesn't recognize it already has a position in the mar
 | 2:45 PM | BTC | Buy | 10.63 | DOWN | $5.63 | - |
 | 2:45 PM | BTC | Buy | 2.42 | DOWN | $1.28 | - |
 | 2:45 PM | BTC | Buy | 7.69 | UP | $2.31 | Loss (imbalanced) |
+| 3:00 PM | BTC | Buy | 17.98 | DOWN | $7.19 | - |
+| 3:00 PM | BTC | Buy | 16.17 | UP | $8.57 | - |
+| 3:00 PM | BTC | Buy | 13.00 | UP | $6.89 | Pending (62% hedge) |
+| 3:00 PM | ETH | Buy | 5.29 | UP | $0.42 | Pending (unhedged) |
+
+---
+
+## Position Summary Table
+
+| Market | UP Shares | DOWN Shares | Hedge % | Issue |
+|--------|-----------|-------------|---------|-------|
+| BTC 9:30AM | 9.43 | 0.00 | 0% | ONE-SIDED |
+| SOL 9:45AM | 10.10 | 0.00 | 0% | ONE-SIDED |
+| BTC 10:00AM | 0.00 | 3.85 | 0% | ONE-SIDED |
+| SOL 10:00AM | 10.10 | 0.00 | 0% | ONE-SIDED |
+| BTC 10:15AM | 0.00 | 44.75 | 0% | ONE-SIDED (after unwind) |
+| ETH 10:15AM | 30.32 | 16.84 | 56% | IMBALANCED |
+| BTC 10:30AM | 2.88 | 10.10 | 29% | IMBALANCED |
+| SOL 11:00AM | 0.00 | 12.99 | 0% | ONE-SIDED |
+| BTC 11:00AM | 0.00 | 9.61 | 0% | ONE-SIDED |
+| SOL 2:15PM | 31.76 | 15.40 | 48% | IMBALANCED |
+| ETH 2:15PM | 16.22 | 0.00 | 0% | ONE-SIDED |
+| ETH 2:30PM | 23.29 | 21.46 | **92%** | ✅ GOOD |
+| BTC 2:30PM | 0.00 | 4.80 | 0% | ONE-SIDED |
+| BTC 2:45PM | 23.01 | 18.05 | **78%** | ✅ ACCEPTABLE |
+| BTC 3:00PM | 29.17 | 17.98 | 62% | IMBALANCED |
+| ETH 3:00PM | 5.29 | 0.00 | 0% | ONE-SIDED |

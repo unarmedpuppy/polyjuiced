@@ -78,7 +78,7 @@ class GabagoolConfig:
     ws_reconnect_delay_seconds: float = 1.0
 
     # Mode
-    dry_run: bool = False  # LIVE mode enabled
+    dry_run: bool = True  # DRY RUN mode - no real trades until hedge enforcement is implemented
 
     # Directional trading settings
     directional_enabled: bool = False  # Disabled by default - arb only
