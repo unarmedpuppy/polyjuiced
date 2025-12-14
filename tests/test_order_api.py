@@ -493,44 +493,44 @@ class TestDecimalPrecision:
     def test_decimal_calculation_produces_clean_values(self):
         """Test that our Decimal approach produces API-compliant values.
 
-        Polymarket API requirements:
-        - maker_amount (USD cost): max 2 decimal places
-        - taker_amount (shares): max 4 decimal places
+        Polymarket API requirements (especially for FOK orders):
+        - maker_amount (shares * price): max 2 decimal places
+        - taker_amount (shares): max 2 decimal places (py-clob-client limit)
         - price: 2 decimal places
+
+        CRITICAL: The product shares × price must have ≤2 decimals for FOK orders.
         """
         from decimal import Decimal, ROUND_DOWN
 
         # Test case: $10 at $0.97 price
-        amount_usd = Decimal("10.0")
         price = Decimal("0.97")
-
-        # Round USD amount to 2 decimals FIRST (maker_amount requirement)
-        amount_usd = amount_usd.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-
-        # Calculate limit price (add 2 cents, cap at 0.99)
         limit_price = min(price + Decimal("0.02"), Decimal("0.99"))
         limit_price = limit_price.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
-        # Calculate shares with 4 decimal precision (taker_amount requirement)
-        shares = (amount_usd / limit_price).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
+        # Round USD amount to 2 decimals
+        maker_amount_target = Decimal("10.00")
 
-        # Verify USD amount has max 2 decimal places (maker_amount)
-        assert amount_usd == Decimal("10.00")
-        assert str(amount_usd) == "10.00"
+        # Calculate shares (round to 2 decimals for py-clob-client)
+        shares = (maker_amount_target / limit_price).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+        # Adjust shares until product is clean
+        for _ in range(200):
+            actual_maker = shares * limit_price
+            actual_maker_rounded = actual_maker.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            if actual_maker == actual_maker_rounded:
+                break
+            shares = shares - Decimal("0.01")
 
         # Verify price has max 2 decimal places
         assert limit_price == Decimal("0.99")
 
-        # Verify shares has max 4 decimal places (taker_amount)
-        assert shares == Decimal("10.1010")
-        assert len(str(shares).split('.')[-1]) <= 4
+        # Verify shares has max 2 decimal places
+        assert len(str(shares).split('.')[-1]) <= 2
 
-        # Convert to float and verify no floating point issues
-        price_float = float(limit_price)
-        shares_float = float(shares)
-
-        assert f"{price_float:.2f}" == "0.99"
-        assert f"{shares_float:.4f}" == "10.1010"
+        # CRITICAL: Verify maker_amount (shares × price) has max 2 decimal places
+        maker_amount = shares * limit_price
+        maker_rounded = maker_amount.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        assert maker_amount == maker_rounded, f"maker_amount {maker_amount} has more than 2 decimals"
 
     def test_decimal_precision_edge_cases(self):
         """Test edge cases for decimal precision that previously caused API errors.

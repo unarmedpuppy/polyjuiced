@@ -232,27 +232,36 @@ class PolymarketClient:
 
         from decimal import Decimal, ROUND_DOWN
 
-        # Polymarket requires:
+        # Polymarket requires (especially for FOK orders):
         # - maker_amount (USD): 2 decimal places max
-        # - taker_amount (shares): 4 decimal places max
+        # - taker_amount (shares): 2 decimal places (py-clob-client limit)
         # - price: 2 decimal places
 
-        # Round USD amount to 2 decimals FIRST (maker_amount requirement)
-        amount_d = Decimal(str(amount_usd)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
         price_d = Decimal(str(price))
 
         # Use aggressive limit price to ensure fill (max 2 decimals)
         if side.upper() == "BUY":
-            # Buy at slightly above market to ensure fill
             limit_price_d = min(price_d + Decimal("0.02"), Decimal("0.99"))
         else:
-            # Sell at slightly below market to ensure fill
             limit_price_d = max(price_d - Decimal("0.02"), Decimal("0.01"))
-
         limit_price_d = limit_price_d.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
-        # Calculate shares from amount with proper precision (4 decimals for taker_amount)
-        shares_d = (amount_d / limit_price_d).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
+        # Round USD amount to 2 decimals - this IS our target maker_amount
+        maker_amount_d = Decimal(str(amount_usd)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+        # Calculate shares from clean maker_amount (round to 2 decimals for py-clob-client)
+        shares_d = (maker_amount_d / limit_price_d).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+        # Ensure shares × price produces a clean maker_amount (≤2 decimals)
+        for _ in range(200):
+            actual_maker = shares_d * limit_price_d
+            actual_maker_rounded = actual_maker.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            if actual_maker == actual_maker_rounded:
+                break
+            shares_d = shares_d - Decimal("0.01")
+            if shares_d <= 0:
+                shares_d = Decimal("0.01")
+                break
 
         limit_price = float(limit_price_d)
         shares = float(shares_d)
@@ -657,11 +666,9 @@ class PolymarketClient:
 
             # Polymarket requires:
             # - maker_amount (USD): 2 decimal places max
-            # - taker_amount (shares): 4 decimal places max
+            # - taker_amount (shares): 2 decimal places (py-clob-client limit)
             # - price: 2 decimal places
 
-            # Round USD amount to 2 decimals FIRST (maker_amount requirement)
-            amount_d = Decimal(str(amount_usd)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
             price_d = Decimal(str(price))
 
             # DEPRECATED: This 3¢ slippage destroys arbitrage profit!
@@ -670,8 +677,22 @@ class PolymarketClient:
             limit_price_d = min(price_d + Decimal("0.03"), Decimal("0.99"))
             limit_price_d = limit_price_d.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
-            # Calculate shares with proper precision (4 decimals for taker_amount)
-            shares_d = (amount_d / limit_price_d).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
+            # Round USD amount to 2 decimals - this IS our target maker_amount
+            maker_amount_d = Decimal(str(amount_usd)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+            # Calculate shares (round to 2 decimals for py-clob-client)
+            shares_d = (maker_amount_d / limit_price_d).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+            # Ensure shares × price produces a clean maker_amount (≤2 decimals)
+            for _ in range(200):
+                actual_maker = shares_d * limit_price_d
+                actual_maker_rounded = actual_maker.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+                if actual_maker == actual_maker_rounded:
+                    break
+                shares_d = shares_d - Decimal("0.01")
+                if shares_d <= 0:
+                    shares_d = Decimal("0.01")
+                    break
 
             limit_price = float(limit_price_d)
             shares = float(shares_d)
@@ -1078,31 +1099,49 @@ class PolymarketClient:
 
             start_time_ms = int(time.time() * 1000)
 
-            # Polymarket requires:
-            # - maker_amount (USD): 2 decimal places max
-            # - taker_amount (shares): 4 decimal places max
+            # Polymarket API requirements for market BUY orders (especially FOK):
+            # - maker_amount (USD you pay): max 2 decimal places
+            # - taker_amount (shares you receive): max 2 decimal places (py-clob-client limit)
             # - price: 2 decimal places
+            #
+            # CRITICAL: FOK orders require maker_amount (shares × price) to have ≤2 decimals.
+            # Since shares × price rarely produces clean results (e.g., 25.48 × 0.35 = 8.918),
+            # we work BACKWARDS: round maker_amount first, then calculate shares.
 
-            # Round USD amount to 2 decimals FIRST (maker_amount requirement)
-            amount_d = Decimal(str(amount_usd)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-
-            # Use the limit price EXACTLY as provided - NO slippage, NO re-fetching
-            # Ensure price has 2 decimal places (Polymarket requirement)
+            # Ensure price has 2 decimal places
             price_d = Decimal(str(limit_price)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
-            # Calculate shares from rounded amount and price
-            # Round to 4 decimals (taker_amount max precision)
-            shares_d = (amount_d / price_d).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
+            # Round USD amount to 2 decimals - this IS our maker_amount (guaranteed clean)
+            maker_amount_d = Decimal(str(amount_usd)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+            # Calculate shares from clean maker_amount
+            # Round to 2 decimals (py-clob-client limit) with ROUND_DOWN
+            shares_d = (maker_amount_d / price_d).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+            # Recalculate actual maker_amount from rounded shares (this is what API sees)
+            actual_maker = shares_d * price_d
+
+            # If the actual maker has more than 2 decimals, reduce shares until clean
+            # Worst case is ~100 iterations for pathological prices like 0.97
+            for _ in range(200):
+                actual_maker = shares_d * price_d
+                actual_maker_rounded = actual_maker.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+                if actual_maker == actual_maker_rounded:
+                    break  # Clean!
+                shares_d = shares_d - Decimal("0.01")
+                if shares_d <= 0:
+                    shares_d = Decimal("0.01")  # Minimum viable shares
+                    break
 
             final_price = float(price_d)
             shares = float(shares_d)
-            final_amount = float(amount_d)
+            final_maker_amount = float(actual_maker)
 
             log.info(
                 f"Placing {label} order at EXACT limit (no slippage)",
                 limit_price=f"${final_price:.2f}",
-                shares=f"{shares:.4f}",
-                amount_usd=f"${final_amount:.2f}",
+                shares=f"{shares:.2f}",
+                maker_amount=f"${final_maker_amount:.2f}",
             )
 
             order_args = OrderArgs(
@@ -1194,12 +1233,12 @@ class PolymarketClient:
                     "pre_fill_no_depth": pre_fill_no_depth,
                 }
 
-            # Case 2: One or both didn't fill (FOK rejection or went LIVE)
+            # Case 2: One or both didn't fill (went LIVE instead of MATCHED)
             # Phase 4 Fix (2025-12-14): Proper handling of partial fills
             #
-            # With FOK orders:
+            # With GTC orders (we use GTC instead of FOK due to py-clob-client bugs):
             # - MATCHED = filled completely
-            # - Any other status = did not fill (FOK guarantees no partial book orders)
+            # - LIVE = order sitting on book, not filled yet
             #
             # CRITICAL: We do NOT attempt to "unwind" MATCHED positions because:
             # 1. Selling creates a NEW trade, not an unwind
@@ -1207,8 +1246,7 @@ class PolymarketClient:
             # 3. The strategy records partial fills properly (Phase 2)
             # 4. Better to hold the position than take guaranteed loss
             #
-            # Instead: Cancel any LIVE orders (shouldn't happen with FOK, but defensive)
-            # and return accurate fill data for strategy to record.
+            # Action: Cancel any LIVE orders and return accurate fill data for strategy.
 
             # Determine what actually filled
             yes_size_matched = float(yes_result.get("size_matched", 0) or yes_result.get("matched_size", 0) or 0)
@@ -1231,7 +1269,7 @@ class PolymarketClient:
                 partial_fill=partial_fill,
             )
 
-            # Cancel any LIVE orders (shouldn't happen with FOK, but defensive)
+            # Cancel any LIVE orders (GTC orders may sit on book if not filled)
             # Note: We do NOT cancel MATCHED orders - those are complete fills
             if yes_status == "LIVE" and yes_order_id:
                 try:
