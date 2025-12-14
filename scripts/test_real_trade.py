@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Test script to execute a real $1 trade on an active 15-minute market.
 
+⚠️ DISABLED: This script places REAL orders with real money.
+Disabled 2025-12-14 after untracked trade incident.
+To re-enable, remove the sys.exit() below.
+
 This script:
 1. Finds an active 15-minute BTC or ETH market
 2. Buys $1 worth of the UP (YES) side
@@ -11,6 +15,18 @@ Run with: python3 scripts/test_real_trade.py
 
 import os
 import sys
+
+# =============================================================
+# DISABLED: This script places REAL orders
+# Remove this block to re-enable
+print("=" * 60)
+print("⚠️  DISABLED: test_real_trade.py places REAL orders")
+print("This script has been disabled for safety.")
+print("If you need to test order execution, edit this file")
+print("and remove the sys.exit() call below.")
+print("=" * 60)
+sys.exit(1)
+# =============================================================
 
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))

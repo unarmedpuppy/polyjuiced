@@ -1,8 +1,26 @@
 #!/usr/bin/env python3
-"""Test script to validate order execution on Polymarket."""
+"""Test script to validate order execution on Polymarket.
+
+⚠️ DISABLED: This script places REAL orders with real money.
+Disabled 2025-12-14 after untracked trade incident.
+To re-enable, remove the sys.exit() below.
+"""
 
 import asyncio
 import sys
+
+# =============================================================
+# DISABLED: This script places REAL orders
+# Remove this block to re-enable
+print("=" * 60)
+print("⚠️  DISABLED: test_order.py places REAL orders")
+print("This script has been disabled for safety.")
+print("If you need to test order execution, edit this file")
+print("and remove the sys.exit() call below.")
+print("=" * 60)
+sys.exit(1)
+# =============================================================
+
 sys.path.insert(0, '/app')
 
 from src.config import load_config

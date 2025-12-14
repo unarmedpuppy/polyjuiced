@@ -446,14 +446,24 @@ class GabagoolStrategy(BaseStrategy):
                     )
                     await self.on_opportunity(opportunity)
 
-                # Check directional strategy (runs alongside arbitrage)
-                if self.gabagool_config.directional_enabled:
-                    await self._check_directional_opportunities()
-                    await self._manage_directional_positions()
-
-                # Check near-resolution opportunities (high-confidence bets in final minute)
-                if self.gabagool_config.near_resolution_enabled:
-                    await self._check_near_resolution_opportunities()
+                # =============================================================
+                # DISABLED: Directional and Near-Resolution strategies
+                # These create ONE-SIDED positions (not arbitrage) which can cause
+                # unbalanced trades and exceed position limits.
+                # Commented out 2025-12-14 after untracked trade incident.
+                # See: POST_MORTEM_2025-12-13.md
+                # =============================================================
+                #
+                # # Check directional strategy (runs alongside arbitrage)
+                # if self.gabagool_config.directional_enabled:
+                #     await self._check_directional_opportunities()
+                #     await self._manage_directional_positions()
+                #
+                # # Check near-resolution opportunities (high-confidence bets in final minute)
+                # if self.gabagool_config.near_resolution_enabled:
+                #     await self._check_near_resolution_opportunities()
+                #
+                # =============================================================
 
                 # Check for positions to settle (every 60 seconds)
                 if now - self._last_settlement_check >= self._settlement_check_interval:
