@@ -115,7 +115,7 @@ class GabagoolConfig:
             max_slippage_cents=float(os.getenv("GABAGOOL_MAX_SLIPPAGE", "2.0")),
             order_timeout_seconds=float(os.getenv("GABAGOOL_ORDER_TIMEOUT", "10.0")),
             ws_reconnect_delay_seconds=float(os.getenv("GABAGOOL_WS_RECONNECT_DELAY", "1.0")),
-            dry_run=os.getenv("GABAGOOL_DRY_RUN", "false").lower() == "true",
+            dry_run=os.getenv("GABAGOOL_DRY_RUN", "true").lower() == "true",  # Default TRUE until hedge enforcement complete
             # Directional trading
             directional_enabled=os.getenv("GABAGOOL_DIRECTIONAL_ENABLED", "false").lower() == "true",
             directional_entry_threshold=float(os.getenv("GABAGOOL_DIRECTIONAL_ENTRY_THRESHOLD", "0.25")),
@@ -126,7 +126,7 @@ class GabagoolConfig:
             directional_trailing_activation=float(os.getenv("GABAGOOL_DIRECTIONAL_TRAILING_ACTIVATION", "0.05")),
             directional_trailing_distance=float(os.getenv("GABAGOOL_DIRECTIONAL_TRAILING_DISTANCE", "0.10")),
             # Near-resolution trading
-            near_resolution_enabled=os.getenv("GABAGOOL_NEAR_RESOLUTION_ENABLED", "true").lower() == "true",
+            near_resolution_enabled=os.getenv("GABAGOOL_NEAR_RESOLUTION_ENABLED", "false").lower() == "true",  # Disabled - creates unhedged positions
             near_resolution_time_threshold=float(os.getenv("GABAGOOL_NEAR_RESOLUTION_TIME", "60.0")),
             near_resolution_min_price=float(os.getenv("GABAGOOL_NEAR_RESOLUTION_MIN_PRICE", "0.94")),
             near_resolution_max_price=float(os.getenv("GABAGOOL_NEAR_RESOLUTION_MAX_PRICE", "0.975")),
