@@ -9,6 +9,8 @@ from typing import Deque, Dict, Any, List, Optional, TYPE_CHECKING
 import structlog
 from aiohttp import web
 
+from .events import trade_events, EventTypes
+
 log = structlog.get_logger()
 
 if TYPE_CHECKING:
@@ -1360,6 +1362,98 @@ dashboard: DashboardServer = None
 _trade_id_counter = 0
 
 
+async def _on_trade_event(event_type: str, data: Dict[str, Any]) -> None:
+    """Handle trade events from strategy.
+
+    Phase 6: Dashboard subscribes to events instead of being called directly.
+    This keeps dashboard as a pure display layer.
+
+    Args:
+        event_type: Type of event (trade_created, trade_resolved, etc.)
+        data: Event data payload
+    """
+    if event_type == EventTypes.TRADE_CREATED:
+        # Update in-memory state for display
+        trade = {
+            "id": data.get("trade_id"),
+            "time": datetime.utcnow().strftime("%H:%M:%S"),
+            "market_time": data.get("market_end_time"),
+            "asset": data.get("asset"),
+            "yes_price": data.get("yes_price"),
+            "no_price": data.get("no_price"),
+            "yes_cost": data.get("yes_cost"),
+            "no_cost": data.get("no_cost"),
+            "spread": data.get("spread"),
+            "expected_profit": data.get("expected_profit"),
+            "actual_profit": None,
+            "status": "pending",
+            "dry_run": data.get("dry_run", False),
+            # Phase 2 fields
+            "hedge_ratio": data.get("hedge_ratio"),
+            "execution_status": data.get("execution_status"),
+        }
+        trade_history.append(trade)
+
+        # Update stats
+        stats["daily_trades"] = stats.get("daily_trades", 0) + 1
+        stats["pending"] = stats.get("pending", 0) + 1
+        stats["daily_exposure"] = stats.get("daily_exposure", 0.0) + data.get("yes_cost", 0) + data.get("no_cost", 0)
+        stats["last_trade"] = datetime.utcnow().isoformat()
+
+        # Broadcast to SSE clients
+        if dashboard:
+            await dashboard.broadcast({
+                "trades": [trade],
+                "stats": stats,
+            })
+
+        log.debug(
+            "Dashboard received trade event",
+            trade_id=data.get("trade_id"),
+            asset=data.get("asset"),
+        )
+
+    elif event_type == EventTypes.TRADE_RESOLVED:
+        # Update trade status
+        trade_id = data.get("trade_id")
+        won = data.get("won", False)
+        actual_profit = data.get("actual_profit", 0.0)
+
+        for trade in trade_history:
+            if trade["id"] == trade_id:
+                trade["status"] = "win" if won else "loss"
+                trade["actual_profit"] = actual_profit
+                break
+
+        # Update stats
+        if won:
+            stats["wins"] = stats.get("wins", 0) + 1
+        else:
+            stats["losses"] = stats.get("losses", 0) + 1
+        stats["pending"] = max(0, stats.get("pending", 0) - 1)
+        stats["daily_pnl"] = stats.get("daily_pnl", 0.0) + actual_profit
+
+        # Broadcast to SSE clients
+        if dashboard:
+            await dashboard.broadcast({
+                "trade_update": {
+                    "trade_id": trade_id,
+                    "status": "win" if won else "loss",
+                    "actual_profit": actual_profit,
+                },
+                "stats": stats,
+            })
+
+    elif event_type == EventTypes.STATS_UPDATED:
+        # Direct stats update
+        for key, value in data.items():
+            if key in stats:
+                stats[key] = value
+
+        if dashboard:
+            await dashboard.broadcast({"stats": stats})
+
+
 async def init_persistence(db: "Database") -> None:
     """Initialize persistence and load historical data.
 
@@ -1436,6 +1530,10 @@ async def init_persistence(db: "Database") -> None:
         import structlog
         log = structlog.get_logger()
         log.warning("Failed to load historical data", error=str(e))
+
+    # Phase 6: Subscribe to trade events from strategy
+    trade_events.subscribe(_on_trade_event)
+    log.info("Dashboard subscribed to trade events")
 
 
 def add_log(level: str, message: str, persist: bool = True, **extra) -> None:
@@ -1537,7 +1635,12 @@ def add_trade(
     condition_id: str = None,
     dry_run: bool = False,
 ) -> str:
-    """Add a new trade to history.
+    """Add a new trade to dashboard display.
+
+    NOTE: Phase 2 Architecture Change (2025-12-14)
+    This function now ONLY manages in-memory display state.
+    Database persistence is handled by strategy via _record_trade().
+    Dashboard is READ-ONLY for trade data.
 
     Args:
         asset: Asset symbol (BTC, ETH)
@@ -1549,7 +1652,7 @@ def add_trade(
         expected_profit: Expected profit
         market_end_time: Market resolution time
         market_slug: Market slug for reference
-        condition_id: Market condition ID
+        condition_id: Market condition ID (unused - kept for backward compat)
         dry_run: Whether this is a dry run trade
 
     Returns:
@@ -1587,29 +1690,12 @@ def add_trade(
             "stats": stats,
         }))
 
-    # Persist to database
-    if _db:
-        asyncio.create_task(_db.save_trade(
-            trade_id=trade_id,
-            asset=asset,
-            yes_price=yes_price,
-            no_price=no_price,
-            yes_cost=yes_cost,
-            no_cost=no_cost,
-            spread=spread,
-            expected_profit=expected_profit,
-            market_end_time=market_end_time,
-            market_slug=market_slug,
-            condition_id=condition_id,
-            dry_run=dry_run,
-        ))
-        # Update daily stats
-        asyncio.create_task(_db.update_daily_stats(
-            trades_delta=1,
-            exposure_delta=yes_cost + no_cost,
-        ))
+    # NOTE: Database persistence is now handled by strategy via _record_trade()
+    # Dashboard is READ-ONLY - do NOT save to DB here
+    # The _db.save_trade() and _db.update_daily_stats() calls have been removed
+    # as part of Phase 2 architecture (strategy owns persistence)
 
-    # Log the trade
+    # Log the trade (still done here for immediate display)
     add_log(
         "trade",
         f"Trade opened: {asset} spread={spread:.1f}¢ exp_profit=${expected_profit:.2f}",
@@ -1621,7 +1707,12 @@ def add_trade(
 
 
 def resolve_trade(trade_id: str, won: bool, actual_profit: float) -> None:
-    """Update a trade with its resolution result.
+    """Update a trade's display state with resolution result.
+
+    NOTE: Phase 2 Architecture Change (2025-12-14)
+    This function now ONLY manages in-memory display state.
+    Database persistence should be handled by strategy.
+    Dashboard is READ-ONLY for trade data.
 
     Args:
         trade_id: The trade ID returned from add_trade
@@ -1634,7 +1725,7 @@ def resolve_trade(trade_id: str, won: bool, actual_profit: float) -> None:
             trade["actual_profit"] = actual_profit
             break
 
-    # Update win/loss/pending counts
+    # Update win/loss/pending counts (in-memory display state only)
     if won:
         stats["wins"] = stats.get("wins", 0) + 1
     else:
@@ -1660,15 +1751,10 @@ def resolve_trade(trade_id: str, won: bool, actual_profit: float) -> None:
             "stats": stats,
         }))
 
-    # Persist to database
-    if _db:
-        asyncio.create_task(_db.resolve_trade(trade_id, won, actual_profit))
-        # Update daily stats
-        asyncio.create_task(_db.update_daily_stats(
-            pnl_delta=actual_profit,
-            wins_delta=1 if won else 0,
-            losses_delta=0 if won else 1,
-        ))
+    # Phase 6 (2025-12-14): Dashboard is READ-ONLY
+    # Database persistence is handled by strategy via events.
+    # The backward-compat _db.resolve_trade() call has been removed.
+    # Strategy should emit EventTypes.TRADE_RESOLVED for resolution updates.
 
     # Log resolution
     status_str = "WIN" if won else "LOSS"

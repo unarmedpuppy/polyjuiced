@@ -457,11 +457,16 @@ class PolymarketClient:
         no_token_id: str,
         yes_amount_usd: float,
         no_amount_usd: float,
+        yes_price: float = 0.0,  # EXACT limit price (0 = fetch from book - DEPRECATED)
+        no_price: float = 0.0,   # EXACT limit price (0 = fetch from book - DEPRECATED)
         timeout_seconds: float = 2.0,
         condition_id: str = "",
         asset: str = "",
     ) -> Dict[str, Any]:
         """Execute YES and NO orders for arbitrage with fill-or-kill semantics.
+
+        DEPRECATED: Use execute_dual_leg_order_parallel() instead.
+        This sequential method is kept for backwards compatibility.
 
         CRITICAL: For arbitrage, we MUST get both legs filled or neither.
         A partial fill (one side only) creates an unhedged directional position
@@ -471,7 +476,8 @@ class PolymarketClient:
         1. Pre-flight check: verify liquidity on both sides
         2. Place YES order first (GTC with aggressive price)
         3. If YES fills, immediately place NO order
-        4. If NO fails after YES succeeded, immediately unwind YES position
+        4. If NO fails after YES succeeded: Cancel LIVE NO orders, return partial fill data
+           (Phase 4: NO unwind attempts - positions held until resolution)
         5. If YES fails, don't place NO at all
 
         Args:
@@ -479,6 +485,8 @@ class PolymarketClient:
             no_token_id: NO token ID
             yes_amount_usd: Amount to spend on YES
             no_amount_usd: Amount to spend on NO
+            yes_price: EXACT limit price for YES (0 = fetch from book - DEPRECATED)
+            no_price: EXACT limit price for NO (0 = fetch from book - DEPRECATED)
             timeout_seconds: Timeout for order placement
             condition_id: Market condition ID (for fill logging)
             asset: Asset symbol (for fill logging)
@@ -486,8 +494,8 @@ class PolymarketClient:
         Returns:
             Dict with 'yes_order', 'no_order', 'success', 'partial_fill' keys
         """
-        log.info(
-            "Executing dual-leg arbitrage order",
+        log.warning(
+            "Using DEPRECATED sequential execution - switch to parallel execution",
             yes_amount=yes_amount_usd,
             no_amount=no_amount_usd,
         )
@@ -522,6 +530,9 @@ class PolymarketClient:
                     "success": False,
                     "partial_fill": False,
                     "error": "Insufficient liquidity - no asks available",
+                    # Phase 5: Liquidity data (empty book)
+                    "pre_fill_yes_depth": 0.0,
+                    "pre_fill_no_depth": 0.0,
                 }
 
             # Estimate available liquidity at top of book
@@ -552,6 +563,9 @@ class PolymarketClient:
                     "success": False,
                     "partial_fill": False,
                     "error": f"Insufficient YES liquidity: {yes_liquidity:.1f} persistent (from {yes_displayed:.1f} displayed) < {yes_shares_needed:.1f} needed",
+                    # Phase 5: Liquidity data (rejected due to insufficient depth)
+                    "pre_fill_yes_depth": yes_displayed,
+                    "pre_fill_no_depth": no_displayed,
                 }
 
             if no_liquidity < no_shares_needed * min_liquidity_ratio:
@@ -567,6 +581,9 @@ class PolymarketClient:
                     "success": False,
                     "partial_fill": False,
                     "error": f"Insufficient NO liquidity: {no_liquidity:.1f} persistent (from {no_displayed:.1f} displayed) < {no_shares_needed:.1f} needed",
+                    # Phase 5: Liquidity data (rejected due to insufficient depth)
+                    "pre_fill_yes_depth": yes_displayed,
+                    "pre_fill_no_depth": no_displayed,
                 }
 
             # Check 2: Self-induced spread collapse
@@ -584,6 +601,9 @@ class PolymarketClient:
                     "success": False,
                     "partial_fill": False,
                     "error": f"Order too large relative to book (would consume {max(yes_shares_needed/yes_displayed, no_shares_needed/no_displayed)*100:.0f}% of depth)",
+                    # Phase 5: Liquidity data (rejected due to consumption limit)
+                    "pre_fill_yes_depth": yes_displayed,
+                    "pre_fill_no_depth": no_displayed,
                 }
 
             log.info(
@@ -605,6 +625,12 @@ class PolymarketClient:
 
         def place_fok_order(token_id: str, amount_usd: float, label: str) -> Dict[str, Any]:
             """Place a Fill-or-Kill order.
+
+            DEPRECATED: This function is part of the deprecated sequential execution.
+            Use execute_dual_leg_order_parallel() instead which uses exact pricing.
+
+            WARNING: This function adds 3¢ slippage which destroys arbitrage profit!
+            It should NOT be used for arbitrage. Only kept for backwards compatibility.
 
             Note: FOK orders have decimal precision bugs in py-clob-client.
             We use GTC instead which works. For arbitrage, we accept the risk
@@ -628,7 +654,9 @@ class PolymarketClient:
             price_d = Decimal(str(price))
             amount_d = Decimal(str(amount_usd))
 
-            # Aggressive price to ensure fill (max 2 decimals)
+            # DEPRECATED: This 3¢ slippage destroys arbitrage profit!
+            # This is kept for backwards compatibility only.
+            # Use execute_dual_leg_order_parallel() which uses exact pricing.
             limit_price_d = min(price_d + Decimal("0.03"), Decimal("0.99"))
             limit_price_d = limit_price_d.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
@@ -703,6 +731,9 @@ class PolymarketClient:
                     "success": False,
                     "partial_fill": False,
                     "error": f"YES order went LIVE instead of filling - insufficient liquidity at price",
+                    # Phase 5: Liquidity data captured before execution
+                    "pre_fill_yes_depth": pre_fill_yes_depth,
+                    "pre_fill_no_depth": pre_fill_no_depth,
                 }
 
             if not yes_filled:
@@ -717,6 +748,9 @@ class PolymarketClient:
                     "success": False,
                     "partial_fill": False,
                     "error": f"YES order rejected: {yes_status}",
+                    # Phase 5: Liquidity data captured before execution
+                    "pre_fill_yes_depth": pre_fill_yes_depth,
+                    "pre_fill_no_depth": pre_fill_no_depth,
                 }
 
             log.info("YES order filled", status=yes_status, size_matched=yes_size_matched)
@@ -736,85 +770,43 @@ class PolymarketClient:
             # If NO order went LIVE or didn't fill, we have a partial fill situation
             if no_status == "LIVE" or not no_filled:
                 # CRITICAL: YES filled but NO didn't - we have a partial fill!
-                # Must immediately unwind the YES position to avoid directional exposure
+                #
+                # Phase 4 Fix (2025-12-14): DO NOT attempt to "unwind"
+                # Unwinding by selling creates a NEW trade and guarantees loss.
+                # Strategy will record the partial fill (Phase 2) and hold position.
                 log.error(
-                    "PARTIAL FILL: YES filled but NO did not! Attempting to unwind...",
+                    "PARTIAL FILL: YES filled but NO did not",
                     yes_status=yes_status,
                     no_status=no_status,
                     no_result=no_result,
+                    note="Strategy will record partial fill. Position held until resolution.",
                 )
 
-                # Cancel any pending NO order first
+                # Cancel any LIVE NO order (shouldn't happen with FOK, but defensive)
                 no_order_id = no_result.get("id") or no_result.get("order_id")
-                if no_order_id:
+                if no_status == "LIVE" and no_order_id:
                     try:
                         self._client.cancel(no_order_id)
-                        log.info("Cancelled pending NO order", order_id=no_order_id[:20] + "...")
+                        log.info("Cancelled LIVE NO order", order_id=no_order_id[:20] + "...")
                     except Exception as cancel_err:
-                        log.warning("Failed to cancel NO order", error=str(cancel_err))
+                        log.warning("Failed to cancel LIVE NO order", error=str(cancel_err))
 
-                # Try to sell back the YES position we just bought
-                # Get the shares we bought from the YES order
-                yes_size = yes_result.get("size") or yes_result.get("original_size")
-                unwind_result = None
-
-                if yes_size:
-                    try:
-                        yes_size_float = float(yes_size)
-                        log.info(
-                            "Unwinding YES position",
-                            shares=yes_size_float,
-                            token_id=yes_token_id[:20] + "...",
-                        )
-
-                        # Sell at market (slightly below current price to ensure fill)
-                        try:
-                            current_price = self.get_price(yes_token_id, "sell")
-                        except Exception:
-                            current_price = 0.45  # Fallback
-
-                        from decimal import Decimal, ROUND_DOWN
-                        sell_price_d = Decimal(str(current_price)) - Decimal("0.02")
-                        sell_price_d = max(sell_price_d, Decimal("0.01"))
-                        sell_price_d = sell_price_d.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-                        sell_price = float(sell_price_d)
-
-                        sell_args = OrderArgs(
-                            token_id=yes_token_id,
-                            price=sell_price,
-                            size=yes_size_float,
-                            side="SELL",
-                        )
-                        signed_sell = self._client.create_order(sell_args)
-                        unwind_result = self._client.post_order(signed_sell, orderType=OrderType.GTC)
-
-                        unwind_status = unwind_result.get("status", "").upper()
-                        if unwind_status in ("MATCHED", "FILLED", "LIVE"):
-                            log.info(
-                                "Successfully unwound YES position",
-                                status=unwind_status,
-                            )
-                        else:
-                            log.error(
-                                "Failed to unwind YES position - MANUAL INTERVENTION NEEDED",
-                                status=unwind_status,
-                                result=unwind_result,
-                            )
-
-                    except Exception as unwind_err:
-                        log.error(
-                            "Error unwinding YES position - MANUAL INTERVENTION NEEDED",
-                            error=str(unwind_err),
-                        )
-
+                # Return partial fill data for strategy to record
+                # Note: We do NOT try to unwind - that creates more problems
+                yes_filled = yes_size_matched or float(yes_result.get("_intended_size", 0))
                 return {
                     "yes_order": yes_result,
                     "no_order": no_result,
-                    "unwind_order": unwind_result,
                     "success": False,
                     "partial_fill": True,
-                    "unwound": unwind_result is not None,
-                    "error": f"PARTIAL FILL: YES filled, NO rejected ({no_status}). Unwind attempted.",
+                    "yes_filled_size": yes_filled,
+                    "no_filled_size": 0.0,
+                    "yes_filled_cost": yes_filled * yes_price,
+                    "no_filled_cost": 0.0,
+                    "error": f"PARTIAL FILL: YES filled ({yes_status}), NO rejected ({no_status}). Position held.",
+                    # Phase 5: Liquidity data captured before execution
+                    "pre_fill_yes_depth": pre_fill_yes_depth,
+                    "pre_fill_no_depth": pre_fill_no_depth,
                 }
 
             # Both legs filled successfully!
@@ -861,6 +853,9 @@ class PolymarketClient:
                 "no_order": no_result,
                 "success": True,
                 "partial_fill": False,
+                # Phase 5: Liquidity data captured before execution
+                "pre_fill_yes_depth": pre_fill_yes_depth,
+                "pre_fill_no_depth": pre_fill_no_depth,
             }
 
         except asyncio.TimeoutError:
@@ -876,6 +871,9 @@ class PolymarketClient:
                 "success": False,
                 "partial_fill": False,
                 "error": "timeout",
+                # Phase 5: Liquidity data (may not be captured if exception occurred early)
+                "pre_fill_yes_depth": locals().get("pre_fill_yes_depth", 0.0),
+                "pre_fill_no_depth": locals().get("pre_fill_no_depth", 0.0),
             }
 
         except Exception as e:
@@ -891,6 +889,9 @@ class PolymarketClient:
                 "success": False,
                 "partial_fill": False,
                 "error": str(e),
+                # Phase 5: Liquidity data (may not be captured if exception occurred early)
+                "pre_fill_yes_depth": locals().get("pre_fill_yes_depth", 0.0),
+                "pre_fill_no_depth": locals().get("pre_fill_no_depth", 0.0),
             }
 
     async def execute_dual_leg_order_parallel(
@@ -899,6 +900,8 @@ class PolymarketClient:
         no_token_id: str,
         yes_amount_usd: float,
         no_amount_usd: float,
+        yes_price: float,  # EXACT limit price from opportunity detection
+        no_price: float,   # EXACT limit price from opportunity detection
         timeout_seconds: float = 5.0,
         max_liquidity_consumption_pct: float = 0.50,
         condition_id: str = "",
@@ -906,8 +909,9 @@ class PolymarketClient:
     ) -> Dict[str, Any]:
         """Execute YES and NO orders in PARALLEL for true atomic execution.
 
-        Phase 3 improvement: Instead of sequential (YES then NO), place both
-        orders simultaneously. If either fails to fill within timeout, cancel both.
+        IMPORTANT: Prices are EXACT limit prices. NO slippage is added.
+        If we can't fill at these prices, we don't take the trade.
+        The goal is precision execution, not guaranteed fills.
 
         This provides better atomicity because:
         1. Both orders hit the book at nearly the same time
@@ -919,6 +923,8 @@ class PolymarketClient:
             no_token_id: NO token ID
             yes_amount_usd: Amount to spend on YES
             no_amount_usd: Amount to spend on NO
+            yes_price: EXACT limit price for YES (from opportunity, no slippage)
+            no_price: EXACT limit price for NO (from opportunity, no slippage)
             timeout_seconds: Timeout for both orders to fill
             max_liquidity_consumption_pct: Max % of displayed liquidity to consume
             condition_id: Market condition ID (for logging)
@@ -927,14 +933,42 @@ class PolymarketClient:
         Returns:
             Dict with 'yes_order', 'no_order', 'success', 'partial_fill' keys
         """
+        # Validate arbitrage still makes sense BEFORE any execution
+        total_cost = yes_price + no_price
+        expected_profit_per_share = 1.0 - total_cost
+
+        if total_cost >= 1.0:
+            log.warning(
+                "Arbitrage INVALID - total cost >= $1.00, rejecting trade",
+                yes_price=f"${yes_price:.2f}",
+                no_price=f"${no_price:.2f}",
+                total_cost=f"${total_cost:.2f}",
+            )
+            return {
+                "yes_order": None,
+                "no_order": None,
+                "success": False,
+                "partial_fill": False,
+                "error": f"Arbitrage invalidated - prices sum to ${total_cost:.2f} >= $1.00",
+                # Phase 5: Liquidity data (not captured - early rejection)
+                "pre_fill_yes_depth": 0.0,
+                "pre_fill_no_depth": 0.0,
+            }
+
         log.info(
-            "Executing PARALLEL dual-leg arbitrage order",
+            "Executing PARALLEL dual-leg arbitrage with EXACT pricing (no slippage)",
             yes_amount=yes_amount_usd,
             no_amount=no_amount_usd,
+            yes_limit=f"${yes_price:.2f}",
+            no_limit=f"${no_price:.2f}",
+            total_cost=f"${total_cost:.2f}",
+            expected_profit_per_share=f"${expected_profit_per_share:.2f}",
             timeout=timeout_seconds,
         )
 
         # Pre-flight liquidity check with configurable consumption limit
+        # NOTE: We use the passed-in prices (yes_price, no_price) for share calculations,
+        # NOT prices fetched from order book here. The prices come from opportunity detection.
         try:
             yes_book = self.get_order_book(yes_token_id)
             no_book = self.get_order_book(no_token_id)
@@ -950,14 +984,16 @@ class PolymarketClient:
                     "success": False,
                     "partial_fill": False,
                     "error": "Insufficient liquidity - no asks available",
+                    # Phase 5: Liquidity data (empty book - no depth available)
+                    "pre_fill_yes_depth": 0.0,
+                    "pre_fill_no_depth": 0.0,
                 }
 
             # Calculate available liquidity (top 3 levels)
             yes_displayed = sum(float(ask.get("size", 0)) for ask in yes_asks[:3])
             no_displayed = sum(float(ask.get("size", 0)) for ask in no_asks[:3])
 
-            yes_price = float(yes_asks[0].get("price", 0.5))
-            no_price = float(no_asks[0].get("price", 0.5))
+            # Use the PASSED-IN prices for share calculations (from opportunity detection)
             yes_shares_needed = yes_amount_usd / yes_price if yes_price > 0 else 0
             no_shares_needed = no_amount_usd / no_price if no_price > 0 else 0
 
@@ -978,6 +1014,9 @@ class PolymarketClient:
                     "success": False,
                     "partial_fill": False,
                     "error": f"YES order would consume {yes_shares_needed/yes_displayed*100:.0f}% of liquidity (max {max_liquidity_consumption_pct*100:.0f}%)",
+                    # Phase 5: Liquidity data (rejected due to consumption limit)
+                    "pre_fill_yes_depth": yes_displayed,
+                    "pre_fill_no_depth": no_displayed,
                 }
 
             if no_shares_needed > max_no_shares:
@@ -993,6 +1032,9 @@ class PolymarketClient:
                     "success": False,
                     "partial_fill": False,
                     "error": f"NO order would consume {no_shares_needed/no_displayed*100:.0f}% of liquidity (max {max_liquidity_consumption_pct*100:.0f}%)",
+                    # Phase 5: Liquidity data (rejected due to consumption limit)
+                    "pre_fill_yes_depth": yes_displayed,
+                    "pre_fill_no_depth": no_displayed,
                 }
 
             log.info(
@@ -1008,51 +1050,52 @@ class PolymarketClient:
             log.warning("Liquidity check failed, proceeding anyway", error=str(e))
             pre_fill_yes_depth = 0.0
             pre_fill_no_depth = 0.0
-            yes_price = 0.5
-            no_price = 0.5
 
-        def place_order_sync(token_id: str, amount_usd: float, label: str, price_hint: float) -> Dict[str, Any]:
-            """Place a single order synchronously (for use in thread pool)."""
+        def place_order_sync(token_id: str, amount_usd: float, label: str, limit_price: float) -> Dict[str, Any]:
+            """Place a single order at EXACT limit price. No slippage, no re-fetching.
+
+            CRITICAL: The limit_price is used EXACTLY as provided.
+            - DO NOT add slippage - the arbitrage profit depends on exact prices
+            - DO NOT re-fetch price from API - we trust the opportunity detection
+            - If we can't fill at this price, we simply don't fill (that's OK)
+            """
             from decimal import Decimal, ROUND_DOWN
 
             start_time_ms = int(time.time() * 1000)
 
-            # Use provided price hint or fetch
-            try:
-                price = self.get_price(token_id, "buy")
-            except Exception:
-                price = price_hint
-
-            price_d = Decimal(str(price))
+            # Use the limit price EXACTLY as provided - NO slippage, NO re-fetching
+            price_d = Decimal(str(limit_price))
             amount_d = Decimal(str(amount_usd))
 
-            # Aggressive price to ensure fill (+3 cents, max 0.99)
-            limit_price_d = min(price_d + Decimal("0.03"), Decimal("0.99"))
-            limit_price_d = limit_price_d.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            # Ensure price has 2 decimal places (Polymarket requirement)
+            price_d = price_d.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
-            shares_d = (amount_d / limit_price_d).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            # Calculate shares from amount and price
+            shares_d = (amount_d / price_d).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
-            limit_price = float(limit_price_d)
+            final_price = float(price_d)
             shares = float(shares_d)
 
             log.info(
-                f"Placing {label} order (parallel)",
-                price=f"{limit_price:.2f}",
+                f"Placing {label} order at EXACT limit (no slippage)",
+                limit_price=f"${final_price:.2f}",
                 shares=f"{shares:.2f}",
+                amount_usd=f"${amount_usd:.2f}",
             )
 
             order_args = OrderArgs(
                 token_id=token_id,
-                price=limit_price,
+                price=final_price,
                 size=shares,
                 side="BUY",
             )
 
             signed_order = self._client.create_order(order_args)
-            result = self._client.post_order(signed_order, orderType=OrderType.GTC)
+            # Use FOK (Fill-or-Kill) for atomicity - either fill completely or not at all
+            result = self._client.post_order(signed_order, orderType=OrderType.FOK)
 
             result["_intended_size"] = shares
-            result["_intended_price"] = limit_price
+            result["_intended_price"] = final_price
             result["_start_time_ms"] = start_time_ms
             result["_label"] = label
 
@@ -1124,89 +1167,90 @@ class PolymarketClient:
                     "partial_fill": False,
                     "yes_filled_size": yes_size_matched or float(yes_result.get("_intended_size", 0)),
                     "no_filled_size": no_size_matched or float(no_result.get("_intended_size", 0)),
+                    # Phase 5: Liquidity data captured before execution
+                    "pre_fill_yes_depth": pre_fill_yes_depth,
+                    "pre_fill_no_depth": pre_fill_no_depth,
                 }
 
-            # Case 2: One or both went LIVE (on book, not filled)
-            # Cancel both orders to maintain atomicity
-            log.warning(
-                "One or both orders went LIVE - cancelling both for atomicity",
-                yes_status=yes_status,
-                no_status=no_status,
-            )
+            # Case 2: One or both didn't fill (FOK rejection or went LIVE)
+            # Phase 4 Fix (2025-12-14): Proper handling of partial fills
+            #
+            # With FOK orders:
+            # - MATCHED = filled completely
+            # - Any other status = did not fill (FOK guarantees no partial book orders)
+            #
+            # CRITICAL: We do NOT attempt to "unwind" MATCHED positions because:
+            # 1. Selling creates a NEW trade, not an unwind
+            # 2. Selling at market creates additional losses (slippage)
+            # 3. The strategy records partial fills properly (Phase 2)
+            # 4. Better to hold the position than take guaranteed loss
+            #
+            # Instead: Cancel any LIVE orders (shouldn't happen with FOK, but defensive)
+            # and return accurate fill data for strategy to record.
 
-            cancelled_yes = False
-            cancelled_no = False
+            # Determine what actually filled
+            yes_size_matched = float(yes_result.get("size_matched", 0) or yes_result.get("matched_size", 0) or 0)
+            no_size_matched = float(no_result.get("size_matched", 0) or no_result.get("matched_size", 0) or 0)
 
-            if yes_order_id:
-                try:
-                    self._client.cancel(yes_order_id)
-                    cancelled_yes = True
-                    log.info("Cancelled YES order", order_id=yes_order_id[:20] + "...")
-                except Exception as e:
-                    log.warning("Failed to cancel YES order", error=str(e))
+            # Calculate costs based on what actually filled
+            yes_filled_cost = yes_size_matched * yes_price if yes_filled else 0.0
+            no_filled_cost = no_size_matched * no_price if no_filled else 0.0
 
-            if no_order_id:
-                try:
-                    self._client.cancel(no_order_id)
-                    cancelled_no = True
-                    log.info("Cancelled NO order", order_id=no_order_id[:20] + "...")
-                except Exception as e:
-                    log.warning("Failed to cancel NO order", error=str(e))
-
-            # Determine if we have a partial fill situation
-            # (one filled before we could cancel)
             partial_fill = (yes_filled and not no_filled) or (no_filled and not yes_filled)
 
-            if partial_fill:
-                # We have a problem - one leg filled, other didn't
-                # Need to unwind the filled leg
-                if yes_filled and not cancelled_yes:
-                    log.error("PARTIAL FILL: YES filled but NO didn't - attempting unwind")
-                    # Try to sell back YES
-                    yes_size = yes_result.get("_intended_size") or yes_result.get("size")
-                    if yes_size:
-                        try:
-                            from decimal import Decimal, ROUND_DOWN
-                            sell_price = max(yes_price - 0.02, 0.01)
-                            sell_price_d = Decimal(str(sell_price)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-                            sell_args = OrderArgs(
-                                token_id=yes_token_id,
-                                price=float(sell_price_d),
-                                size=float(yes_size),
-                                side="SELL",
-                            )
-                            signed_sell = self._client.create_order(sell_args)
-                            self._client.post_order(signed_sell, orderType=OrderType.GTC)
-                            log.info("Unwound YES position")
-                        except Exception as e:
-                            log.error("Failed to unwind YES - MANUAL INTERVENTION NEEDED", error=str(e))
+            log.warning(
+                "Orders did not fill atomically",
+                yes_status=yes_status,
+                no_status=no_status,
+                yes_filled=yes_filled,
+                no_filled=no_filled,
+                yes_size_matched=yes_size_matched,
+                no_size_matched=no_size_matched,
+                partial_fill=partial_fill,
+            )
 
-                elif no_filled and not cancelled_no:
-                    log.error("PARTIAL FILL: NO filled but YES didn't - attempting unwind")
-                    no_size = no_result.get("_intended_size") or no_result.get("size")
-                    if no_size:
-                        try:
-                            from decimal import Decimal, ROUND_DOWN
-                            sell_price = max(no_price - 0.02, 0.01)
-                            sell_price_d = Decimal(str(sell_price)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-                            sell_args = OrderArgs(
-                                token_id=no_token_id,
-                                price=float(sell_price_d),
-                                size=float(no_size),
-                                side="SELL",
-                            )
-                            signed_sell = self._client.create_order(sell_args)
-                            self._client.post_order(signed_sell, orderType=OrderType.GTC)
-                            log.info("Unwound NO position")
-                        except Exception as e:
-                            log.error("Failed to unwind NO - MANUAL INTERVENTION NEEDED", error=str(e))
+            # Cancel any LIVE orders (shouldn't happen with FOK, but defensive)
+            # Note: We do NOT cancel MATCHED orders - those are complete fills
+            if yes_status == "LIVE" and yes_order_id:
+                try:
+                    self._client.cancel(yes_order_id)
+                    log.info("Cancelled LIVE YES order", order_id=yes_order_id[:20] + "...")
+                except Exception as e:
+                    log.warning("Failed to cancel LIVE YES order", error=str(e))
+
+            if no_status == "LIVE" and no_order_id:
+                try:
+                    self._client.cancel(no_order_id)
+                    log.info("Cancelled LIVE NO order", order_id=no_order_id[:20] + "...")
+                except Exception as e:
+                    log.warning("Failed to cancel LIVE NO order", error=str(e))
+
+            # Log partial fill for monitoring (but don't try to unwind!)
+            if partial_fill:
+                filled_leg = "YES" if yes_filled else "NO"
+                unfilled_leg = "NO" if yes_filled else "YES"
+                filled_shares = yes_size_matched if yes_filled else no_size_matched
+                log.error(
+                    f"PARTIAL FILL: {filled_leg} filled, {unfilled_leg} did not",
+                    filled_leg=filled_leg,
+                    filled_shares=filled_shares,
+                    unfilled_status=no_status if yes_filled else yes_status,
+                    note="Strategy will record partial fill. Position will be held until resolution.",
+                )
 
             return {
                 "yes_order": yes_result,
                 "no_order": no_result,
                 "success": False,
                 "partial_fill": partial_fill,
+                "yes_filled_size": yes_size_matched if yes_filled else 0.0,
+                "no_filled_size": no_size_matched if no_filled else 0.0,
+                "yes_filled_cost": yes_filled_cost,
+                "no_filled_cost": no_filled_cost,
                 "error": f"Orders did not fill atomically (YES:{yes_status}, NO:{no_status})",
+                # Phase 5: Liquidity data captured before execution
+                "pre_fill_yes_depth": pre_fill_yes_depth,
+                "pre_fill_no_depth": pre_fill_no_depth,
             }
 
         except Exception as e:
@@ -1221,6 +1265,9 @@ class PolymarketClient:
                 "success": False,
                 "partial_fill": False,
                 "error": str(e),
+                # Phase 5: Liquidity data (may not be captured if exception occurred early)
+                "pre_fill_yes_depth": locals().get("pre_fill_yes_depth", 0.0),
+                "pre_fill_no_depth": locals().get("pre_fill_no_depth", 0.0),
             }
 
     # =========================================================================
