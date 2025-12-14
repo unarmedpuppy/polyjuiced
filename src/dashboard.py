@@ -591,7 +591,7 @@ DASHBOARD_HTML = """
                 </span>
             </div>
             <div class="panel-body" style="padding: 0;">
-                <div id="markets-list" style="max-height: 425px; overflow-y: auto;">
+                <div id="markets-list" style="max-height: 430px; overflow-y: auto;">
                     <div style="padding: 20px; text-align: center; color: var(--dim-green);">
                         Searching for markets...
                     </div>
@@ -875,7 +875,7 @@ DASHBOARD_HTML = """
                     table.appendChild(row);
                     marketRowCache.set(id, row);
                 } else {
-                    // Update prices, spread, and ARB status
+                    // Update prices, spread, and ARB status - only if changed
                     const upCell = row.querySelector('.cell-upprice');
                     const downCell = row.querySelector('.cell-downprice');
                     const spreadCell = row.querySelector('.cell-spread');
@@ -885,21 +885,23 @@ DASHBOARD_HTML = """
                     const downText = m.down_price ? (m.down_price * 100).toFixed(1) + '¢' : 'N/A';
                     const spreadText = spread ? spread + '¢' : 'N/A';
                     const arbText = meetsArbCriteria ? '✓' : '—';
+                    const arbColor = meetsArbCriteria ? 'var(--green)' : 'var(--dim-green)';
+                    const arbWeight = meetsArbCriteria ? 'bold' : 'normal';
 
                     if (upCell && upCell.textContent !== upText) upCell.textContent = upText;
                     if (downCell && downCell.textContent !== downText) downCell.textContent = downText;
                     if (spreadCell) {
                         if (spreadCell.textContent !== spreadText) spreadCell.textContent = spreadText;
-                        spreadCell.style.color = spreadColor;
+                        if (spreadCell.style.color !== spreadColor) spreadCell.style.color = spreadColor;
                     }
                     if (arbCell) {
                         if (arbCell.textContent !== arbText) arbCell.textContent = arbText;
-                        arbCell.style.color = meetsArbCriteria ? 'var(--green)' : 'var(--dim-green)';
-                        arbCell.style.fontWeight = meetsArbCriteria ? 'bold' : 'normal';
+                        if (arbCell.style.color !== arbColor) arbCell.style.color = arbColor;
+                        if (arbCell.style.fontWeight !== arbWeight) arbCell.style.fontWeight = arbWeight;
                     }
                 }
 
-                // Update row background (stable - won't flicker)
+                // Update row background only if changed
                 const bgColor = isTradeable ? 'rgba(0, 255, 65, 0.05)' : 'rgba(255, 0, 64, 0.05)';
                 if (row.style.background !== bgColor) row.style.background = bgColor;
             }
@@ -923,28 +925,22 @@ DASHBOARD_HTML = """
                 const mins = Math.floor(secondsRemaining / 60);
                 const secs = Math.floor(secondsRemaining % 60);
                 const timeLeft = secondsRemaining > 0 ? `${mins}m ${secs}s` : 'ENDED';
+                const timeColor = secondsRemaining > 60 ? 'var(--green)' : 'var(--red)';
 
                 const timeCell = row.querySelector('.cell-timeleft');
-                const statusCell = row.querySelector('.cell-status');
 
                 if (timeCell) {
-                    timeCell.textContent = timeLeft;
-                    timeCell.style.color = secondsRemaining > 60 ? 'var(--green)' : 'var(--red)';
+                    if (timeCell.textContent !== timeLeft) timeCell.textContent = timeLeft;
+                    if (timeCell.style.color !== timeColor) timeCell.style.color = timeColor;
                 }
 
-                if (statusCell) {
-                    const statusText = isTradeable ? 'TRADEABLE' : 'EXPIRED';
-                    if (statusCell.textContent !== statusText) {
-                        statusCell.textContent = statusText;
-                        statusCell.style.color = isTradeable ? 'var(--green)' : 'var(--red)';
-                    }
-                }
-
-                // Update row background
-                row.style.background = isTradeable ? 'rgba(0, 255, 65, 0.05)' : 'rgba(255, 0, 64, 0.05)';
+                // Update row background only if changed
+                const bgColor = isTradeable ? 'rgba(0, 255, 65, 0.05)' : 'rgba(255, 0, 64, 0.05)';
+                if (row.style.background !== bgColor) row.style.background = bgColor;
             }
 
-            document.getElementById('tradeable-count').textContent = tradeableCount;
+            const countEl = document.getElementById('tradeable-count');
+            if (countEl.textContent !== String(tradeableCount)) countEl.textContent = tradeableCount;
         }
 
         // Update market timers every second (client-side countdown)
