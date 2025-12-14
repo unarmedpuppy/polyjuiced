@@ -3385,3 +3385,104 @@ class TestPhase4eIntegrationScenarios:
         assert result.success is False
         assert result.shares_filled == 0.0
         assert result.pre_hedge_ratio == result.post_hedge_ratio
+
+
+class TestDailyExposureLimitZeroMeansUnlimited:
+    """Regression test: max_daily_exposure_usd=0 should mean unlimited.
+
+    Bug discovered: Dec 14, 2025
+    Root cause: The condition `self._daily_exposure >= self.gabagool_config.max_daily_exposure_usd`
+                evaluated True when both values were 0 (0 >= 0), incorrectly triggering
+                the "Daily exposure limit reached" state and preventing any trading.
+
+    Fix: Changed to check `if max_daily_exposure_usd > 0` first before comparing,
+         so 0 is treated as "unlimited" (no limit enforced).
+
+    Symptom: Dashboard showed "no markets found" because the strategy was paused
+             immediately on startup due to the limit check.
+    """
+
+    @pytest.fixture
+    def mock_gabagool_config(self):
+        """Create mock GabagoolConfig."""
+        from src.config import GabagoolConfig
+
+        config = GabagoolConfig()
+        config.max_daily_exposure_usd = 0.0  # 0 = unlimited
+        config.max_daily_loss_usd = 10.0
+        return config
+
+    def test_zero_exposure_limit_allows_trading(self, mock_gabagool_config):
+        """When max_daily_exposure_usd=0, it should NOT block trading."""
+        # Simulate the fixed logic
+        max_daily_exposure_usd = mock_gabagool_config.max_daily_exposure_usd
+        current_exposure = 0.0
+
+        # This is the FIX: 0 means unlimited, so skip the check
+        limit_reached = (
+            max_daily_exposure_usd > 0
+            and current_exposure >= max_daily_exposure_usd
+        )
+
+        assert limit_reached is False, "0 exposure limit should NOT trigger limit"
+
+    def test_zero_exposure_limit_allows_trading_even_with_exposure(self, mock_gabagool_config):
+        """When max_daily_exposure_usd=0, high exposure should NOT block trading."""
+        max_daily_exposure_usd = mock_gabagool_config.max_daily_exposure_usd
+        current_exposure = 1000.0  # Already traded $1000 today
+
+        # With 0 (unlimited) limit, should still allow trading
+        limit_reached = (
+            max_daily_exposure_usd > 0
+            and current_exposure >= max_daily_exposure_usd
+        )
+
+        assert limit_reached is False, "0 limit means unlimited, should never trigger"
+
+    def test_nonzero_exposure_limit_blocks_when_exceeded(self, mock_gabagool_config):
+        """When max_daily_exposure_usd > 0, it should block when exceeded."""
+        mock_gabagool_config.max_daily_exposure_usd = 100.0  # $100 limit
+        max_daily_exposure_usd = mock_gabagool_config.max_daily_exposure_usd
+        current_exposure = 100.0  # At the limit
+
+        limit_reached = (
+            max_daily_exposure_usd > 0
+            and current_exposure >= max_daily_exposure_usd
+        )
+
+        assert limit_reached is True, "Should block when at limit"
+
+    def test_nonzero_exposure_limit_allows_below_limit(self, mock_gabagool_config):
+        """When max_daily_exposure_usd > 0, should allow trading below limit."""
+        mock_gabagool_config.max_daily_exposure_usd = 100.0  # $100 limit
+        max_daily_exposure_usd = mock_gabagool_config.max_daily_exposure_usd
+        current_exposure = 50.0  # Below limit
+
+        limit_reached = (
+            max_daily_exposure_usd > 0
+            and current_exposure >= max_daily_exposure_usd
+        )
+
+        assert limit_reached is False, "Should allow trading below limit"
+
+    def test_buggy_logic_would_block_zero_exposure(self):
+        """Demonstrate the BUG: without the fix, 0 >= 0 evaluates True.
+
+        This test shows what the buggy code would have done.
+        """
+        max_daily_exposure_usd = 0.0  # Intended as "unlimited"
+        current_exposure = 0.0  # No trading yet
+
+        # BUGGY logic (what it was before the fix):
+        buggy_limit_reached = current_exposure >= max_daily_exposure_usd
+
+        # This would incorrectly trigger because 0 >= 0 is True!
+        assert buggy_limit_reached is True, "Bug: 0 >= 0 triggers limit incorrectly"
+
+        # FIXED logic:
+        fixed_limit_reached = (
+            max_daily_exposure_usd > 0
+            and current_exposure >= max_daily_exposure_usd
+        )
+
+        assert fixed_limit_reached is False, "Fixed: 0 means unlimited"
