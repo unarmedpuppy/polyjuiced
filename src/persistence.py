@@ -267,6 +267,41 @@ class Database:
 
             CREATE INDEX IF NOT EXISTS idx_settlement_unclaimed ON settlement_queue(claimed, market_end_time);
             CREATE INDEX IF NOT EXISTS idx_settlement_condition ON settlement_queue(condition_id);
+
+            -- =========================================================================
+            -- Circuit Breaker State (persists across restarts)
+            -- Tracks realized PnL and circuit breaker status
+            -- =========================================================================
+
+            CREATE TABLE IF NOT EXISTS circuit_breaker_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),  -- Singleton row
+                date TEXT NOT NULL,                      -- Current trading day (YYYY-MM-DD)
+                realized_pnl REAL DEFAULT 0.0,           -- Actual P&L from resolved trades today
+                circuit_breaker_hit BOOLEAN DEFAULT 0,   -- Whether loss limit was triggered
+                hit_at TIMESTAMP,                        -- When circuit breaker was triggered
+                hit_reason TEXT,                         -- Reason for trigger
+                total_trades_today INTEGER DEFAULT 0,    -- Trade count for the day
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            -- Initialize singleton row if not exists
+            INSERT OR IGNORE INTO circuit_breaker_state (id, date)
+            VALUES (1, date('now'));
+
+            -- Realized PnL ledger: individual entries for audit trail
+            CREATE TABLE IF NOT EXISTS realized_pnl_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                trade_id TEXT NOT NULL,
+                trade_date TEXT NOT NULL,               -- YYYY-MM-DD for daily aggregation
+                pnl_amount REAL NOT NULL,               -- Actual profit/loss
+                pnl_type TEXT NOT NULL,                 -- 'resolution', 'settlement', 'rebalance'
+                notes TEXT,
+                UNIQUE(trade_id, pnl_type)              -- Prevent duplicate entries
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_pnl_ledger_date ON realized_pnl_ledger(trade_date);
+            CREATE INDEX IF NOT EXISTS idx_pnl_ledger_trade ON realized_pnl_ledger(trade_id);
         """)
         await self._conn.commit()
 
@@ -1580,6 +1615,229 @@ class Database:
             deleted = cursor.rowcount
             await self._conn.commit()
             return deleted
+
+    # ========== Circuit Breaker State Operations ==========
+
+    async def get_circuit_breaker_state(self) -> Dict[str, Any]:
+        """Get current circuit breaker state.
+
+        Handles daily reset automatically - if the stored date is not today,
+        resets the state for the new day.
+
+        Returns:
+            Dict with circuit breaker state
+        """
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+
+        async with self._conn.execute(
+            "SELECT * FROM circuit_breaker_state WHERE id = 1"
+        ) as cursor:
+            row = await cursor.fetchone()
+
+            if row is None:
+                # Initialize if not exists
+                await self._conn.execute(
+                    """
+                    INSERT INTO circuit_breaker_state (id, date)
+                    VALUES (1, ?)
+                    """,
+                    (today,),
+                )
+                await self._conn.commit()
+                return {
+                    "date": today,
+                    "realized_pnl": 0.0,
+                    "circuit_breaker_hit": False,
+                    "hit_at": None,
+                    "hit_reason": None,
+                    "total_trades_today": 0,
+                }
+
+            state = dict(row)
+
+            # Check if we need to reset for new day
+            if state["date"] != today:
+                log.info(
+                    "New trading day - resetting circuit breaker state",
+                    previous_date=state["date"],
+                    previous_pnl=f"${state['realized_pnl']:.2f}",
+                    new_date=today,
+                )
+                await self._conn.execute(
+                    """
+                    UPDATE circuit_breaker_state
+                    SET date = ?,
+                        realized_pnl = 0.0,
+                        circuit_breaker_hit = 0,
+                        hit_at = NULL,
+                        hit_reason = NULL,
+                        total_trades_today = 0,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = 1
+                    """,
+                    (today,),
+                )
+                await self._conn.commit()
+                return {
+                    "date": today,
+                    "realized_pnl": 0.0,
+                    "circuit_breaker_hit": False,
+                    "hit_at": None,
+                    "hit_reason": None,
+                    "total_trades_today": 0,
+                }
+
+            return {
+                "date": state["date"],
+                "realized_pnl": state["realized_pnl"] or 0.0,
+                "circuit_breaker_hit": bool(state["circuit_breaker_hit"]),
+                "hit_at": state["hit_at"],
+                "hit_reason": state["hit_reason"],
+                "total_trades_today": state["total_trades_today"] or 0,
+            }
+
+    async def record_realized_pnl(
+        self,
+        trade_id: str,
+        pnl_amount: float,
+        pnl_type: str,
+        max_daily_loss: float,
+        notes: str = None,
+    ) -> Dict[str, Any]:
+        """Record realized P&L and check circuit breaker.
+
+        Args:
+            trade_id: Associated trade ID
+            pnl_amount: Actual profit/loss amount
+            pnl_type: Type of P&L ('resolution', 'settlement', 'rebalance')
+            max_daily_loss: Maximum daily loss threshold (positive number)
+            notes: Optional notes
+
+        Returns:
+            Updated circuit breaker state including whether it was triggered
+        """
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+
+        async with self._lock:
+            # Insert into ledger (ignore if duplicate)
+            try:
+                await self._conn.execute(
+                    """
+                    INSERT INTO realized_pnl_ledger (trade_id, trade_date, pnl_amount, pnl_type, notes)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (trade_id, today, pnl_amount, pnl_type, notes),
+                )
+            except Exception as e:
+                # Duplicate entry - already recorded
+                log.debug(
+                    "PnL already recorded for trade",
+                    trade_id=trade_id,
+                    pnl_type=pnl_type,
+                    error=str(e),
+                )
+                # Still need to return current state
+                return await self.get_circuit_breaker_state()
+
+            # Get current state (handles daily reset)
+            state = await self.get_circuit_breaker_state()
+            new_pnl = state["realized_pnl"] + pnl_amount
+            new_trade_count = state["total_trades_today"] + 1
+
+            # Check if we need to trigger circuit breaker
+            circuit_breaker_hit = state["circuit_breaker_hit"]
+            hit_at = state["hit_at"]
+            hit_reason = state["hit_reason"]
+
+            if not circuit_breaker_hit and new_pnl <= -max_daily_loss:
+                circuit_breaker_hit = True
+                hit_at = datetime.utcnow().isoformat()
+                hit_reason = f"Daily loss limit exceeded: ${abs(new_pnl):.2f} >= ${max_daily_loss:.2f}"
+                log.warning(
+                    "CIRCUIT BREAKER TRIGGERED",
+                    realized_pnl=f"${new_pnl:.2f}",
+                    max_daily_loss=f"${max_daily_loss:.2f}",
+                    trigger_trade=trade_id,
+                )
+
+            # Update state
+            await self._conn.execute(
+                """
+                UPDATE circuit_breaker_state
+                SET realized_pnl = ?,
+                    circuit_breaker_hit = ?,
+                    hit_at = ?,
+                    hit_reason = ?,
+                    total_trades_today = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = 1
+                """,
+                (new_pnl, circuit_breaker_hit, hit_at, hit_reason, new_trade_count),
+            )
+            await self._conn.commit()
+
+        log.info(
+            "Recorded realized P&L",
+            trade_id=trade_id[:8] + "..." if len(trade_id) > 8 else trade_id,
+            pnl=f"${pnl_amount:.2f}",
+            pnl_type=pnl_type,
+            daily_total=f"${new_pnl:.2f}",
+            circuit_breaker_hit=circuit_breaker_hit,
+        )
+
+        return {
+            "date": today,
+            "realized_pnl": new_pnl,
+            "circuit_breaker_hit": circuit_breaker_hit,
+            "hit_at": hit_at,
+            "hit_reason": hit_reason,
+            "total_trades_today": new_trade_count,
+        }
+
+    async def reset_circuit_breaker(self, reason: str = "Manual reset") -> None:
+        """Manually reset circuit breaker (keeps PnL, clears hit flag).
+
+        Args:
+            reason: Reason for manual reset
+        """
+        async with self._lock:
+            await self._conn.execute(
+                """
+                UPDATE circuit_breaker_state
+                SET circuit_breaker_hit = 0,
+                    hit_at = NULL,
+                    hit_reason = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = 1
+                """
+            )
+            await self._conn.commit()
+
+        log.info("Circuit breaker manually reset", reason=reason)
+
+    async def get_daily_pnl_breakdown(self, date: str = None) -> List[Dict[str, Any]]:
+        """Get P&L breakdown for a specific day.
+
+        Args:
+            date: Date in YYYY-MM-DD format (default: today)
+
+        Returns:
+            List of P&L entries for the day
+        """
+        if date is None:
+            date = datetime.utcnow().strftime("%Y-%m-%d")
+
+        async with self._conn.execute(
+            """
+            SELECT trade_id, pnl_amount, pnl_type, notes, created_at
+            FROM realized_pnl_ledger
+            WHERE trade_date = ?
+            ORDER BY created_at ASC
+            """,
+            (date,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
 
 
 # Global database instance

@@ -225,6 +225,9 @@ class GabagoolStrategy(BaseStrategy):
         self._position_manager: Optional[ActivePositionManager] = None
         # Pending telemetry for trades being executed: {condition_id: TradeTelemetry}
         self._pending_telemetry: Dict[str, TradeTelemetry] = {}
+        # Circuit breaker state (loaded from DB on startup)
+        self._circuit_breaker_hit: bool = False
+        self._realized_pnl: float = 0.0
 
     def set_liquidity_collector(self, collector: "LiquidityCollector") -> None:
         """Set the liquidity collector for data collection.
@@ -412,11 +415,18 @@ class GabagoolStrategy(BaseStrategy):
         # Load unclaimed positions from database (from previous sessions)
         await self._load_unclaimed_positions()
 
-        # Update dashboard with strategy status
+        # Load circuit breaker state from database
+        await self._load_circuit_breaker_state()
+
+        # Update dashboard with strategy status and circuit breaker state
         update_stats(
             arbitrage_enabled=self.gabagool_config.enabled,
             directional_enabled=self.gabagool_config.directional_enabled,
             near_resolution_enabled=self.gabagool_config.near_resolution_enabled,
+            dry_run=self.gabagool_config.dry_run,
+            circuit_breaker_hit=self._circuit_breaker_hit,
+            realized_pnl=self._realized_pnl,
+            trading_mode=self._get_trading_mode(),
         )
 
         # Start DEDICATED queue processor task - runs independently of main loop
@@ -1111,14 +1121,20 @@ class GabagoolStrategy(BaseStrategy):
         if hasattr(market, "end_time") and market.end_time:
             market_end_time = market.end_time.strftime("%H:%M")
 
-        if self.gabagool_config.dry_run:
-            # Simulate trade
+        # Check if trading is disabled (dry_run OR circuit_breaker_hit)
+        trading_disabled = self._is_trading_disabled()
+        trading_mode = self._get_trading_mode()
+
+        if trading_disabled:
+            # Simulate trade (dry run or circuit breaker mode)
+            mode_label = "CIRCUIT BREAKER" if self._circuit_breaker_hit else "DRY RUN"
             log.info(
-                "DRY RUN: Would execute trade",
+                f"{mode_label}: Would execute trade",
                 asset=market.asset,
                 yes_amount=f"${yes_amount:.2f}",
                 no_amount=f"${no_amount:.2f}",
                 expected_profit=f"${expected_profit:.2f}",
+                mode=trading_mode,
             )
 
             # Add to dashboard trade history (kept for backward compat during transition)
@@ -1132,20 +1148,21 @@ class GabagoolStrategy(BaseStrategy):
                 expected_profit=expected_profit,
                 market_end_time=market_end_time,
                 market_slug=market.slug,
-                dry_run=True,
+                dry_run=True,  # Both dry_run and circuit_breaker show as simulated
+                trading_mode=trading_mode,  # Pass actual mode for dashboard
             )
 
-            # Phase 2: Strategy owns persistence - record dry run trade to DB
+            # Phase 2: Strategy owns persistence - record simulated trade to DB
             await self._record_trade(
                 trade_id=trade_id,
                 market=market,
                 opportunity=opportunity,
                 yes_amount=yes_amount,
                 no_amount=no_amount,
-                actual_yes_shares=yes_shares,  # In dry run, intended = actual
+                actual_yes_shares=yes_shares,  # In simulated mode, intended = actual
                 actual_no_shares=no_shares,
-                hedge_ratio=1.0,  # Perfect hedge assumed in dry run
-                execution_status="full_fill",  # Assumed success in dry run
+                hedge_ratio=1.0,  # Perfect hedge assumed in simulation
+                execution_status="full_fill",  # Assumed success in simulation
                 yes_order_status="SIMULATED",
                 no_order_status="SIMULATED",
                 expected_profit=expected_profit,
@@ -1678,6 +1695,65 @@ class GabagoolStrategy(BaseStrategy):
         except Exception as e:
             log.error("Failed to load unclaimed positions from database", error=str(e))
 
+    async def _load_circuit_breaker_state(self) -> None:
+        """Load circuit breaker state from database on startup.
+
+        This recovers the realized PnL and circuit breaker hit status from
+        the database, ensuring we maintain loss limits across restarts.
+        """
+        if not self._db:
+            log.debug("No database configured, skipping circuit breaker load")
+            return
+
+        try:
+            state = await self._db.get_circuit_breaker_state()
+
+            self._realized_pnl = state["realized_pnl"]
+            self._circuit_breaker_hit = state["circuit_breaker_hit"]
+
+            mode = "CIRCUIT BREAKER HIT" if self._circuit_breaker_hit else "NORMAL"
+            log.info(
+                "Loaded circuit breaker state from database",
+                mode=mode,
+                realized_pnl=f"${self._realized_pnl:.2f}",
+                trades_today=state["total_trades_today"],
+                hit_reason=state.get("hit_reason"),
+            )
+
+            if self._circuit_breaker_hit:
+                log.warning(
+                    "CIRCUIT BREAKER IS ACTIVE - trading disabled until reset",
+                    hit_at=state["hit_at"],
+                    reason=state["hit_reason"],
+                )
+
+        except Exception as e:
+            log.error("Failed to load circuit breaker state", error=str(e))
+            # Default to safe state
+            self._circuit_breaker_hit = False
+            self._realized_pnl = 0.0
+
+    def _is_trading_disabled(self) -> bool:
+        """Check if trading is disabled (dry_run OR circuit_breaker_hit).
+
+        Returns:
+            True if trading should be simulated, False if real trading is allowed
+        """
+        return self.gabagool_config.dry_run or self._circuit_breaker_hit
+
+    def _get_trading_mode(self) -> str:
+        """Get current trading mode for display.
+
+        Returns:
+            'LIVE', 'DRY_RUN', or 'CIRCUIT_BREAKER'
+        """
+        if self._circuit_breaker_hit:
+            return "CIRCUIT_BREAKER"
+        elif self.gabagool_config.dry_run:
+            return "DRY_RUN"
+        else:
+            return "LIVE"
+
     async def _check_settlement(self) -> None:
         """Check for positions that need settlement (claiming winnings).
 
@@ -1687,8 +1763,8 @@ class GabagoolStrategy(BaseStrategy):
         3. Attempts to claim winnings by selling resolved positions at 0.99
         4. Updates database with claim results
         """
-        if self.gabagool_config.dry_run:
-            # Skip settlement in dry run mode
+        if self._is_trading_disabled():
+            # Skip settlement in dry run or circuit breaker mode
             return
 
         now = datetime.utcnow()
@@ -1936,6 +2012,66 @@ class GabagoolStrategy(BaseStrategy):
                 markets=len(self._active_markets),
             )
 
+    async def _record_and_check_circuit_breaker(
+        self,
+        trade_id: str,
+        actual_profit: float,
+        pnl_type: str = "resolution",
+        dry_run: bool = False,
+    ) -> None:
+        """Record realized PnL and check if circuit breaker should trigger.
+
+        Args:
+            trade_id: Trade ID
+            actual_profit: Actual realized profit/loss
+            pnl_type: Type of P&L entry
+            dry_run: Whether this was a simulated trade
+        """
+        # Don't record PnL for simulated trades - they're not real money
+        if dry_run:
+            return
+
+        if not self._db:
+            return
+
+        try:
+            state = await self._db.record_realized_pnl(
+                trade_id=trade_id,
+                pnl_amount=actual_profit,
+                pnl_type=pnl_type,
+                max_daily_loss=self.gabagool_config.max_daily_loss_usd,
+            )
+
+            # Update local state
+            self._realized_pnl = state["realized_pnl"]
+
+            # Check if circuit breaker was just triggered
+            if state["circuit_breaker_hit"] and not self._circuit_breaker_hit:
+                self._circuit_breaker_hit = True
+                log.warning(
+                    "CIRCUIT BREAKER TRIGGERED - switching to simulation mode",
+                    realized_pnl=f"${self._realized_pnl:.2f}",
+                    max_loss=f"${self.gabagool_config.max_daily_loss_usd:.2f}",
+                    trigger_trade=trade_id,
+                )
+                # Update dashboard immediately
+                update_stats(
+                    circuit_breaker_hit=True,
+                    realized_pnl=self._realized_pnl,
+                    trading_mode="CIRCUIT_BREAKER",
+                )
+            else:
+                # Always update realized PnL on dashboard
+                update_stats(realized_pnl=self._realized_pnl)
+
+        except Exception as e:
+            log.error(
+                "Failed to record realized PnL",
+                trade_id=trade_id,
+                pnl=actual_profit,
+                error=str(e),
+            )
+
     async def _check_resolved_trades(self) -> None:
         """Check for resolved markets and update dashboard with results.
 
@@ -1970,6 +2106,12 @@ class GabagoolStrategy(BaseStrategy):
                     won = actual_profit > 0
                     resolve_trade(trade_id, won=won, actual_profit=actual_profit)
                     resolved_ids.append(trade_id)
+
+                    # Record realized PnL and check circuit breaker
+                    await self._record_and_check_circuit_breaker(
+                        trade_id, actual_profit, "resolution", trade_result.dry_run
+                    )
+
                     log.info(
                         "Trade resolved (timeout, no end_time)",
                         asset=market.asset,
@@ -1998,6 +2140,12 @@ class GabagoolStrategy(BaseStrategy):
                         won = actual_profit > 0
                         resolve_trade(trade_id, won=won, actual_profit=actual_profit)
                         resolved_ids.append(trade_id)
+
+                        # Record realized PnL and check circuit breaker
+                        await self._record_and_check_circuit_breaker(
+                            trade_id, actual_profit, "resolution", trade_result.dry_run
+                        )
+
                         log.info(
                             "Trade resolved (API confirmed)",
                             asset=market.asset,
@@ -2019,6 +2167,11 @@ class GabagoolStrategy(BaseStrategy):
 
             resolve_trade(trade_id, won=won, actual_profit=actual_profit)
             resolved_ids.append(trade_id)
+
+            # Record realized PnL and check circuit breaker
+            await self._record_and_check_circuit_breaker(
+                trade_id, actual_profit, "resolution", trade_result.dry_run
+            )
 
             log.info(
                 "Trade resolved (timeout)",

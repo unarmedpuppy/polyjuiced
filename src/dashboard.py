@@ -430,6 +430,16 @@ DASHBOARD_HTML = """
             animation: blink 2s infinite;
         }
 
+        .circuit-breaker-banner {
+            background: linear-gradient(90deg, #dc3545, transparent);
+            color: #fff;
+            text-align: center;
+            padding: 8px;
+            font-weight: bold;
+            letter-spacing: 2px;
+            animation: blink 1s infinite;
+        }
+
         @media (max-width: 1200px) {
             .grid { grid-template-columns: repeat(2, 1fr); }
             .grid-2col { grid-template-columns: 1fr; }
@@ -475,6 +485,9 @@ DASHBOARD_HTML = """
 <body>
     <div id="dry-run-banner" class="dry-run-banner" style="display: none;">
         [ DRY RUN MODE - NO REAL TRADES ]
+    </div>
+    <div id="circuit-breaker-banner" class="circuit-breaker-banner" style="display: none;">
+        [ ⚠️ CIRCUIT BREAKER ACTIVE - DAILY LOSS LIMIT REACHED ]
     </div>
 
     <div class="container">
@@ -983,9 +996,31 @@ DASHBOARD_HTML = """
                 updateClass(document.getElementById('dir-status'), 'status-dot ' + (s.directional_enabled ? '' : 'error'));
                 updateClass(document.getElementById('nr-status'), 'status-dot ' + (s.near_resolution_enabled ? '' : 'error'));
 
-                if (s.dry_run) {
-                    const banner = document.getElementById('dry-run-banner');
-                    if (banner.style.display !== 'block') banner.style.display = 'block';
+                // Show appropriate banner based on trading mode
+                const dryRunBanner = document.getElementById('dry-run-banner');
+                const cbBanner = document.getElementById('circuit-breaker-banner');
+
+                if (s.circuit_breaker_hit) {
+                    // Circuit breaker takes priority
+                    if (cbBanner.style.display !== 'block') cbBanner.style.display = 'block';
+                    if (dryRunBanner.style.display !== 'none') dryRunBanner.style.display = 'none';
+                } else if (s.dry_run) {
+                    // Dry run mode
+                    if (dryRunBanner.style.display !== 'block') dryRunBanner.style.display = 'block';
+                    if (cbBanner.style.display !== 'none') cbBanner.style.display = 'none';
+                } else {
+                    // Live trading
+                    if (dryRunBanner.style.display !== 'none') dryRunBanner.style.display = 'none';
+                    if (cbBanner.style.display !== 'none') cbBanner.style.display = 'none';
+                }
+
+                // Update realized PnL if available
+                if (s.realized_pnl !== undefined) {
+                    const pnlEl = document.getElementById('daily-pnl');
+                    if (pnlEl) {
+                        pnlEl.textContent = (s.realized_pnl >= 0 ? '+' : '') + '$' + s.realized_pnl.toFixed(2);
+                        pnlEl.className = s.realized_pnl >= 0 ? 'positive' : 'negative';
+                    }
                 }
             }
 
@@ -1634,6 +1669,7 @@ def add_trade(
     market_slug: str = None,
     condition_id: str = None,
     dry_run: bool = False,
+    trading_mode: str = None,
 ) -> str:
     """Add a new trade to dashboard display.
 
@@ -1654,6 +1690,7 @@ def add_trade(
         market_slug: Market slug for reference
         condition_id: Market condition ID (unused - kept for backward compat)
         dry_run: Whether this is a dry run trade
+        trading_mode: Trading mode ('LIVE', 'DRY_RUN', or 'CIRCUIT_BREAKER')
 
     Returns:
         Trade ID for later updates
@@ -1661,6 +1698,10 @@ def add_trade(
     global _trade_id_counter
     _trade_id_counter += 1
     trade_id = f"trade-{_trade_id_counter}"
+
+    # Determine trading mode if not provided
+    if trading_mode is None:
+        trading_mode = "DRY_RUN" if dry_run else "LIVE"
 
     trade = {
         "id": trade_id,
@@ -1676,6 +1717,7 @@ def add_trade(
         "actual_profit": None,
         "status": "pending",
         "dry_run": dry_run,
+        "trading_mode": trading_mode,
         "market_slug": market_slug,
     }
 
