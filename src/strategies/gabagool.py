@@ -936,6 +936,53 @@ class GabagoolStrategy(BaseStrategy):
                     error=error_msg,
                 )
 
+            # Post-trade hedge verification
+            # Extract actual filled sizes from API result
+            yes_order = api_result.get("yes_order", {})
+            no_order = api_result.get("no_order", {})
+
+            # Get actual filled sizes (may differ from intended due to partial fills)
+            actual_yes_shares = float(
+                yes_order.get("size_matched", 0) or
+                yes_order.get("matched_size", 0) or
+                yes_order.get("size", 0) or
+                yes_shares
+            )
+            actual_no_shares = float(
+                no_order.get("size_matched", 0) or
+                no_order.get("matched_size", 0) or
+                no_order.get("size", 0) or
+                no_shares
+            )
+
+            # Calculate actual hedge ratio
+            min_shares = min(actual_yes_shares, actual_no_shares)
+            max_shares = max(actual_yes_shares, actual_no_shares)
+            actual_hedge_ratio = min_shares / max_shares if max_shares > 0 else 0
+
+            log.info(
+                "Post-trade hedge verification",
+                asset=market.asset,
+                yes_shares=actual_yes_shares,
+                no_shares=actual_no_shares,
+                hedge_ratio=f"{actual_hedge_ratio:.1%}",
+            )
+
+            # Warn if hedge ratio is poor (but still record the trade)
+            if actual_hedge_ratio < 0.70:
+                add_log(
+                    "warning",
+                    f"Low hedge ratio on {market.asset}: {actual_hedge_ratio:.0%}",
+                    yes_shares=actual_yes_shares,
+                    no_shares=actual_no_shares,
+                )
+
+            # Use actual filled sizes for the trade record
+            yes_shares = actual_yes_shares
+            no_shares = actual_no_shares
+            total_cost = yes_amount + no_amount
+            expected_profit = min_shares - total_cost
+
             # Add to dashboard trade history
             trade_id = add_trade(
                 asset=market.asset,

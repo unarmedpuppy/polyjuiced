@@ -91,7 +91,8 @@ class GabagoolConfig:
     directional_trailing_distance: float = 0.10  # 10¢ trailing stop
 
     # Near-resolution trading settings (high-confidence bets in final minute)
-    near_resolution_enabled: bool = True  # Bet on nearly-resolved markets
+    # DISABLED: Creates one-sided positions that lose money when wrong
+    near_resolution_enabled: bool = False  # Disabled - was creating unhedged positions
     near_resolution_time_threshold: float = 60.0  # Max seconds remaining (60s = 1 min)
     near_resolution_min_price: float = 0.94  # Min price to bet (94 cents)
     near_resolution_max_price: float = 0.975  # Max price to bet (97.5 cents)

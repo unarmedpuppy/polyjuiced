@@ -671,12 +671,43 @@ class PolymarketClient:
             )
 
             # Check if YES order filled
+            # IMPORTANT: LIVE means order is on the book waiting, NOT filled
+            # Only MATCHED/FILLED indicate actual execution
             yes_status = yes_result.get("status", "").upper()
-            yes_filled = yes_status in ("MATCHED", "FILLED", "LIVE")
+            yes_filled = yes_status in ("MATCHED", "FILLED")
+
+            # Also check size_matched for partial fills
+            yes_size_matched = float(yes_result.get("size_matched", 0) or yes_result.get("matched_size", 0) or 0)
+            yes_intended_size = float(yes_result.get("_intended_size", 0) or yes_result.get("size", 0) or 0)
+
+            # If status is LIVE, the order is sitting on the book - not filled yet
+            if yes_status == "LIVE":
+                log.warning(
+                    "YES order went LIVE (on book) instead of filling immediately - cancelling",
+                    status=yes_status,
+                    size_matched=yes_size_matched,
+                    intended_size=yes_intended_size,
+                )
+                # Cancel the unfilled order
+                yes_order_id = yes_result.get("id") or yes_result.get("order_id")
+                if yes_order_id:
+                    try:
+                        self._client.cancel(yes_order_id)
+                        log.info("Cancelled unfilled YES order", order_id=yes_order_id[:20] + "...")
+                    except Exception as cancel_err:
+                        log.warning("Failed to cancel YES order", error=str(cancel_err))
+
+                return {
+                    "yes_order": yes_result,
+                    "no_order": None,
+                    "success": False,
+                    "partial_fill": False,
+                    "error": f"YES order went LIVE instead of filling - insufficient liquidity at price",
+                }
 
             if not yes_filled:
                 log.warning(
-                    "YES order did not fill (FOK rejected)",
+                    "YES order did not fill",
                     status=yes_status,
                     result=yes_result,
                 )
@@ -685,10 +716,10 @@ class PolymarketClient:
                     "no_order": None,
                     "success": False,
                     "partial_fill": False,
-                    "error": f"YES order FOK rejected: {yes_status}",
+                    "error": f"YES order rejected: {yes_status}",
                 }
 
-            log.info("YES order filled, placing NO order...")
+            log.info("YES order filled", status=yes_status, size_matched=yes_size_matched)
 
             # Step 2: YES filled, now place NO order
             no_result = await asyncio.wait_for(
@@ -697,10 +728,13 @@ class PolymarketClient:
             )
 
             # Check if NO order filled
+            # IMPORTANT: LIVE means order is on the book waiting, NOT filled
             no_status = no_result.get("status", "").upper()
-            no_filled = no_status in ("MATCHED", "FILLED", "LIVE")
+            no_filled = no_status in ("MATCHED", "FILLED")
+            no_size_matched = float(no_result.get("size_matched", 0) or no_result.get("matched_size", 0) or 0)
 
-            if not no_filled:
+            # If NO order went LIVE or didn't fill, we have a partial fill situation
+            if no_status == "LIVE" or not no_filled:
                 # CRITICAL: YES filled but NO didn't - we have a partial fill!
                 # Must immediately unwind the YES position to avoid directional exposure
                 log.error(
@@ -787,7 +821,9 @@ class PolymarketClient:
             log.info(
                 "Both legs filled successfully",
                 yes_status=yes_status,
+                yes_size_matched=yes_size_matched,
                 no_status=no_status,
+                no_size_matched=no_size_matched,
             )
 
             # Log fills to liquidity collector if available
