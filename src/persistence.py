@@ -885,11 +885,17 @@ class Database:
 
         return points
 
-    async def reset_all_trade_data(self) -> Dict[str, int]:
-        """Reset all trade history data.
+    async def reset_trade_history(self, preserve_liquidity_data: bool = True) -> Dict[str, int]:
+        """Reset trade history data.
 
-        This clears trades, daily_stats, and logs.
-        Keeps markets table intact (market discovery data is useful).
+        This clears trades, daily_stats, and logs (incorrect P&L data).
+
+        By default, PRESERVES fill_records and liquidity_snapshots which are
+        valuable for building persistence/slippage prediction models.
+
+        Args:
+            preserve_liquidity_data: If True (default), keep fill_records and
+                liquidity_snapshots. Set to False to delete everything.
 
         Returns:
             Dict with counts of deleted records per table
@@ -898,12 +904,10 @@ class Database:
             "trades": 0,
             "daily_stats": 0,
             "logs": 0,
-            "fill_records": 0,
-            "liquidity_snapshots": 0,
         }
 
         async with self._lock:
-            # Clear trades
+            # Clear trades (incorrect P&L data)
             cursor = await self._conn.execute("DELETE FROM trades")
             deleted["trades"] = cursor.rowcount
 
@@ -915,18 +919,29 @@ class Database:
             cursor = await self._conn.execute("DELETE FROM logs")
             deleted["logs"] = cursor.rowcount
 
-            # Clear fill records
-            cursor = await self._conn.execute("DELETE FROM fill_records")
-            deleted["fill_records"] = cursor.rowcount
+            # Only clear liquidity data if explicitly requested
+            if not preserve_liquidity_data:
+                cursor = await self._conn.execute("DELETE FROM fill_records")
+                deleted["fill_records"] = cursor.rowcount
 
-            # Clear liquidity snapshots
-            cursor = await self._conn.execute("DELETE FROM liquidity_snapshots")
-            deleted["liquidity_snapshots"] = cursor.rowcount
+                cursor = await self._conn.execute("DELETE FROM liquidity_snapshots")
+                deleted["liquidity_snapshots"] = cursor.rowcount
 
             await self._conn.commit()
 
-        log.info("Reset all trade data", deleted=deleted)
+        log.info("Reset trade history", deleted=deleted, preserved_liquidity=preserve_liquidity_data)
         return deleted
+
+    async def reset_all_trade_data(self) -> Dict[str, int]:
+        """Reset ALL trade data including liquidity modeling data.
+
+        WARNING: This deletes valuable liquidity data used for slippage modeling.
+        Use reset_trade_history() instead to preserve that data.
+
+        Returns:
+            Dict with counts of deleted records per table
+        """
+        return await self.reset_trade_history(preserve_liquidity_data=False)
 
 
 # Global database instance
