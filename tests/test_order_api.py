@@ -600,36 +600,31 @@ class TestDecimalPrecision:
             "Must verify shares × price produces clean maker_amount"
         )
 
-    def test_gtc_used_instead_of_fok(self):
-        """Verify GTC is used instead of FOK due to precision bugs."""
-        import os
+    def test_fok_compatible_with_clean_maker_amount(self):
+        """Verify FOK can be used now that we ensure clean maker_amount.
 
-        src_dir = os.path.join(os.path.dirname(__file__), '..', 'src')
+        Previously FOK failed with "invalid amounts" errors because
+        shares × price produced values with >2 decimals. Now we adjust
+        shares to ensure the product is always ≤2 decimals.
 
-        files_to_check = [
-            'client/polymarket.py',
-            'strategies/gabagool.py',
-        ]
+        FOK is preferred over GTC for arbitrage because:
+        1. Atomicity: Either fills completely or not at all
+        2. No hanging orders: Don't end up with orders on the book
+        3. Predictable: Know immediately if the trade succeeded
 
-        for rel_path in files_to_check:
-            filepath = os.path.join(src_dir, rel_path)
-            if os.path.exists(filepath):
-                with open(filepath, 'r') as f:
-                    content = f.read()
+        This test verifies FOK is used in the parallel execution path.
+        """
+        import src.client.polymarket as polymarket_module
+        source = inspect.getsource(polymarket_module.PolymarketClient.execute_dual_leg_order_parallel)
 
-                # Should NOT have FOK in post_order calls (except in comments)
-                # Count actual FOK usage in code (not comments)
-                lines = content.split('\n')
-                fok_in_code = 0
-                for line in lines:
-                    # Skip comments
-                    code_part = line.split('#')[0]
-                    if 'OrderType.FOK' in code_part and 'post_order' in code_part:
-                        fok_in_code += 1
-
-                assert fok_in_code == 0, (
-                    f"{rel_path} should use GTC instead of FOK in post_order calls"
-                )
+        # The parallel execution path should use FOK for atomicity
+        assert "OrderType.FOK" in source, (
+            "Parallel execution should use FOK for atomic fills"
+        )
+        # And it should have logic to ensure clean maker_amount
+        assert "actual_maker" in source, (
+            "Must adjust shares to ensure clean maker_amount for FOK"
+        )
 
 
 class TestArbitragePositionSizing:
