@@ -620,21 +620,32 @@ DASHBOARD_HTML = """
         // SSE connection for real-time updates
         const evtSource = new EventSource('/dashboard/events');
 
-        // Debounce rapid updates using requestAnimationFrame
-        let pendingMarketUpdate = null;
+        // Debounce market updates to at most once per 500ms (prices only, time is client-side)
         let pendingMarketData = null;
+        let lastMarketUpdate = 0;
+        let marketUpdateTimer = null;
 
         evtSource.onmessage = function(event) {
             const data = JSON.parse(event.data);
 
-            // Debounce market updates to prevent flickering
+            // Debounce market updates - only update prices every 500ms
+            // Time remaining is handled by client-side interval, so no need for frequent server updates
             if (data.markets) {
                 pendingMarketData = data.markets;
-                if (!pendingMarketUpdate) {
-                    pendingMarketUpdate = requestAnimationFrame(() => {
+                const now = Date.now();
+
+                // Only process update if 500ms has passed since last update
+                if (now - lastMarketUpdate >= 500) {
+                    lastMarketUpdate = now;
+                    updateMarketsOptimized(pendingMarketData);
+                } else if (!marketUpdateTimer) {
+                    // Schedule update for when 500ms has passed
+                    const delay = 500 - (now - lastMarketUpdate);
+                    marketUpdateTimer = setTimeout(() => {
+                        lastMarketUpdate = Date.now();
                         updateMarketsOptimized(pendingMarketData);
-                        pendingMarketUpdate = null;
-                    });
+                        marketUpdateTimer = null;
+                    }, delay);
                 }
                 // Remove markets from data so updateDashboard doesn't process it
                 delete data.markets;
@@ -652,6 +663,33 @@ DASHBOARD_HTML = """
 
         // Cache for market row elements to enable incremental updates
         const marketRowCache = new Map();
+        // Store market end times for client-side countdown (ms timestamp)
+        const marketEndTimes = new Map();
+
+        // Parse "HH:MM UTC" format to milliseconds timestamp (today's date)
+        function parseEndTimeToMs(endTimeStr) {
+            if (!endTimeStr || !/^\d{2}:\d{2} UTC$/.test(endTimeStr)) return null;
+            const [timepart] = endTimeStr.split(' ');
+            const [h, m] = timepart.split(':').map(Number);
+            const now = new Date();
+            // Create date in UTC
+            const endDate = new Date(Date.UTC(
+                now.getUTCFullYear(),
+                now.getUTCMonth(),
+                now.getUTCDate(),
+                h, m, 0, 0
+            ));
+            // If the time has already passed today, it might be for the next slot
+            // But for 15-min markets, they should be within a reasonable window
+            return endDate.getTime();
+        }
+
+        // Calculate seconds remaining from end time
+        function calculateSecondsRemaining(endTimeMs) {
+            if (!endTimeMs) return 0;
+            const now = Date.now();
+            return Math.max(0, Math.floor((endTimeMs - now) / 1000));
+        }
 
         // Convert UTC timestamp to CST (UTC-6) for display
         function utcToCst(utcTimeStr) {
@@ -700,18 +738,17 @@ DASHBOARD_HTML = """
             }
         }
 
-        // Optimized market update - only updates changed cells, not entire table
+        // Optimized market update - only updates prices/status from server
+        // Time remaining is calculated client-side for smooth countdown
         function updateMarketsOptimized(markets) {
             const marketsList = document.getElementById('markets-list');
             const marketIds = new Set(Object.keys(markets));
-
-            let foundCount = 0;
-            let tradeableCount = 0;
 
             // Handle empty state
             if (marketIds.size === 0) {
                 marketsList.innerHTML = '<div style="padding: 20px; text-align: center; color: var(--dim-green);">No markets found. Waiting for next 15-minute window...</div>';
                 marketRowCache.clear();
+                marketEndTimes.clear();
                 document.getElementById('market-count').textContent = '0';
                 document.getElementById('tradeable-count').textContent = '0';
                 return;
@@ -743,28 +780,46 @@ DASHBOARD_HTML = """
                 if (!marketIds.has(id)) {
                     row.remove();
                     marketRowCache.delete(id);
+                    marketEndTimes.delete(id);
                 }
             }
 
-            // Sort markets by minutes remaining (rounded) to prevent constant reordering
-            // Using minute granularity keeps the list stable while still showing soonest first
+            // Store/update end times for each market
+            for (const [id, m] of Object.entries(markets)) {
+                if (m.end_time && !marketEndTimes.has(id)) {
+                    const endMs = parseEndTimeToMs(m.end_time);
+                    if (endMs) marketEndTimes.set(id, endMs);
+                }
+            }
+
+            // Sort markets by minutes remaining (using client-side calculation)
             const sortedMarkets = Object.entries(markets).sort((a, b) => {
-                const aMinutes = Math.floor((a[1].seconds_remaining || 0) / 60);
-                const bMinutes = Math.floor((b[1].seconds_remaining || 0) / 60);
+                const aEndMs = marketEndTimes.get(a[0]);
+                const bEndMs = marketEndTimes.get(b[0]);
+                const aSeconds = aEndMs ? calculateSecondsRemaining(aEndMs) : 0;
+                const bSeconds = bEndMs ? calculateSecondsRemaining(bEndMs) : 0;
+                const aMinutes = Math.floor(aSeconds / 60);
+                const bMinutes = Math.floor(bSeconds / 60);
                 if (aMinutes !== bMinutes) return aMinutes - bMinutes;
-                // Secondary sort by asset name for stability within same minute
                 return (a[1].asset || '').localeCompare(b[1].asset || '');
             });
 
-            // Update or create rows for each market
+            let foundCount = 0;
+            let tradeableCount = 0;
+
+            // Update or create rows for each market (but don't reorder existing rows)
             for (const [id, m] of sortedMarkets) {
                 foundCount++;
-                const isTradeable = m.seconds_remaining > 60;
+
+                // Calculate time remaining client-side from stored end time
+                const endMs = marketEndTimes.get(id);
+                const secondsRemaining = endMs ? calculateSecondsRemaining(endMs) : 0;
+                const isTradeable = secondsRemaining > 60;
                 if (isTradeable) tradeableCount++;
 
-                const mins = Math.floor(m.seconds_remaining / 60);
-                const secs = Math.floor(m.seconds_remaining % 60);
-                const timeLeft = m.seconds_remaining > 0 ? `${mins}m ${secs}s` : 'ENDED';
+                const mins = Math.floor(secondsRemaining / 60);
+                const secs = Math.floor(secondsRemaining % 60);
+                const timeLeft = secondsRemaining > 0 ? `${mins}m ${secs}s` : 'ENDED';
 
                 let row = marketRowCache.get(id);
                 if (!row) {
@@ -786,28 +841,54 @@ DASHBOARD_HTML = """
                         <td style="padding: 8px; text-align: right;" class="cell-downprice">${m.down_price ? (m.down_price * 100).toFixed(1) + '¢' : 'N/A'}</td>
                         <td style="padding: 8px; text-align: center;" class="cell-status">${isTradeable ? 'TRADEABLE' : 'EXPIRED'}</td>
                     `;
+                    // Append new rows to table (will be sorted on next full refresh)
                     table.appendChild(row);
                     marketRowCache.set(id, row);
                 } else {
-                    // Update only changed cells (no innerHTML replacement = no flicker)
-                    const timeCell = row.querySelector('.cell-timeleft');
+                    // Update only prices (time and status updated by separate interval)
                     const upCell = row.querySelector('.cell-upprice');
                     const downCell = row.querySelector('.cell-downprice');
-                    const statusCell = row.querySelector('.cell-status');
 
-                    // Update time left
-                    if (timeCell.textContent !== timeLeft) {
-                        timeCell.textContent = timeLeft;
-                        timeCell.style.color = m.seconds_remaining > 60 ? 'var(--green)' : 'var(--red)';
-                    }
-
-                    // Update prices
                     const upText = m.up_price ? (m.up_price * 100).toFixed(1) + '¢' : 'N/A';
                     const downText = m.down_price ? (m.down_price * 100).toFixed(1) + '¢' : 'N/A';
                     if (upCell.textContent !== upText) upCell.textContent = upText;
                     if (downCell.textContent !== downText) downCell.textContent = downText;
+                }
 
-                    // Update status
+                // Update row background (stable - won't flicker)
+                const bgColor = isTradeable ? 'rgba(0, 255, 65, 0.05)' : 'rgba(255, 0, 64, 0.05)';
+                if (row.style.background !== bgColor) row.style.background = bgColor;
+            }
+
+            document.getElementById('market-count').textContent = foundCount;
+            document.getElementById('tradeable-count').textContent = tradeableCount;
+        }
+
+        // Client-side timer to update time remaining every second (independent of server updates)
+        function updateMarketTimers() {
+            let tradeableCount = 0;
+
+            for (const [id, row] of marketRowCache.entries()) {
+                const endMs = marketEndTimes.get(id);
+                if (!endMs) continue;
+
+                const secondsRemaining = calculateSecondsRemaining(endMs);
+                const isTradeable = secondsRemaining > 60;
+                if (isTradeable) tradeableCount++;
+
+                const mins = Math.floor(secondsRemaining / 60);
+                const secs = Math.floor(secondsRemaining % 60);
+                const timeLeft = secondsRemaining > 0 ? `${mins}m ${secs}s` : 'ENDED';
+
+                const timeCell = row.querySelector('.cell-timeleft');
+                const statusCell = row.querySelector('.cell-status');
+
+                if (timeCell) {
+                    timeCell.textContent = timeLeft;
+                    timeCell.style.color = secondsRemaining > 60 ? 'var(--green)' : 'var(--red)';
+                }
+
+                if (statusCell) {
                     const statusText = isTradeable ? 'TRADEABLE' : 'EXPIRED';
                     if (statusCell.textContent !== statusText) {
                         statusCell.textContent = statusText;
@@ -815,16 +896,15 @@ DASHBOARD_HTML = """
                     }
                 }
 
-                // Update row background based on tradeable status
+                // Update row background
                 row.style.background = isTradeable ? 'rgba(0, 255, 65, 0.05)' : 'rgba(255, 0, 64, 0.05)';
-
-                // Ensure row is in correct sorted position in DOM
-                table.appendChild(row);
             }
 
-            document.getElementById('market-count').textContent = foundCount;
             document.getElementById('tradeable-count').textContent = tradeableCount;
         }
+
+        // Update market timers every second (client-side countdown)
+        setInterval(updateMarketTimers, 1000);
 
         function updateDashboard(data) {
             if (data.stats) {
