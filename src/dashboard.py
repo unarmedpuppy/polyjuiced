@@ -313,7 +313,7 @@ DASHBOARD_HTML = """
         .trade-profit.positive { color: var(--green); }
         .trade-profit.negative { color: var(--red); }
 
-        /* Log terminal */
+        /* Log terminal - newest messages at top, no scrolling needed */
         .log-terminal {
             height: 300px;
             overflow-y: auto;
@@ -322,6 +322,8 @@ DASHBOARD_HTML = """
             padding: 10px;
             background: #000;
             border: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
         }
 
         .log-terminal::-webkit-scrollbar { width: 8px; }
@@ -433,6 +435,42 @@ DASHBOARD_HTML = """
         @media (max-width: 1200px) {
             .grid { grid-template-columns: repeat(2, 1fr); }
             .grid-2col { grid-template-columns: 1fr; }
+        }
+
+        /* Mobile responsiveness */
+        @media (max-width: 768px) {
+            .container { padding: 10px; }
+            .header h1 { font-size: 2rem; letter-spacing: 4px; }
+            .header .subtitle { font-size: 0.75rem; letter-spacing: 2px; }
+            .status-bar {
+                flex-wrap: wrap;
+                gap: 10px 20px;
+                font-size: 0.75rem;
+            }
+            .status-item {
+                white-space: nowrap;
+            }
+            .grid { grid-template-columns: 1fr 1fr; gap: 10px; }
+            .panel-title { font-size: 0.8rem; letter-spacing: 1px; }
+            .stat-value { font-size: 1.5rem !important; }
+            .winloss { gap: 15px; }
+            .winloss-value { font-size: 1.2rem; }
+            /* Hide less important status items on mobile */
+            .status-item:nth-child(n+5) { display: none; }
+            /* Make markets table scroll horizontally if needed */
+            #markets-list { overflow-x: auto; }
+            #markets-list table { min-width: 500px; }
+        }
+
+        @media (max-width: 480px) {
+            .header h1 { font-size: 1.5rem; }
+            .grid { grid-template-columns: 1fr; }
+            .trade-item {
+                grid-template-columns: 1fr;
+                gap: 8px;
+            }
+            .trade-time { font-size: 0.7rem; }
+            .trade-profit { text-align: left; }
         }
     </style>
 </head>
@@ -556,23 +594,6 @@ DASHBOARD_HTML = """
                 <div id="markets-list" style="max-height: 200px; overflow-y: auto;">
                     <div style="padding: 20px; text-align: center; color: var(--dim-green);">
                         Searching for markets...
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- Strategy Decisions Panel -->
-        <div class="panel" style="margin-bottom: 20px;">
-            <div class="panel-header">
-                <span class="panel-title">[ STRATEGY DECISIONS ]</span>
-                <span style="color: var(--dim-green); font-size: 0.8rem;">
-                    Real-time evaluation
-                </span>
-            </div>
-            <div class="panel-body" style="padding: 0;">
-                <div id="decisions-list" style="max-height: 180px; overflow-y: auto; font-size: 0.85rem;">
-                    <div style="padding: 15px; text-align: center; color: var(--dim-green);">
-                        Waiting for market evaluation...
                     </div>
                 </div>
             </div>
@@ -730,7 +751,6 @@ DASHBOARD_HTML = """
         // Limit DOM children to prevent memory issues
         const MAX_LOG_ENTRIES = 100;
         const MAX_TRADE_ENTRIES = 50;
-        const MAX_DECISION_ENTRIES = 20;
 
         function trimChildren(element, maxCount) {
             while (element.children.length > maxCount) {
@@ -767,9 +787,10 @@ DASHBOARD_HTML = """
                     <th style="padding: 8px; text-align: left;">Asset</th>
                     <th style="padding: 8px; text-align: left;">End Time</th>
                     <th style="padding: 8px; text-align: right;">Time Left</th>
-                    <th style="padding: 8px; text-align: right;">Up Price</th>
-                    <th style="padding: 8px; text-align: right;">Down Price</th>
-                    <th style="padding: 8px; text-align: center;">Status</th>
+                    <th style="padding: 8px; text-align: right;">Up</th>
+                    <th style="padding: 8px; text-align: right;">Down</th>
+                    <th style="padding: 8px; text-align: right;">Spread</th>
+                    <th style="padding: 8px; text-align: center;">ARB</th>
                 `;
                 table.appendChild(header);
                 marketsList.appendChild(table);
@@ -821,6 +842,14 @@ DASHBOARD_HTML = """
                 const secs = Math.floor(secondsRemaining % 60);
                 const timeLeft = secondsRemaining > 0 ? `${mins}m ${secs}s` : 'ENDED';
 
+                // Calculate spread and ARB eligibility
+                const spread = (m.up_price && m.down_price)
+                    ? ((1 - m.up_price - m.down_price) * 100).toFixed(1)
+                    : null;
+                const spreadNum = spread ? parseFloat(spread) : 0;
+                const meetsArbCriteria = isTradeable && spreadNum >= 2.0;
+                const spreadColor = spreadNum >= 2.0 ? 'var(--green)' : spreadNum > 0 ? 'var(--amber)' : 'var(--red)';
+
                 let row = marketRowCache.get(id);
                 if (!row) {
                     // Create new row
@@ -839,20 +868,35 @@ DASHBOARD_HTML = """
                         <td style="padding: 8px; text-align: right;" class="cell-timeleft">${timeLeft}</td>
                         <td style="padding: 8px; text-align: right;" class="cell-upprice">${m.up_price ? (m.up_price * 100).toFixed(1) + '¢' : 'N/A'}</td>
                         <td style="padding: 8px; text-align: right;" class="cell-downprice">${m.down_price ? (m.down_price * 100).toFixed(1) + '¢' : 'N/A'}</td>
-                        <td style="padding: 8px; text-align: center;" class="cell-status">${isTradeable ? 'TRADEABLE' : 'EXPIRED'}</td>
+                        <td style="padding: 8px; text-align: right;" class="cell-spread">${spread ? spread + '¢' : 'N/A'}</td>
+                        <td style="padding: 8px; text-align: center;" class="cell-arb">${meetsArbCriteria ? '✓' : '—'}</td>
                     `;
                     // Append new rows to table (will be sorted on next full refresh)
                     table.appendChild(row);
                     marketRowCache.set(id, row);
                 } else {
-                    // Update only prices (time and status updated by separate interval)
+                    // Update prices, spread, and ARB status
                     const upCell = row.querySelector('.cell-upprice');
                     const downCell = row.querySelector('.cell-downprice');
+                    const spreadCell = row.querySelector('.cell-spread');
+                    const arbCell = row.querySelector('.cell-arb');
 
                     const upText = m.up_price ? (m.up_price * 100).toFixed(1) + '¢' : 'N/A';
                     const downText = m.down_price ? (m.down_price * 100).toFixed(1) + '¢' : 'N/A';
-                    if (upCell.textContent !== upText) upCell.textContent = upText;
-                    if (downCell.textContent !== downText) downCell.textContent = downText;
+                    const spreadText = spread ? spread + '¢' : 'N/A';
+                    const arbText = meetsArbCriteria ? '✓' : '—';
+
+                    if (upCell && upCell.textContent !== upText) upCell.textContent = upText;
+                    if (downCell && downCell.textContent !== downText) downCell.textContent = downText;
+                    if (spreadCell) {
+                        if (spreadCell.textContent !== spreadText) spreadCell.textContent = spreadText;
+                        spreadCell.style.color = spreadColor;
+                    }
+                    if (arbCell) {
+                        if (arbCell.textContent !== arbText) arbCell.textContent = arbText;
+                        arbCell.style.color = meetsArbCriteria ? 'var(--green)' : 'var(--dim-green)';
+                        arbCell.style.fontWeight = meetsArbCriteria ? 'bold' : 'normal';
+                    }
                 }
 
                 // Update row background (stable - won't flicker)
@@ -944,6 +988,7 @@ DASHBOARD_HTML = """
 
             if (data.logs) {
                 const terminal = document.getElementById('log-terminal');
+                // Prepend new logs at the top (newest first)
                 data.logs.forEach(log => {
                     const line = document.createElement('div');
                     line.className = 'log-line';
@@ -956,12 +1001,14 @@ DASHBOARD_HTML = """
                         '<span class="log-level ' + levelClass + '">[' + (log.level || 'INFO').toUpperCase() + ']</span>' +
                         '<span class="log-msg">' + log.message + '</span>' + extra;
 
-                    terminal.appendChild(line);
+                    // Insert at top so newest is always visible
+                    terminal.insertBefore(line, terminal.firstChild);
                 });
 
-                // Trim old entries to prevent memory issues
-                trimChildren(terminal, MAX_LOG_ENTRIES);
-                terminal.scrollTop = terminal.scrollHeight;
+                // Trim old entries from bottom to prevent memory issues
+                while (terminal.children.length > MAX_LOG_ENTRIES) {
+                    terminal.removeChild(terminal.lastChild);
+                }
                 document.getElementById('log-count').textContent = terminal.children.length;
             }
 
@@ -1042,72 +1089,7 @@ DASHBOARD_HTML = """
             }
 
             // Markets are now handled by updateMarketsOptimized() with debouncing
-
-            // Update decisions list
-            if (data.decisions) {
-                const decisionsList = document.getElementById('decisions-list');
-                let html = '';
-
-                if (data.decisions.length === 0) {
-                    html = '<div style="padding: 15px; text-align: center; color: var(--dim-green);">Waiting for market evaluation...</div>';
-                } else {
-                    // Limit decisions shown to prevent memory issues
-                    const decisionsToShow = data.decisions.slice(0, MAX_DECISION_ENTRIES);
-                    for (const d of decisionsToShow) {
-                        // Determine colors based on action
-                        let actionColor, actionBg, decisionText;
-                        if (d.action === 'YES' || d.action === 'TRADE') {
-                            actionColor = 'var(--green)';
-                            actionBg = 'rgba(0, 255, 65, 0.15)';
-                            decisionText = 'ARB: YES';
-                        } else if (d.action === 'NO' || d.action === 'SKIP') {
-                            actionColor = 'var(--red)';
-                            actionBg = 'rgba(255, 0, 64, 0.08)';
-                            decisionText = 'ARB: NO';
-                        } else if (d.action === 'REJECT') {
-                            // FOK order didn't fill - normal, not critical
-                            actionColor = 'var(--amber)';
-                            actionBg = 'rgba(255, 176, 0, 0.08)';
-                            decisionText = 'REJECTED';
-                        } else if (d.action === 'PARTIAL') {
-                            // CRITICAL: Partial fill - one leg filled, other didn't
-                            actionColor = '#ff0000';
-                            actionBg = 'rgba(255, 0, 0, 0.25)';
-                            decisionText = '⚠ PARTIAL FILL';
-                        } else if (d.action === 'DIR_YES') {
-                            actionColor = 'var(--cyan)';
-                            actionBg = 'rgba(0, 255, 255, 0.15)';
-                            decisionText = 'DIR: YES';
-                        } else if (d.action === 'DIR_NO') {
-                            actionColor = 'var(--amber)';
-                            actionBg = 'rgba(255, 176, 0, 0.08)';
-                            decisionText = 'DIR: NO';
-                        } else {
-                            actionColor = 'var(--amber)';
-                            actionBg = 'rgba(255, 176, 0, 0.08)';
-                            decisionText = d.action;
-                        }
-                        const spreadColor = d.spread >= 2.0 ? 'var(--green)' :
-                                           d.spread >= 0 ? 'var(--amber)' : 'var(--red)';
-
-                        html += `<div style="padding: 8px 12px; border-bottom: 1px solid var(--border); background: ${actionBg}; display: flex; justify-content: space-between; align-items: center;">`;
-                        html += `<div style="flex: 1;">`;
-                        html += `<span style="color: var(--dim-green); font-size: 0.75rem;">${utcToCst(d.timestamp)}</span> `;
-                        html += `<span style="color: var(--cyan); font-weight: bold;">${d.asset}</span> `;
-                        html += `<span style="color: ${actionColor}; font-weight: bold; font-size: 1.1rem;">[${decisionText}]</span> `;
-                        html += `<span style="color: var(--dim-green);">${d.reason}</span>`;
-                        html += `</div>`;
-                        html += `<div style="text-align: right; min-width: 200px;">`;
-                        html += `<span style="color: var(--dim-green);">Up:</span> <span>${d.up_price ? (d.up_price * 100).toFixed(1) + '¢' : 'N/A'}</span> `;
-                        html += `<span style="color: var(--dim-green);">Down:</span> <span>${d.down_price ? (d.down_price * 100).toFixed(1) + '¢' : 'N/A'}</span> `;
-                        html += `<span style="color: var(--dim-green);">Spread:</span> <span style="color: ${spreadColor}; font-weight: bold;">${d.spread.toFixed(1)}¢</span>`;
-                        html += `</div>`;
-                        html += `</div>`;
-                    }
-                }
-
-                decisionsList.innerHTML = html;
-            }
+            // Decisions removed - ARB status now shown in markets table
         }
 
         function updateTime() {
