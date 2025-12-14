@@ -591,7 +591,7 @@ DASHBOARD_HTML = """
                 </span>
             </div>
             <div class="panel-body" style="padding: 0;">
-                <div id="markets-list" style="max-height: 420px; overflow-y: auto;">
+                <div id="markets-list" style="max-height: 425px; overflow-y: auto;">
                     <div style="padding: 20px; text-align: center; color: var(--dim-green);">
                         Searching for markets...
                     </div>
@@ -1001,14 +1001,17 @@ DASHBOARD_HTML = """
                         '<span class="log-level ' + levelClass + '">[' + (log.level || 'INFO').toUpperCase() + ']</span>' +
                         '<span class="log-msg">' + log.message + '</span>' + extra;
 
-                    // Insert at top so newest is always visible
-                    terminal.insertBefore(line, terminal.firstChild);
+                    // Append at bottom so newest is at bottom
+                    terminal.appendChild(line);
                 });
 
-                // Trim old entries from bottom to prevent memory issues
+                // Trim old entries from top to prevent memory issues
                 while (terminal.children.length > MAX_LOG_ENTRIES) {
-                    terminal.removeChild(terminal.lastChild);
+                    terminal.removeChild(terminal.firstChild);
                 }
+
+                // Auto-scroll to bottom to show newest
+                terminal.scrollTop = terminal.scrollHeight;
                 document.getElementById('log-count').textContent = terminal.children.length;
             }
 
