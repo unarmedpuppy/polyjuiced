@@ -957,6 +957,77 @@ Failure → record_claim_attempt() → Tracks error, will retry next cycle
 - [x] Shrink container max-height from 430px to 180px (~4 rows)
 - [x] Handle case where all markets are filtered out
 
+### Phase 15: Trade Reconciliation & Observability ✅ COMPLETE (2025-12-15)
+- [x] Create `scripts/reconcile_trades.py` - standalone reconciliation script
+- [x] Fetches trades from Polymarket Data API (`https://data-api.polymarket.com/trades`)
+- [x] Compares with local DB (trades + settlement_queue tables)
+- [x] Identifies untracked positions (on Polymarket but not in local DB)
+- [x] `--fix` flag adds untracked positions to settlement queue
+- [x] `--json` flag for programmatic output
+- [x] `--days N` parameter to control lookback window
+
+**Reconciliation Script Usage:**
+```bash
+# Show discrepancies (read-only)
+python scripts/reconcile_trades.py
+
+# Fix by adding untracked positions to settlement queue
+python scripts/reconcile_trades.py --fix
+
+# Output as JSON
+python scripts/reconcile_trades.py --json
+
+# Check last 14 days
+python scripts/reconcile_trades.py --days 14
+```
+
+### Phase 16: Dashboard Observability Widgets ✅ COMPLETE (2025-12-15)
+- [x] Add Historical Positions panel showing settlement queue data
+- [x] Add `/dashboard/positions` endpoint returning settlement history
+- [x] Add `get_settlement_history()` method to persistence.py
+- [x] Add Reconciliation Status panel with:
+  - RECON status indicator in header (green/yellow/red)
+  - Untracked positions count and value
+  - Polymarket trades vs local tracked count
+  - Status message with color-coded warnings
+  - REFRESH button for manual reconciliation checks
+- [x] Add `/dashboard/reconciliation` endpoint that:
+  - Fetches trades from Polymarket Data API (async httpx)
+  - Compares with local trades and settlement queue
+  - Returns discrepancy summary as JSON
+
+**Dashboard Endpoints:**
+| Endpoint | Purpose |
+|----------|---------|
+| `/dashboard/positions` | Historical positions from settlement queue |
+| `/dashboard/reconciliation` | Real-time reconciliation status |
+| `/dashboard/state` | Full dashboard state (markets, stats, trades) |
+| `/dashboard/pnl-history` | P&L chart data |
+
+### Phase 17: Partial Fill Detection Fix ✅ COMPLETE (2025-12-15)
+- [x] Fixed `place_order_sync()` to catch exceptions and return error dict
+- [x] Previously: exceptions would bubble up, `asyncio.gather` would raise, outer handler returned `partial_fill=False`
+- [x] Now: exceptions caught, returns `{"status": "EXCEPTION", "error": ..., "size_matched": 0}`
+- [x] Allows parallel execution to detect when one leg fills and other fails
+- [x] Partial fills now properly recorded to database and settlement queue
+
+**Root Cause of Untracked Positions:**
+```
+BEFORE FIX:
+1. Bot sends YES order → FILLS ✅
+2. Bot sends NO order → EXCEPTION raised by py-clob-client
+3. asyncio.gather raises → outer try/except catches
+4. Returns success=False, partial_fill=False → NO database record
+5. BUT: YES order already executed on-chain!
+
+AFTER FIX:
+1. Bot sends YES order → FILLS ✅
+2. Bot sends NO order → Exception caught in place_order_sync()
+3. Returns {"status": "EXCEPTION", ...} instead of raising
+4. Parallel execution completes, detects partial fill
+5. Records partial fill to database AND settlement queue
+```
+
 ---
 
 ## Change Log
@@ -976,6 +1047,9 @@ Failure → record_claim_attempt() → Tracks error, will retry next cycle
 | 2025-12-14 | Claude | **Phase 12 COMPLETE**: Position persistence for auto-settlement. Added `settlement_queue` table. Positions survive bot restarts. `_track_position()` saves to DB, `_load_unclaimed_positions()` restores on startup, `_check_settlement()` queries DB for claimable positions. |
 | 2025-12-15 | Claude | **Server Restart Blackout Protection**: Added 5:00-5:29 AM CST blackout window to prevent trades during daily server restart at 5:15 AM. Background task updates `_in_blackout` flag every 60 seconds. Trading mode priority: BLACKOUT > CIRCUIT_BREAKER > DRY_RUN > LIVE. Purple "BLACKOUT" banner on dashboard. |
 | 2025-12-15 | Claude | **Dashboard Active Markets Filter**: Markets display now filtered to only show those within 15-minute window (≤900 seconds remaining). Shrunk container to 180px (fits ~4 rows). Improves focus on actionable markets. |
+| 2025-12-15 | Claude | **Phase 15 COMPLETE**: Trade reconciliation script (`scripts/reconcile_trades.py`). Fetches trades from Polymarket Data API, compares with local DB, identifies untracked positions. `--fix` flag adds to settlement queue. |
+| 2025-12-15 | Claude | **Phase 16 COMPLETE**: Dashboard observability widgets. Added Historical Positions panel, Reconciliation Status panel with RECON indicator, `/dashboard/positions` and `/dashboard/reconciliation` endpoints. |
+| 2025-12-15 | Claude | **Phase 17 COMPLETE**: Partial fill detection fix. `place_order_sync()` now catches exceptions and returns error dict instead of raising. Allows detection of partial fills when one leg fills and other throws exception. |
 
 ---
 
