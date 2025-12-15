@@ -312,6 +312,7 @@ class Database:
         Safe to run multiple times (idempotent).
         """
         # Phase 2 migration: Add execution tracking columns to trades table
+        # Multi-strategy migration: Add strategy_id column to trades table
         migrations = [
             ("trades", "yes_shares", "REAL"),
             ("trades", "no_shares", "REAL"),
@@ -323,6 +324,8 @@ class Database:
             ("trades", "no_liquidity_at_price", "REAL"),
             ("trades", "yes_book_depth_total", "REAL"),
             ("trades", "no_book_depth_total", "REAL"),
+            # Multi-strategy support (Dec 2025)
+            ("trades", "strategy_id", "TEXT DEFAULT 'gabagool'"),
         ]
 
         for table, column, col_type in migrations:
@@ -549,6 +552,74 @@ class Database:
         ) as cursor:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
+
+    async def record_trade(
+        self,
+        condition_id: str,
+        side: str,
+        shares: float,
+        price: float,
+        cost: float,
+        strategy_id: str = "gabagool",
+        asset: str = None,
+        trade_id: str = None,
+    ) -> str:
+        """Record a simple one-leg trade (used by Vol Happens and other strategies).
+
+        This is a simpler method than save_arbitrage_trade for single-leg trades.
+
+        Args:
+            condition_id: Market condition ID
+            side: "YES" or "NO"
+            shares: Number of shares
+            price: Price per share
+            cost: Total cost (shares * price)
+            strategy_id: Strategy identifier (e.g., "vol_happens", "gabagool")
+            asset: Asset symbol (optional)
+            trade_id: Custom trade ID (generated if not provided)
+
+        Returns:
+            trade_id: The trade ID used
+        """
+        import uuid
+
+        if trade_id is None:
+            trade_id = str(uuid.uuid4())
+
+        async with self._lock:
+            # Use appropriate column based on side
+            if side.upper() == "YES":
+                await self._conn.execute(
+                    """
+                    INSERT INTO trades (
+                        id, condition_id, asset, yes_price, no_price,
+                        yes_cost, no_cost, yes_shares, no_shares,
+                        spread, expected_profit, status, strategy_id
+                    ) VALUES (?, ?, ?, ?, 0, ?, 0, ?, 0, 0, 0, 'pending', ?)
+                    """,
+                    (trade_id, condition_id, asset, price, cost, shares, strategy_id),
+                )
+            else:
+                await self._conn.execute(
+                    """
+                    INSERT INTO trades (
+                        id, condition_id, asset, yes_price, no_price,
+                        yes_cost, no_cost, yes_shares, no_shares,
+                        spread, expected_profit, status, strategy_id
+                    ) VALUES (?, ?, ?, 0, ?, 0, ?, 0, ?, 0, 0, 'pending', ?)
+                    """,
+                    (trade_id, condition_id, asset, price, cost, shares, strategy_id),
+                )
+            await self._conn.commit()
+
+        log.debug(
+            "Recorded trade",
+            trade_id=trade_id[:8] + "...",
+            strategy=strategy_id,
+            side=side,
+            shares=shares,
+        )
+        return trade_id
 
     # ========== Market Operations ==========
 

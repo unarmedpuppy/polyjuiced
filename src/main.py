@@ -23,6 +23,7 @@ from .monitoring.market_finder import MarketFinder
 from .persistence import get_database, close_database, Database
 from .risk import CircuitBreaker, PositionSizer
 from .strategies.gabagool import GabagoolStrategy
+from .strategies.vol_happens import VolHappensStrategy
 
 # Configure stdlib logging level (required for structlog filter_by_level)
 logging.basicConfig(
@@ -75,6 +76,7 @@ class GabagoolBot:
         self._circuit_breaker: Optional[CircuitBreaker] = None
         self._position_sizer: Optional[PositionSizer] = None
         self._strategy: Optional[GabagoolStrategy] = None
+        self._vol_happens_strategy: Optional[VolHappensStrategy] = None
         self._metrics_server: Optional[MetricsServer] = None
         self._dashboard: Optional[DashboardServer] = None
         self._db: Optional[Database] = None
@@ -113,6 +115,11 @@ class GabagoolBot:
             dry_run=self.config.gabagool.dry_run,
             arbitrage_enabled=self.config.gabagool.enabled,
             directional_enabled=self.config.gabagool.directional_enabled,
+            # Per-strategy status for multi-strategy dashboard
+            gabagool_enabled=self.config.gabagool.enabled,
+            gabagool_dry_run=self.config.gabagool.dry_run,
+            vol_happens_enabled=self.config.vol_happens.enabled,
+            vol_happens_dry_run=self.config.vol_happens.dry_run,
         )
         add_log("info", "Dashboard started", url="http://localhost:8080/dashboard")
 
@@ -125,9 +132,22 @@ class GabagoolBot:
         # Log startup info
         self._log_startup_info()
 
-        # Start the strategy
+        # Start the strategies
         try:
-            await self._strategy.start()
+            # Start Gabagool (primary strategy)
+            gabagool_task = asyncio.create_task(self._strategy.start())
+
+            # Start Vol Happens (optional secondary strategy)
+            vol_happens_task = None
+            if self.config.vol_happens.enabled:
+                vol_happens_task = asyncio.create_task(self._vol_happens_strategy.start())
+                add_log("info", "Vol Happens strategy enabled")
+
+            # Wait for strategies (they run until stopped)
+            tasks = [gabagool_task]
+            if vol_happens_task:
+                tasks.append(vol_happens_task)
+            await asyncio.gather(*tasks)
         except Exception as e:
             log.error("Strategy crashed", error=str(e))
             raise
@@ -143,9 +163,12 @@ class GabagoolBot:
         self._running = False
         self._shutdown_event.set()
 
-        # Stop strategy
+        # Stop strategies
         if self._strategy:
             await self._strategy.stop()
+
+        if self._vol_happens_strategy:
+            await self._vol_happens_strategy.stop()
 
         # Stop liquidity collector
         if self._liquidity_collector:
@@ -242,6 +265,15 @@ class GabagoolBot:
             ws_client=self._ws_client,
             market_finder=self._market_finder,
             config=self.config,
+        )
+
+        # Create Vol Happens strategy (runs alongside Gabagool)
+        self._vol_happens_strategy = VolHappensStrategy(
+            client=self._client,
+            ws_client=self._ws_client,
+            market_finder=self._market_finder,
+            config=self.config,
+            db=self._db,
         )
 
         # Create liquidity collector for fill/depth data collection

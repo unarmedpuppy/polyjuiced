@@ -879,7 +879,8 @@ class ActivePositionManager:
                 token_id = position.market.no_token_id
                 side = "BUY"
 
-            # Execute order via FOK to ensure atomicity
+            # Execute order via GTC (FOK has decimal precision bugs in py-clob-client)
+            # Using aggressive limit price ensures fill while avoiding the FOK bug
             from py_clob_client.clob_types import OrderArgs, OrderType
 
             order_args = OrderArgs(
@@ -890,7 +891,7 @@ class ActivePositionManager:
             )
 
             signed_order = self._client._client.create_order(order_args)
-            result = self._client._client.post_order(signed_order, orderType=OrderType.FOK)
+            result = self._client._client.post_order(signed_order, orderType=OrderType.GTC)
 
             status = result.get("status", "").upper()
 
@@ -920,11 +921,11 @@ class ActivePositionManager:
                 )
 
             elif status == "LIVE":
-                # Order placed but not immediately filled - for FOK this shouldn't happen
+                # Order placed but not immediately filled - GTC order is on the book
                 trade.status = "PARTIAL"
-                trade.error = "Order went LIVE (expected FOK to fill immediately)"
+                trade.error = "Order went LIVE (GTC order on book, may fill later)"
                 log.warning(
-                    "Rebalance order went LIVE instead of filling",
+                    "Rebalance order went LIVE instead of filling immediately",
                     trade_id=position.trade_id,
                     order_id=result.get("id"),
                 )

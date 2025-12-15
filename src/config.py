@@ -86,9 +86,9 @@ class GabagoolConfig:
 
     # Phase 2 Strategy (Dec 15, 2025): Gradual position building
     # Split trades into multiple tranches to reduce market impact and get better fills
+    # NOTE: Tranches execute back-to-back with NO delays (removed - delays let spread escape)
     gradual_entry_enabled: bool = False  # Disabled by default - single entry
     gradual_entry_tranches: int = 3  # Number of tranches (e.g., 3 means 3 smaller orders)
-    gradual_entry_delay_seconds: float = 30.0  # Delay between tranches
     gradual_entry_min_spread_cents: float = 3.0  # Only use gradual for spreads >= 3 cents
 
     # Phase 3: Better order execution (Dec 13, 2025)
@@ -150,10 +150,9 @@ class GabagoolConfig:
             max_position_imbalance_shares=float(os.getenv("GABAGOOL_MAX_POSITION_IMBALANCE", "5.0")),
             order_timeout_seconds=float(os.getenv("GABAGOOL_ORDER_TIMEOUT", "10.0")),
             ws_reconnect_delay_seconds=float(os.getenv("GABAGOOL_WS_RECONNECT_DELAY", "1.0")),
-            # Phase 2: Gradual position building
+            # Phase 2: Gradual position building (no delays - back-to-back execution)
             gradual_entry_enabled=os.getenv("GABAGOOL_GRADUAL_ENTRY_ENABLED", "false").lower() == "true",
             gradual_entry_tranches=int(os.getenv("GABAGOOL_GRADUAL_ENTRY_TRANCHES", "3")),
-            gradual_entry_delay_seconds=float(os.getenv("GABAGOOL_GRADUAL_ENTRY_DELAY", "30.0")),
             gradual_entry_min_spread_cents=float(os.getenv("GABAGOOL_GRADUAL_ENTRY_MIN_SPREAD", "3.0")),
             # Phase 3: Better order execution
             parallel_execution_enabled=os.getenv("GABAGOOL_PARALLEL_EXECUTION", "true").lower() == "true",
@@ -211,12 +210,72 @@ class CopyTradingConfig:
 
 
 @dataclass
+class VolHappensConfig:
+    """Vol Happens strategy configuration.
+
+    A volatility/mean-reversion strategy that builds hedged positions over time.
+
+    Entry Logic:
+    1. Wait for one side to hit entry_price_threshold ($0.48)
+    2. Trend filter: other side must be <= trend_filter_threshold ($0.52)
+    3. Place first leg limit order at entry_price_threshold
+    4. Wait for other side to also hit entry_price_threshold
+    5. Complete hedge with equal shares (not dollars)
+
+    Exit Logic:
+    - If unhedged when exit_time_remaining_seconds left, hard exit at market
+    - Hedged positions settle at resolution (guaranteed $1 payout for YES+NO)
+    """
+
+    # Strategy enable/disable
+    enabled: bool = False
+    markets: List[str] = field(default_factory=lambda: ["BTC", "ETH", "SOL"])
+
+    # Entry thresholds
+    entry_price_threshold: float = 0.48  # Buy side when price <= this
+    trend_filter_threshold: float = 0.52  # Other side must be <= this (ensures spread exists)
+
+    # Position sizing
+    first_leg_size_usd: float = 2.00  # First leg order size
+    max_position_usd: float = 5.00  # Total max position per market
+
+    # Timing
+    min_time_to_enter_seconds: float = 300.0  # Don't enter with < 5 min remaining
+    exit_time_remaining_seconds: float = 210.0  # Hard exit unhedged at 3:30 remaining
+
+    # Risk
+    max_positions: int = 3  # Max concurrent positions (one per market)
+    max_daily_loss_usd: float = 10.0  # Daily loss circuit breaker
+
+    # Mode
+    dry_run: bool = True  # Start in dry run mode
+
+    @classmethod
+    def from_env(cls) -> "VolHappensConfig":
+        """Load configuration from environment variables."""
+        return cls(
+            enabled=os.getenv("VOL_HAPPENS_ENABLED", "false").lower() == "true",
+            markets=os.getenv("VOL_HAPPENS_MARKETS", "BTC,ETH,SOL").split(","),
+            entry_price_threshold=float(os.getenv("VOL_HAPPENS_ENTRY_PRICE", "0.48")),
+            trend_filter_threshold=float(os.getenv("VOL_HAPPENS_TREND_FILTER", "0.52")),
+            first_leg_size_usd=float(os.getenv("VOL_HAPPENS_FIRST_LEG_SIZE", "2.00")),
+            max_position_usd=float(os.getenv("VOL_HAPPENS_MAX_POSITION", "5.00")),
+            min_time_to_enter_seconds=float(os.getenv("VOL_HAPPENS_MIN_TIME_TO_ENTER", "300.0")),
+            exit_time_remaining_seconds=float(os.getenv("VOL_HAPPENS_EXIT_TIME", "210.0")),
+            max_positions=int(os.getenv("VOL_HAPPENS_MAX_POSITIONS", "3")),
+            max_daily_loss_usd=float(os.getenv("VOL_HAPPENS_MAX_DAILY_LOSS", "10.0")),
+            dry_run=os.getenv("VOL_HAPPENS_DRY_RUN", "true").lower() == "true",
+        )
+
+
+@dataclass
 class AppConfig:
     """Main application configuration."""
 
     polymarket: PolymarketSettings
     gabagool: GabagoolConfig
     copy_trading: CopyTradingConfig
+    vol_happens: VolHappensConfig
 
     @classmethod
     def load(cls) -> "AppConfig":
@@ -228,6 +287,7 @@ class AppConfig:
             polymarket=PolymarketSettings(),
             gabagool=GabagoolConfig.from_env(),
             copy_trading=CopyTradingConfig.from_env(),
+            vol_happens=VolHappensConfig.from_env(),
         )
 
 

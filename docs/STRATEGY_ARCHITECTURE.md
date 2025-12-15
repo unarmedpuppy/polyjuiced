@@ -1030,14 +1030,15 @@ GABAGOOL_MAX_SLIPPAGE=0.0     # Already in production (zero slippage)
 ### Phase 19: Gradual Position Building ✅ COMPLETE (2025-12-15)
 - [x] Added `gradual_entry_enabled` config (default: false)
 - [x] Added `gradual_entry_tranches` config (default: 3)
-- [x] Added `gradual_entry_delay_seconds` config (default: 30.0)
 - [x] Added `gradual_entry_min_spread_cents` config (default: 3.0)
 - [x] Implemented `_execute_gradual_entry()` method in GabagoolStrategy
-- [x] Split trades into multiple tranches with configurable delays
+- [x] Split trades into multiple tranches (back-to-back, NO delays)
 - [x] Fallback to single entry when tranche size < min_trade_size
 - [x] Safety checks: market tradeable, trading enabled before each tranche
 - [x] Aggregated result tracking across all tranches
 - [x] Regression tests in `tests/test_phase2_gradual_entry.py`
+
+**Note:** Delays between tranches were intentionally removed - they let the spread escape.
 
 **How Gradual Entry Works:**
 ```

@@ -50,6 +50,11 @@ stats: Dict[str, Any] = {
     "arbitrage_enabled": True,
     "directional_enabled": False,
     "near_resolution_enabled": True,
+    # Per-strategy dry run status (multi-strategy support)
+    "gabagool_enabled": True,
+    "gabagool_dry_run": True,
+    "vol_happens_enabled": False,
+    "vol_happens_dry_run": True,
     # Execution metrics (Phase 8 observability)
     "avg_execution_latency_ms": 0.0,
     "avg_fill_latency_ms": 0.0,
@@ -279,6 +284,66 @@ DASHBOARD_HTML = """
             font-weight: bold;
             color: var(--cyan);
             font-size: 1rem;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        /* Trade strategy/mode badges */
+        .trade-badge {
+            font-family: 'VT323', monospace;
+            font-size: 0.7rem;
+            padding: 2px 5px;
+            border-radius: 2px;
+            font-weight: bold;
+            text-transform: uppercase;
+        }
+
+        .badge-gab {
+            color: var(--cyan);
+            background: rgba(170, 170, 170, 0.15);
+            border: 1px solid var(--cyan);
+        }
+
+        .badge-vol {
+            color: #9966ff;
+            background: rgba(153, 102, 255, 0.15);
+            border: 1px solid #9966ff;
+        }
+
+        .badge-live {
+            color: var(--status-active);
+            background: rgba(0, 255, 0, 0.15);
+            border: 1px solid var(--status-active);
+        }
+
+        .badge-paper {
+            color: var(--amber);
+            background: rgba(255, 176, 0, 0.15);
+            border: 1px solid var(--amber);
+        }
+
+        /* Trade filter buttons */
+        .filter-btn {
+            font-family: 'VT323', monospace;
+            font-size: 0.75rem;
+            padding: 3px 8px;
+            background: var(--dark-green);
+            border: 1px solid var(--border);
+            color: var(--dim-green);
+            cursor: pointer;
+            transition: all 0.15s ease;
+        }
+
+        .filter-btn:hover {
+            border-color: var(--green);
+            color: var(--green);
+        }
+
+        .filter-btn.active {
+            background: rgba(0, 255, 65, 0.15);
+            border-color: var(--green);
+            color: var(--green);
         }
 
         .trade-details {
@@ -651,18 +716,14 @@ DASHBOARD_HTML = """
                     <span style="color: var(--cyan); font-family: 'VT323', monospace; font-size: 1.2rem;">$<span id="wallet-balance">0.00</span></span>
                     <span>WALLET</span>
                 </div>
-                <!-- Strategy Status Indicators -->
+                <!-- Strategy Status Indicators (per-strategy with mode) -->
                 <div class="status-item" style="margin-left: 20px; padding-left: 20px; border-left: 1px solid var(--border);">
-                    <div id="arb-status" class="status-dot"></div>
-                    <span>ARBITRAGE</span>
+                    <div id="gabagool-status" class="status-dot"></div>
+                    <span>GABAGOOL <span id="gabagool-mode" style="font-size: 0.7rem;"></span></span>
                 </div>
                 <div class="status-item">
-                    <div id="dir-status" class="status-dot error"></div>
-                    <span>DIRECTIONAL</span>
-                </div>
-                <div class="status-item">
-                    <div id="nr-status" class="status-dot"></div>
-                    <span>NEAR-RES</span>
+                    <div id="vol-happens-status" class="status-dot error"></div>
+                    <span>VOL_HAPPENS <span id="vol-happens-mode" style="font-size: 0.7rem;"></span></span>
                 </div>
                 <!-- Reconciliation Status -->
                 <div class="status-item" style="margin-left: 20px; padding-left: 20px; border-left: 1px solid var(--border);">
@@ -851,6 +912,15 @@ DASHBOARD_HTML = """
                     <span style="color: var(--dim-green); font-size: 0.8rem;">
                         <span id="trade-count">0</span> trades
                     </span>
+                </div>
+                <!-- Trade Filter Buttons -->
+                <div class="trade-filters" style="padding: 8px 12px; border-bottom: 1px solid var(--border); display: flex; gap: 6px; flex-wrap: wrap;">
+                    <button class="filter-btn active" data-filter="all" onclick="filterTrades('all')">ALL</button>
+                    <button class="filter-btn" data-filter="live" onclick="filterTrades('live')">LIVE</button>
+                    <button class="filter-btn" data-filter="paper" onclick="filterTrades('paper')">PAPER</button>
+                    <span style="border-left: 1px solid var(--border); margin: 0 4px;"></span>
+                    <button class="filter-btn" data-filter="gabagool" onclick="filterTrades('gabagool')">GAB</button>
+                    <button class="filter-btn" data-filter="vol_happens" onclick="filterTrades('vol_happens')">VOL</button>
                 </div>
                 <div class="panel-body" style="padding: 0;">
                     <div id="trade-list" class="trade-list">
@@ -1244,10 +1314,45 @@ DASHBOARD_HTML = """
                     updateText('wallet-balance', s.wallet_balance.toFixed(2));
                 }
 
-                // Update strategy status indicators
-                updateClass(document.getElementById('arb-status'), 'status-dot ' + (s.arbitrage_enabled ? '' : 'error'));
-                updateClass(document.getElementById('dir-status'), 'status-dot ' + (s.directional_enabled ? '' : 'error'));
-                updateClass(document.getElementById('nr-status'), 'status-dot ' + (s.near_resolution_enabled ? '' : 'error'));
+                // Update strategy status indicators (per-strategy with mode display)
+                const gabagoolStatus = document.getElementById('gabagool-status');
+                const gabagoolMode = document.getElementById('gabagool-mode');
+                const volHappensStatus = document.getElementById('vol-happens-status');
+                const volHappensMode = document.getElementById('vol-happens-mode');
+
+                // Gabagool: green if enabled+live, amber if enabled+dry_run, red if disabled
+                if (s.gabagool_enabled !== false) {
+                    if (s.gabagool_dry_run) {
+                        updateClass(gabagoolStatus, 'status-dot warning');
+                        if (gabagoolMode) gabagoolMode.textContent = '[PAPER]';
+                        if (gabagoolMode) gabagoolMode.style.color = 'var(--amber)';
+                    } else {
+                        updateClass(gabagoolStatus, 'status-dot');
+                        if (gabagoolMode) gabagoolMode.textContent = '[LIVE]';
+                        if (gabagoolMode) gabagoolMode.style.color = 'var(--status-active)';
+                    }
+                } else {
+                    updateClass(gabagoolStatus, 'status-dot error');
+                    if (gabagoolMode) gabagoolMode.textContent = '[OFF]';
+                    if (gabagoolMode) gabagoolMode.style.color = 'var(--red)';
+                }
+
+                // Vol Happens: green if enabled+live, amber if enabled+dry_run, red if disabled
+                if (s.vol_happens_enabled) {
+                    if (s.vol_happens_dry_run) {
+                        updateClass(volHappensStatus, 'status-dot warning');
+                        if (volHappensMode) volHappensMode.textContent = '[PAPER]';
+                        if (volHappensMode) volHappensMode.style.color = 'var(--amber)';
+                    } else {
+                        updateClass(volHappensStatus, 'status-dot');
+                        if (volHappensMode) volHappensMode.textContent = '[LIVE]';
+                        if (volHappensMode) volHappensMode.style.color = 'var(--status-active)';
+                    }
+                } else {
+                    updateClass(volHappensStatus, 'status-dot error');
+                    if (volHappensMode) volHappensMode.textContent = '[OFF]';
+                    if (volHappensMode) volHappensMode.style.color = 'var(--red)';
+                }
 
                 // Show appropriate banner based on trading mode
                 const dryRunBanner = document.getElementById('dry-run-banner');
@@ -1341,6 +1446,12 @@ DASHBOARD_HTML = """
                     item.className = 'trade-item ' + status;
                     item.id = 'trade-' + trade.id;
 
+                    // Store strategy/mode as data attributes for filtering
+                    const strategyId = trade.strategy_id || 'gabagool';
+                    const isDryRun = trade.dry_run || trade.trading_mode === 'DRY_RUN';
+                    item.dataset.strategy = strategyId;
+                    item.dataset.mode = isDryRun ? 'paper' : 'live';
+
                     const profitClass = (trade.actual_profit || trade.expected_profit) >= 0 ? 'positive' : 'negative';
                     const profitValue = trade.actual_profit !== null ? trade.actual_profit : trade.expected_profit;
                     const profitLabel = trade.actual_profit !== null ? '' : '(est)';
@@ -1420,10 +1531,22 @@ DASHBOARD_HTML = """
                         </div>
                     ` : '';
 
+                    // Strategy and mode badges
+                    const strategyId = trade.strategy_id || 'gabagool';
+                    const strategyLabel = strategyId === 'vol_happens' ? 'VOL' : 'GAB';
+                    const isDryRun = trade.dry_run || trade.trading_mode === 'DRY_RUN';
+                    const modeLabel = isDryRun ? 'PAPER' : 'LIVE';
+                    const modeBadgeClass = isDryRun ? 'badge-paper' : 'badge-live';
+                    const strategyBadgeClass = strategyId === 'vol_happens' ? 'badge-vol' : 'badge-gab';
+
                     item.innerHTML = `
                         <div class="trade-time">${utcToCst(trade.time)}<br>${utcToCst(trade.market_time) || ''}</div>
                         <div class="trade-info" style="grid-column: span 2;">
-                            <div class="trade-asset">${tradeAssetDisplay}</div>
+                            <div class="trade-asset">
+                                <span class="trade-badge ${strategyBadgeClass}">${strategyLabel}</span>
+                                <span class="trade-badge ${modeBadgeClass}">${modeLabel}</span>
+                                ${tradeAssetDisplay}
+                            </div>
                             <div class="trade-details">
                                 YES: $${trade.yes_cost.toFixed(2)} @ ${(trade.yes_price * 100).toFixed(1)}¢ (${yesStatus}) |
                                 NO: $${trade.no_cost.toFixed(2)} @ ${(trade.no_price * 100).toFixed(1)}¢ (${noStatus}) |
@@ -1445,7 +1568,9 @@ DASHBOARD_HTML = """
 
                 // Trim old entries to prevent memory issues
                 trimChildren(tradeList, MAX_TRADE_ENTRIES);
-                document.getElementById('trade-count').textContent = tradeList.children.length;
+
+                // Apply current filter to newly added trades
+                applyCurrentFilter();
             }
 
             // Update existing trade status
@@ -1527,6 +1652,61 @@ DASHBOARD_HTML = """
             }
         }
         setInterval(updateTimeSinceTrade, 1000);
+
+        // ========== Trade Filtering ==========
+        let currentFilter = 'all';
+
+        function filterTrades(filter) {
+            currentFilter = filter;
+
+            // Update active button
+            document.querySelectorAll('.filter-btn').forEach(btn => {
+                btn.classList.toggle('active', btn.dataset.filter === filter);
+            });
+
+            // Filter trade items using data attributes
+            const tradeList = document.getElementById('trade-list');
+            const items = tradeList.querySelectorAll('.trade-item');
+
+            items.forEach(item => {
+                const strategy = item.dataset.strategy || 'gabagool';
+                const mode = item.dataset.mode || 'live';
+
+                let show = false;
+                switch (filter) {
+                    case 'all':
+                        show = true;
+                        break;
+                    case 'live':
+                        show = mode === 'live';
+                        break;
+                    case 'paper':
+                        show = mode === 'paper';
+                        break;
+                    case 'gabagool':
+                        show = strategy === 'gabagool';
+                        break;
+                    case 'vol_happens':
+                        show = strategy === 'vol_happens';
+                        break;
+                }
+
+                item.style.display = show ? '' : 'none';
+            });
+
+            // Update visible count
+            const visibleCount = Array.from(items).filter(i => i.style.display !== 'none').length;
+            const totalCount = items.length;
+            document.getElementById('trade-count').textContent =
+                filter === 'all' ? totalCount : `${visibleCount}/${totalCount}`;
+        }
+
+        // Apply current filter when new trades are added
+        function applyCurrentFilter() {
+            if (currentFilter !== 'all') {
+                filterTrades(currentFilter);
+            }
+        }
 
         // ========== P&L Chart ==========
         let currentTimeframe = '24h';
@@ -2242,6 +2422,8 @@ async def init_persistence(db: "Database") -> None:
                 "actual_profit": trade.get("actual_profit"),
                 "status": trade.get("status", "pending"),
                 "dry_run": trade.get("dry_run", False),
+                # Multi-strategy support
+                "strategy_id": trade.get("strategy_id", "gabagool"),
                 # Phase 8: Enhanced execution details
                 "yes_shares": trade.get("yes_shares"),
                 "no_shares": trade.get("no_shares"),
@@ -2451,6 +2633,7 @@ def add_trade(
     condition_id: str = None,
     dry_run: bool = False,
     trading_mode: str = None,
+    strategy_id: str = "gabagool",
 ) -> str:
     """Add a new trade to dashboard display.
 
@@ -2472,6 +2655,7 @@ def add_trade(
         condition_id: Market condition ID (unused - kept for backward compat)
         dry_run: Whether this is a dry run trade
         trading_mode: Trading mode ('LIVE', 'DRY_RUN', or 'CIRCUIT_BREAKER')
+        strategy_id: Strategy that created this trade ('gabagool' or 'vol_happens')
 
     Returns:
         Trade ID for later updates
@@ -2500,6 +2684,7 @@ def add_trade(
         "dry_run": dry_run,
         "trading_mode": trading_mode,
         "market_slug": market_slug,
+        "strategy_id": strategy_id,
     }
 
     trade_history.append(trade)
