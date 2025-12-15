@@ -205,9 +205,22 @@ def add_to_settlement_queue(
     cursor = conn.cursor()
     added = 0
 
+    # Use a past timestamp for reconciled trades (they're already resolved or should be monitored)
+    # We set market_end_time to the most recent trade timestamp
+    default_end_time = datetime.now().isoformat()
+
     for pos in positions:
         cid = pos["condition_id"]
         market_data = polymarket_markets.get(cid, {})
+
+        # Get the most recent trade timestamp for this market
+        all_trades = market_data.get("up_trades", []) + market_data.get("down_trades", [])
+        if all_trades:
+            latest_ts = max(t.get("timestamp", 0) for t in all_trades)
+            # Market end time is typically shortly after last trade for 15-min markets
+            market_end_time = datetime.fromtimestamp(latest_ts).isoformat()
+        else:
+            market_end_time = default_end_time
 
         # Add UP position if exists
         if pos["up_shares"] > 0:
@@ -227,10 +240,10 @@ def add_to_settlement_queue(
                         pos["up_shares"],
                         pos["up_cost"] / pos["up_shares"] if pos["up_shares"] > 0 else 0,
                         pos["up_cost"],
-                        "UP",
+                        "YES",  # Use YES/NO to match schema comment
                         "RECONCILED",
                         f"reconcile_{cid[:8]}_up",
-                        None,  # We don't know the end time
+                        market_end_time,
                     ))
                     if cursor.rowcount > 0:
                         added += 1
@@ -254,10 +267,10 @@ def add_to_settlement_queue(
                         pos["down_shares"],
                         pos["down_cost"] / pos["down_shares"] if pos["down_shares"] > 0 else 0,
                         pos["down_cost"],
-                        "DOWN",
+                        "NO",  # Use YES/NO to match schema comment
                         "RECONCILED",
                         f"reconcile_{cid[:8]}_down",
-                        None,
+                        market_end_time,
                     ))
                     if cursor.rowcount > 0:
                         added += 1
