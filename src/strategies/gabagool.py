@@ -34,6 +34,7 @@ from ..metrics import (
     OPPORTUNITIES_DETECTED,
     OPPORTUNITIES_EXECUTED,
     OPPORTUNITIES_SKIPPED,
+    ORDER_REJECTED_TOTAL,
     SPREAD_CENTS,
     TRADE_AMOUNT_USD,
     TRADE_ERRORS_TOTAL,
@@ -849,6 +850,29 @@ class GabagoolStrategy(BaseStrategy):
             no_price=opportunity.no_price,
         )
 
+        # Pre-trade liquidity check - adjust sizes if necessary
+        yes_amount, no_amount = await self._adjust_for_liquidity(
+            opportunity=opportunity,
+            yes_amount=yes_amount,
+            no_amount=no_amount,
+        )
+
+        # Skip if liquidity check zeroed out the trade
+        if yes_amount <= 0 or no_amount <= 0:
+            add_decision(
+                asset=opportunity.market.asset,
+                action="SKIP",
+                reason="Insufficient liquidity for minimum trade size",
+                up_price=opportunity.yes_price,
+                down_price=opportunity.no_price,
+                spread=opportunity.spread_cents,
+            )
+            OPPORTUNITIES_SKIPPED.labels(
+                market=opportunity.market.asset,
+                reason="insufficient_liquidity",
+            ).inc()
+            return None
+
         # Check exposure limits (0 = unlimited)
         total_cost = yes_amount + no_amount
         if self.gabagool_config.max_daily_exposure_usd > 0:
@@ -1067,6 +1091,125 @@ class GabagoolStrategy(BaseStrategy):
             yes_amount *= scale
             no_amount *= scale
 
+        return (yes_amount, no_amount)
+
+    async def _adjust_for_liquidity(
+        self,
+        opportunity: ArbitrageOpportunity,
+        yes_amount: float,
+        no_amount: float,
+    ) -> tuple:
+        """Adjust trade sizes based on available order book liquidity.
+
+        Queries current order book depth and scales down trade size if
+        there isn't enough liquidity to fill our FOK order.
+
+        Args:
+            opportunity: The arbitrage opportunity
+            yes_amount: Intended USD for YES side
+            no_amount: Intended USD for NO side
+
+        Returns:
+            Tuple of (adjusted_yes_amount, adjusted_no_amount)
+        """
+        market = opportunity.market
+
+        # Get current order book for both sides
+        try:
+            yes_book = self.client.get_order_book(market.yes_token_id)
+            no_book = self.client.get_order_book(market.no_token_id)
+        except Exception as e:
+            log.warning(
+                "Failed to get order book for liquidity check, using original sizes",
+                asset=market.asset,
+                error=str(e),
+            )
+            return (yes_amount, no_amount)
+
+        # Calculate intended share sizes
+        yes_shares = yes_amount / opportunity.yes_price if opportunity.yes_price > 0 else 0
+        no_shares = no_amount / opportunity.no_price if opportunity.no_price > 0 else 0
+
+        # Get available liquidity at our price levels
+        # For BUY orders, we look at ASK side (what's being sold)
+        yes_asks = yes_book.get("asks", [])
+        no_asks = no_book.get("asks", [])
+
+        # Calculate depth at or below our target price
+        yes_available = 0.0
+        for ask in yes_asks:
+            price = float(ask.get("price", 0) if isinstance(ask, dict) else getattr(ask, "price", 0))
+            size = float(ask.get("size", 0) if isinstance(ask, dict) else getattr(ask, "size", 0))
+            if price <= opportunity.yes_price:
+                yes_available += size
+
+        no_available = 0.0
+        for ask in no_asks:
+            price = float(ask.get("price", 0) if isinstance(ask, dict) else getattr(ask, "price", 0))
+            size = float(ask.get("size", 0) if isinstance(ask, dict) else getattr(ask, "size", 0))
+            if price <= opportunity.no_price:
+                no_available += size
+
+        # Use max_liquidity_consumption_pct to avoid taking all available liquidity
+        max_consumption = self.gabagool_config.max_liquidity_consumption_pct
+        yes_fillable = yes_available * max_consumption
+        no_fillable = no_available * max_consumption
+
+        # Check if we need to scale down
+        yes_scale = 1.0 if yes_shares <= yes_fillable else (yes_fillable / yes_shares if yes_shares > 0 else 0)
+        no_scale = 1.0 if no_shares <= no_fillable else (no_fillable / no_shares if no_shares > 0 else 0)
+
+        # Use the more restrictive scale (we need BOTH sides to fill)
+        scale = min(yes_scale, no_scale)
+
+        if scale < 1.0:
+            adjusted_yes = yes_amount * scale
+            adjusted_no = no_amount * scale
+
+            # Check minimum trade size (don't bother with tiny trades)
+            min_trade = 1.0  # $1 minimum per side
+            if adjusted_yes < min_trade or adjusted_no < min_trade:
+                log.info(
+                    "Liquidity too low for minimum trade size",
+                    asset=market.asset,
+                    yes_available=f"{yes_available:.1f} shares",
+                    no_available=f"{no_available:.1f} shares",
+                    intended_yes=f"${yes_amount:.2f}",
+                    intended_no=f"${no_amount:.2f}",
+                    adjusted_yes=f"${adjusted_yes:.2f}",
+                    adjusted_no=f"${adjusted_no:.2f}",
+                )
+                return (0.0, 0.0)
+
+            log.info(
+                "Scaled trade size based on liquidity",
+                asset=market.asset,
+                scale=f"{scale:.1%}",
+                yes_available=f"{yes_available:.1f} shares",
+                no_available=f"{no_available:.1f} shares",
+                original_yes=f"${yes_amount:.2f}",
+                original_no=f"${no_amount:.2f}",
+                adjusted_yes=f"${adjusted_yes:.2f}",
+                adjusted_no=f"${adjusted_no:.2f}",
+            )
+            add_log(
+                "info",
+                f"Scaled trade {market.asset} to {scale:.0%} for liquidity",
+                yes_liq=f"{yes_available:.0f}",
+                no_liq=f"{no_available:.0f}",
+            )
+
+            return (adjusted_yes, adjusted_no)
+
+        # Sufficient liquidity - use original sizes
+        log.debug(
+            "Liquidity check passed",
+            asset=market.asset,
+            yes_available=f"{yes_available:.1f}",
+            no_available=f"{no_available:.1f}",
+            yes_needed=f"{yes_shares:.1f}",
+            no_needed=f"{no_shares:.1f}",
+        )
         return (yes_amount, no_amount)
 
     async def _execute_trade(
@@ -1304,15 +1447,46 @@ class GabagoolStrategy(BaseStrategy):
                         pre_fill_no_depth=api_result.get("pre_fill_no_depth"),
                     )
                 else:
-                    # Normal rejection (FOK didn't fill) - this is fine
+                    # Normal rejection (FOK didn't fill) - log details for analysis
+                    # Extract liquidity info if available
+                    pre_yes_depth = api_result.get("pre_fill_yes_depth", "N/A")
+                    pre_no_depth = api_result.get("pre_fill_no_depth", "N/A")
+
+                    log.warning(
+                        "FOK order rejected - insufficient liquidity",
+                        asset=market.asset,
+                        intended_yes_shares=f"{yes_shares:.2f}",
+                        intended_no_shares=f"{no_shares:.2f}",
+                        intended_yes_usd=f"${yes_amount:.2f}",
+                        intended_no_usd=f"${no_amount:.2f}",
+                        yes_price=f"${opportunity.yes_price:.4f}",
+                        no_price=f"${opportunity.no_price:.4f}",
+                        pre_fill_yes_depth=pre_yes_depth,
+                        pre_fill_no_depth=pre_no_depth,
+                        error=error_msg,
+                    )
+                    add_log(
+                        "warning",
+                        f"FOK rejected: {market.asset} - liquidity insufficient",
+                        intended=f"${total_cost:.2f}",
+                        yes_depth=pre_yes_depth,
+                        no_depth=pre_no_depth,
+                    )
                     add_decision(
                         asset=market.asset,
                         action="REJECT",
-                        reason=f"Order rejected: {error_msg}",
+                        reason=f"FOK rejected: insufficient liquidity",
                         up_price=opportunity.yes_price,
                         down_price=opportunity.no_price,
                         spread=opportunity.spread_cents,
                     )
+
+                    # Record rejection metric
+                    ORDER_REJECTED_TOTAL.labels(
+                        market=market.asset,
+                        side="DUAL",
+                        reason="fok_insufficient_liquidity",
+                    ).inc()
 
                 return TradeResult(
                     market=market,
