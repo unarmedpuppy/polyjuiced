@@ -115,25 +115,11 @@ DASHBOARD_HTML = """
 
         .ring-art {
             font-family: 'Courier New', monospace;
-            font-size: 9px;
-            line-height: 1.0;
+            font-size: 11px;
+            line-height: 1.15;
             white-space: pre;
             color: var(--green);
-            text-shadow: 0 0 3px var(--green);
-            position: relative;
-            width: 120px;
-            height: 70px;
-        }
-
-        .ring-frame {
-            position: absolute;
-            top: 0;
-            left: 0;
-            opacity: 0;
-        }
-
-        .ring-frame.active {
-            opacity: 1;
+            text-shadow: 0 0 4px var(--green);
         }
 
         .header-text {
@@ -514,142 +500,28 @@ DASHBOARD_HTML = """
 
     <div class="container">
         <header class="header">
-            <div class="ring-art" id="ring-left">
-<div class="ring-frame active" data-frame="0">
-    ╭───────╮
-   ╱         ╲
-  │           │
-  │     ◯     │
-  │           │
-   ╲         ╱
-    ╰───────╯</div>
-<div class="ring-frame" data-frame="1">
-    ╭──────╮
-   ╱        ╲
-  ╱          ╲
- │      ◯     │
-  ╲          ╱
-   ╲        ╱
-    ╰──────╯</div>
-<div class="ring-frame" data-frame="2">
-   ╭─────╮
-  ╱       ╲
- ╱         ╲
-│     ◯     │
- ╲         ╱
-  ╲       ╱
-   ╰─────╯</div>
-<div class="ring-frame" data-frame="3">
-  ╭────╮
- ╱      ╲
-╱        ╲
-│    ◯    │
-╲        ╱
- ╲      ╱
-  ╰────╯</div>
-<div class="ring-frame" data-frame="4">
-   ╭───╮
-  ╱     ╲
- ╱       ╲
-│    ◯    │
- ╲       ╱
-  ╲     ╱
-   ╰───╯</div>
-<div class="ring-frame" data-frame="5">
-  ╭────╮
- ╱      ╲
-╱        ╲
-│    ◯    │
-╲        ╱
- ╲      ╱
-  ╰────╯</div>
-<div class="ring-frame" data-frame="6">
-   ╭─────╮
-  ╱       ╲
- ╱         ╲
-│     ◯     │
- ╲         ╱
-  ╲       ╱
-   ╰─────╯</div>
-<div class="ring-frame" data-frame="7">
-    ╭──────╮
-   ╱        ╲
-  ╱          ╲
- │      ◯     │
-  ╲          ╱
-   ╲        ╱
-    ╰──────╯</div>
-            </div>
+            <div class="ring-art">     ▄▄████▄▄
+   ▄██▀▀▀▀▀▀██▄
+  ██▀  ▄██▄  ▀██
+ ██   ██▀▀██   ██
+ ██   ██  ██   ██
+ ██   ██▄▄██   ██
+  ██▄  ▀██▀  ▄██
+   ▀██▄▄▄▄▄▄██▀
+     ▀▀████▀▀</div>
             <div class="header-text">
                 <h1>TURN 1 SOL RING</h1>
                 <div class="subtitle">POLYMARKET ARBITRAGE BOT v0.1.0</div>
             </div>
-            <div class="ring-art" id="ring-right">
-<div class="ring-frame active" data-frame="0">
-    ╭───────╮
-   ╱         ╲
-  │           │
-  │     ◯     │
-  │           │
-   ╲         ╱
-    ╰───────╯</div>
-<div class="ring-frame" data-frame="1">
-    ╭──────╮
-   ╱        ╲
-  ╱          ╲
- │      ◯     │
-  ╲          ╱
-   ╲        ╱
-    ╰──────╯</div>
-<div class="ring-frame" data-frame="2">
-   ╭─────╮
-  ╱       ╲
- ╱         ╲
-│     ◯     │
- ╲         ╱
-  ╲       ╱
-   ╰─────╯</div>
-<div class="ring-frame" data-frame="3">
-  ╭────╮
- ╱      ╲
-╱        ╲
-│    ◯    │
-╲        ╱
- ╲      ╱
-  ╰────╯</div>
-<div class="ring-frame" data-frame="4">
-   ╭───╮
-  ╱     ╲
- ╱       ╲
-│    ◯    │
- ╲       ╱
-  ╲     ╱
-   ╰───╯</div>
-<div class="ring-frame" data-frame="5">
-  ╭────╮
- ╱      ╲
-╱        ╲
-│    ◯    │
-╲        ╱
- ╲      ╱
-  ╰────╯</div>
-<div class="ring-frame" data-frame="6">
-   ╭─────╮
-  ╱       ╲
- ╱         ╲
-│     ◯     │
- ╲         ╱
-  ╲       ╱
-   ╰─────╯</div>
-<div class="ring-frame" data-frame="7">
-    ╭──────╮
-   ╱        ╲
-  ╱          ╲
- │      ◯     │
-  ╲          ╱
-   ╲        ╱
-    ╰──────╯</div>
-            </div>
+            <div class="ring-art">     ▄▄████▄▄
+   ▄██▀▀▀▀▀▀██▄
+  ██▀  ▄██▄  ▀██
+ ██   ██▀▀██   ██
+ ██   ██  ██   ██
+ ██   ██▄▄██   ██
+  ██▄  ▀██▀  ▄██
+   ▀██▄▄▄▄▄▄██▀
+     ▀▀████▀▀</div>
         </header>
         <div class="status-bar">
                 <div class="status-item">
@@ -1449,29 +1321,6 @@ DASHBOARD_HTML = """
                 loadPnlData(currentTimeframe);
             });
 
-        // ========== Ring Animation ==========
-        let ringFrame = 0;
-        const totalFrames = 8;
-
-        function animateRings() {
-            // Animate left ring
-            const leftFrames = document.querySelectorAll('#ring-left .ring-frame');
-            leftFrames.forEach((f, i) => {
-                f.classList.toggle('active', i === ringFrame);
-            });
-
-            // Animate right ring (offset by 4 frames for opposite rotation effect)
-            const rightFrames = document.querySelectorAll('#ring-right .ring-frame');
-            const rightFrame = (ringFrame + 4) % totalFrames;
-            rightFrames.forEach((f, i) => {
-                f.classList.toggle('active', i === rightFrame);
-            });
-
-            ringFrame = (ringFrame + 1) % totalFrames;
-        }
-
-        // Run animation at ~8fps for smooth spinning
-        setInterval(animateRings, 125);
     </script>
 </body>
 </html>
