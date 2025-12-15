@@ -1004,8 +1004,17 @@ class PolymarketClient:
             yes_book = self.get_order_book(yes_token_id)
             no_book = self.get_order_book(no_token_id)
 
-            yes_asks = yes_book.get("asks", [])
-            no_asks = no_book.get("asks", [])
+            # Handle both dict and OrderBookSummary object from py-clob-client
+            # py-clob-client now returns OrderBookSummary objects with .asks/.bids attributes
+            if hasattr(yes_book, "asks"):
+                yes_asks = yes_book.asks or []
+            else:
+                yes_asks = yes_book.get("asks", [])
+
+            if hasattr(no_book, "asks"):
+                no_asks = no_book.asks or []
+            else:
+                no_asks = no_book.get("asks", [])
 
             if not yes_asks or not no_asks:
                 log.warning("Insufficient liquidity - no asks on one or both sides")
@@ -1021,8 +1030,14 @@ class PolymarketClient:
                 }
 
             # Calculate available liquidity (top 3 levels)
-            yes_displayed = sum(float(ask.get("size", 0)) for ask in yes_asks[:3])
-            no_displayed = sum(float(ask.get("size", 0)) for ask in no_asks[:3])
+            # Handle both dict and OrderBookLevel objects from py-clob-client
+            def get_ask_size(ask):
+                if hasattr(ask, "size"):
+                    return float(ask.size or 0)
+                return float(ask.get("size", 0))
+
+            yes_displayed = sum(get_ask_size(ask) for ask in yes_asks[:3])
+            no_displayed = sum(get_ask_size(ask) for ask in no_asks[:3])
 
             # Use the PASSED-IN prices for share calculations (from opportunity detection)
             yes_shares_needed = yes_amount_usd / yes_price if yes_price > 0 else 0

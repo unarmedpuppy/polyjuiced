@@ -1163,8 +1163,16 @@ class GabagoolStrategy(BaseStrategy):
 
         # Get available liquidity at our price levels
         # For BUY orders, we look at ASK side (what's being sold)
-        yes_asks = yes_book.get("asks", [])
-        no_asks = no_book.get("asks", [])
+        # Handle both dict and OrderBookSummary object from py-clob-client
+        if hasattr(yes_book, "asks"):
+            yes_asks = yes_book.asks or []
+        else:
+            yes_asks = yes_book.get("asks", [])
+
+        if hasattr(no_book, "asks"):
+            no_asks = no_book.asks or []
+        else:
+            no_asks = no_book.get("asks", [])
 
         # Calculate depth at or below our target price
         yes_available = 0.0
