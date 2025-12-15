@@ -62,6 +62,7 @@ class GabagoolConfig:
     min_spread_threshold: float = 0.02  # 2 cents minimum to trade
 
     # Position sizing
+    min_trade_size_usd: float = 3.0  # Minimum trade size per side (skip smaller trades)
     max_trade_size_usd: float = 25.0  # Per order (may be overridden by balance-based sizing)
     max_per_window_usd: float = 50.0  # Per 15-min market
     max_daily_exposure_usd: float = 0.0  # 0 = unlimited (circuit breaker uses max_daily_loss instead)
@@ -127,6 +128,7 @@ class GabagoolConfig:
             enabled=os.getenv("GABAGOOL_ENABLED", "true").lower() == "true",
             markets=os.getenv("GABAGOOL_MARKETS", "BTC,ETH,SOL").split(","),
             min_spread_threshold=float(os.getenv("GABAGOOL_MIN_SPREAD", "0.02")),
+            min_trade_size_usd=float(os.getenv("GABAGOOL_MIN_TRADE_SIZE", "3.0")),
             max_trade_size_usd=float(os.getenv("GABAGOOL_MAX_TRADE_SIZE", "25.0")),
             max_per_window_usd=float(os.getenv("GABAGOOL_MAX_PER_WINDOW", "50.0")),
             max_daily_exposure_usd=float(os.getenv("GABAGOOL_MAX_DAILY_EXPOSURE", "0.0")),

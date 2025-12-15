@@ -874,6 +874,18 @@ class GabagoolStrategy(BaseStrategy):
             except Exception as e:
                 log.warning("Failed to get balance for sizing, using fixed max", error=str(e))
 
+        # Enforce minimum trade size - skip if budget is too small
+        # This prevents tiny trades that aren't worth the fees/effort
+        min_budget_required = self.gabagool_config.min_trade_size_usd * 2  # Need min for both legs
+        if budget < min_budget_required:
+            log.info(
+                "Budget below minimum trade size threshold",
+                budget=f"${budget:.2f}",
+                min_required=f"${min_budget_required:.2f}",
+                min_per_leg=f"${self.gabagool_config.min_trade_size_usd:.2f}",
+            )
+            return None
+
         # Calculate position sizes
         yes_amount, no_amount = self.calculate_position_sizes(
             budget=budget,
@@ -1206,7 +1218,8 @@ class GabagoolStrategy(BaseStrategy):
             adjusted_no = no_amount * scale
 
             # Check minimum trade size (don't bother with tiny trades)
-            min_trade = 1.0  # $1 minimum per side
+            # Use configurable min_trade_size_usd (default $3, was hardcoded at $1)
+            min_trade = self.gabagool_config.min_trade_size_usd
             if adjusted_yes < min_trade or adjusted_no < min_trade:
                 log.info(
                     "Liquidity too low for minimum trade size",
