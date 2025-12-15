@@ -1109,73 +1109,95 @@ class PolymarketClient:
             - maker_amount (USD cost): max 2 decimal places
             - taker_amount (shares): max 4 decimal places
             - price: 2 decimal places
+
+            Returns dict with order info, or error info if order fails.
+            NEVER raises - always returns a dict so parallel execution can detect partial fills.
             """
             from decimal import Decimal, ROUND_DOWN
 
             start_time_ms = int(time.time() * 1000)
 
-            # Polymarket API requirements for market BUY orders (especially FOK):
-            # - maker_amount (USD you pay): max 2 decimal places
-            # - taker_amount (shares you receive): max 2 decimal places (py-clob-client limit)
-            # - price: 2 decimal places
-            #
-            # CRITICAL: FOK orders require maker_amount (shares × price) to have ≤2 decimals.
-            # Since shares × price rarely produces clean results (e.g., 25.48 × 0.35 = 8.918),
-            # we work BACKWARDS: round maker_amount first, then calculate shares.
+            try:
+                # Polymarket API requirements for market BUY orders (especially FOK):
+                # - maker_amount (USD you pay): max 2 decimal places
+                # - taker_amount (shares you receive): max 2 decimal places (py-clob-client limit)
+                # - price: 2 decimal places
+                #
+                # CRITICAL: FOK orders require maker_amount (shares × price) to have ≤2 decimals.
+                # Since shares × price rarely produces clean results (e.g., 25.48 × 0.35 = 8.918),
+                # we work BACKWARDS: round maker_amount first, then calculate shares.
 
-            # Ensure price has 2 decimal places
-            price_d = Decimal(str(limit_price)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+                # Ensure price has 2 decimal places
+                price_d = Decimal(str(limit_price)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
-            # Round USD amount to 2 decimals - this IS our maker_amount (guaranteed clean)
-            maker_amount_d = Decimal(str(amount_usd)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+                # Round USD amount to 2 decimals - this IS our maker_amount (guaranteed clean)
+                maker_amount_d = Decimal(str(amount_usd)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
-            # Calculate shares from clean maker_amount
-            # Round to 2 decimals (py-clob-client limit) with ROUND_DOWN
-            shares_d = (maker_amount_d / price_d).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+                # Calculate shares from clean maker_amount
+                # Round to 2 decimals (py-clob-client limit) with ROUND_DOWN
+                shares_d = (maker_amount_d / price_d).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
-            # Recalculate actual maker_amount from rounded shares (this is what API sees)
-            actual_maker = shares_d * price_d
-
-            # If the actual maker has more than 2 decimals, reduce shares until clean
-            # Worst case is ~100 iterations for pathological prices like 0.97
-            for _ in range(200):
+                # Recalculate actual maker_amount from rounded shares (this is what API sees)
                 actual_maker = shares_d * price_d
-                actual_maker_rounded = actual_maker.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-                if actual_maker == actual_maker_rounded:
-                    break  # Clean!
-                shares_d = shares_d - Decimal("0.01")
-                if shares_d <= 0:
-                    shares_d = Decimal("0.01")  # Minimum viable shares
-                    break
 
-            final_price = float(price_d)
-            shares = float(shares_d)
-            final_maker_amount = float(actual_maker)
+                # If the actual maker has more than 2 decimals, reduce shares until clean
+                # Worst case is ~100 iterations for pathological prices like 0.97
+                for _ in range(200):
+                    actual_maker = shares_d * price_d
+                    actual_maker_rounded = actual_maker.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+                    if actual_maker == actual_maker_rounded:
+                        break  # Clean!
+                    shares_d = shares_d - Decimal("0.01")
+                    if shares_d <= 0:
+                        shares_d = Decimal("0.01")  # Minimum viable shares
+                        break
 
-            log.info(
-                f"Placing {label} order at EXACT limit (no slippage)",
-                limit_price=f"${final_price:.2f}",
-                shares=f"{shares:.2f}",
-                maker_amount=f"${final_maker_amount:.2f}",
-            )
+                final_price = float(price_d)
+                shares = float(shares_d)
+                final_maker_amount = float(actual_maker)
 
-            order_args = OrderArgs(
-                token_id=token_id,
-                price=final_price,
-                size=shares,
-                side="BUY",
-            )
+                log.info(
+                    f"Placing {label} order at EXACT limit (no slippage)",
+                    limit_price=f"${final_price:.2f}",
+                    shares=f"{shares:.2f}",
+                    maker_amount=f"${final_maker_amount:.2f}",
+                )
 
-            signed_order = self._client.create_order(order_args)
-            # Use FOK (Fill-or-Kill) for atomicity - either fill completely or not at all
-            result = self._client.post_order(signed_order, orderType=OrderType.FOK)
+                order_args = OrderArgs(
+                    token_id=token_id,
+                    price=final_price,
+                    size=shares,
+                    side="BUY",
+                )
 
-            result["_intended_size"] = shares
-            result["_intended_price"] = final_price
-            result["_start_time_ms"] = start_time_ms
-            result["_label"] = label
+                signed_order = self._client.create_order(order_args)
+                # Use FOK (Fill-or-Kill) for atomicity - either fill completely or not at all
+                result = self._client.post_order(signed_order, orderType=OrderType.FOK)
 
-            return result
+                result["_intended_size"] = shares
+                result["_intended_price"] = final_price
+                result["_start_time_ms"] = start_time_ms
+                result["_label"] = label
+
+                return result
+
+            except Exception as e:
+                # CRITICAL: Return error dict instead of raising, so parallel execution
+                # can detect partial fills (when one order succeeds and one fails)
+                log.warning(
+                    f"{label} order failed with exception",
+                    error=str(e),
+                    token_id=token_id[:20] + "...",
+                )
+                return {
+                    "status": "EXCEPTION",
+                    "error": str(e),
+                    "_intended_size": locals().get("shares", 0),
+                    "_intended_price": locals().get("final_price", limit_price),
+                    "_start_time_ms": start_time_ms,
+                    "_label": label,
+                    "size_matched": 0,
+                }
 
         try:
             # PARALLEL EXECUTION: Place both orders simultaneously
