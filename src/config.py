@@ -53,8 +53,8 @@ class PolymarketSettings(BaseSettings):
 
 
 @dataclass
-class MegaMarbleConfig:
-    """Mega Marble arbitrage strategy configuration."""
+class GabagoolConfig:
+    """Gabagool arbitrage strategy configuration."""
 
     # Strategy settings
     enabled: bool = True
@@ -112,47 +112,47 @@ class MegaMarbleConfig:
     near_resolution_size_usd: float = 10.0  # Fixed trade size for near-resolution
 
     @classmethod
-    def from_env(cls) -> "MegaMarbleConfig":
+    def from_env(cls) -> "GabagoolConfig":
         """Load configuration from environment variables."""
         return cls(
-            enabled=os.getenv("MARBLE_ENABLED", "true").lower() == "true",
-            markets=os.getenv("MARBLE_MARKETS", "BTC,ETH,SOL").split(","),
-            min_spread_threshold=float(os.getenv("MARBLE_MIN_SPREAD", "0.02")),
-            max_trade_size_usd=float(os.getenv("MARBLE_MAX_TRADE_SIZE", "25.0")),
-            max_per_window_usd=float(os.getenv("MARBLE_MAX_PER_WINDOW", "50.0")),
-            max_daily_exposure_usd=float(os.getenv("MARBLE_MAX_DAILY_EXPOSURE", "0.0")),
-            balance_sizing_enabled=os.getenv("MARBLE_BALANCE_SIZING_ENABLED", "true").lower() == "true",
-            balance_sizing_pct=float(os.getenv("MARBLE_BALANCE_SIZING_PCT", "0.25")),
-            max_daily_loss_usd=float(os.getenv("MARBLE_MAX_DAILY_LOSS", "10.0")),
-            max_unhedged_exposure_usd=float(os.getenv("MARBLE_MAX_UNHEDGED", "10.0")),
-            max_slippage_cents=float(os.getenv("MARBLE_MAX_SLIPPAGE", "2.0")),
+            enabled=os.getenv("GABAGOOL_ENABLED", "true").lower() == "true",
+            markets=os.getenv("GABAGOOL_MARKETS", "BTC,ETH,SOL").split(","),
+            min_spread_threshold=float(os.getenv("GABAGOOL_MIN_SPREAD", "0.02")),
+            max_trade_size_usd=float(os.getenv("GABAGOOL_MAX_TRADE_SIZE", "25.0")),
+            max_per_window_usd=float(os.getenv("GABAGOOL_MAX_PER_WINDOW", "50.0")),
+            max_daily_exposure_usd=float(os.getenv("GABAGOOL_MAX_DAILY_EXPOSURE", "0.0")),
+            balance_sizing_enabled=os.getenv("GABAGOOL_BALANCE_SIZING_ENABLED", "true").lower() == "true",
+            balance_sizing_pct=float(os.getenv("GABAGOOL_BALANCE_SIZING_PCT", "0.25")),
+            max_daily_loss_usd=float(os.getenv("GABAGOOL_MAX_DAILY_LOSS", "10.0")),
+            max_unhedged_exposure_usd=float(os.getenv("GABAGOOL_MAX_UNHEDGED", "10.0")),
+            max_slippage_cents=float(os.getenv("GABAGOOL_MAX_SLIPPAGE", "2.0")),
             # Hedge ratio enforcement
-            min_hedge_ratio=float(os.getenv("MARBLE_MIN_HEDGE_RATIO", "0.80")),
-            critical_hedge_ratio=float(os.getenv("MARBLE_CRITICAL_HEDGE_RATIO", "0.60")),
-            max_position_imbalance_shares=float(os.getenv("MARBLE_MAX_POSITION_IMBALANCE", "5.0")),
-            order_timeout_seconds=float(os.getenv("MARBLE_ORDER_TIMEOUT", "10.0")),
-            ws_reconnect_delay_seconds=float(os.getenv("MARBLE_WS_RECONNECT_DELAY", "1.0")),
+            min_hedge_ratio=float(os.getenv("GABAGOOL_MIN_HEDGE_RATIO", "0.80")),
+            critical_hedge_ratio=float(os.getenv("GABAGOOL_CRITICAL_HEDGE_RATIO", "0.60")),
+            max_position_imbalance_shares=float(os.getenv("GABAGOOL_MAX_POSITION_IMBALANCE", "5.0")),
+            order_timeout_seconds=float(os.getenv("GABAGOOL_ORDER_TIMEOUT", "10.0")),
+            ws_reconnect_delay_seconds=float(os.getenv("GABAGOOL_WS_RECONNECT_DELAY", "1.0")),
             # Phase 3: Better order execution
-            parallel_execution_enabled=os.getenv("MARBLE_PARALLEL_EXECUTION", "true").lower() == "true",
-            max_liquidity_consumption_pct=float(os.getenv("MARBLE_MAX_LIQUIDITY_CONSUMPTION", "0.50")),
-            order_fill_check_interval_ms=float(os.getenv("MARBLE_FILL_CHECK_INTERVAL_MS", "100.0")),
-            parallel_fill_timeout_seconds=float(os.getenv("MARBLE_PARALLEL_FILL_TIMEOUT", "5.0")),
-            dry_run=os.getenv("MARBLE_DRY_RUN", "true").lower() == "true",  # Default TRUE until hedge enforcement complete
+            parallel_execution_enabled=os.getenv("GABAGOOL_PARALLEL_EXECUTION", "true").lower() == "true",
+            max_liquidity_consumption_pct=float(os.getenv("GABAGOOL_MAX_LIQUIDITY_CONSUMPTION", "0.50")),
+            order_fill_check_interval_ms=float(os.getenv("GABAGOOL_FILL_CHECK_INTERVAL_MS", "100.0")),
+            parallel_fill_timeout_seconds=float(os.getenv("GABAGOOL_PARALLEL_FILL_TIMEOUT", "5.0")),
+            dry_run=os.getenv("GABAGOOL_DRY_RUN", "true").lower() == "true",  # Default TRUE until hedge enforcement complete
             # Directional trading
-            directional_enabled=os.getenv("MARBLE_DIRECTIONAL_ENABLED", "false").lower() == "true",
-            directional_entry_threshold=float(os.getenv("MARBLE_DIRECTIONAL_ENTRY_THRESHOLD", "0.25")),
-            directional_time_threshold=float(os.getenv("MARBLE_DIRECTIONAL_TIME_THRESHOLD", "0.80")),
-            directional_size_ratio=float(os.getenv("MARBLE_DIRECTIONAL_SIZE_RATIO", "0.33")),
-            directional_target_base=float(os.getenv("MARBLE_DIRECTIONAL_TARGET_BASE", "0.45")),
-            directional_stop_loss=float(os.getenv("MARBLE_DIRECTIONAL_STOP_LOSS", "0.11")),
-            directional_trailing_activation=float(os.getenv("MARBLE_DIRECTIONAL_TRAILING_ACTIVATION", "0.05")),
-            directional_trailing_distance=float(os.getenv("MARBLE_DIRECTIONAL_TRAILING_DISTANCE", "0.10")),
+            directional_enabled=os.getenv("GABAGOOL_DIRECTIONAL_ENABLED", "false").lower() == "true",
+            directional_entry_threshold=float(os.getenv("GABAGOOL_DIRECTIONAL_ENTRY_THRESHOLD", "0.25")),
+            directional_time_threshold=float(os.getenv("GABAGOOL_DIRECTIONAL_TIME_THRESHOLD", "0.80")),
+            directional_size_ratio=float(os.getenv("GABAGOOL_DIRECTIONAL_SIZE_RATIO", "0.33")),
+            directional_target_base=float(os.getenv("GABAGOOL_DIRECTIONAL_TARGET_BASE", "0.45")),
+            directional_stop_loss=float(os.getenv("GABAGOOL_DIRECTIONAL_STOP_LOSS", "0.11")),
+            directional_trailing_activation=float(os.getenv("GABAGOOL_DIRECTIONAL_TRAILING_ACTIVATION", "0.05")),
+            directional_trailing_distance=float(os.getenv("GABAGOOL_DIRECTIONAL_TRAILING_DISTANCE", "0.10")),
             # Near-resolution trading
-            near_resolution_enabled=os.getenv("MARBLE_NEAR_RESOLUTION_ENABLED", "false").lower() == "true",  # Disabled - creates unhedged positions
-            near_resolution_time_threshold=float(os.getenv("MARBLE_NEAR_RESOLUTION_TIME", "60.0")),
-            near_resolution_min_price=float(os.getenv("MARBLE_NEAR_RESOLUTION_MIN_PRICE", "0.94")),
-            near_resolution_max_price=float(os.getenv("MARBLE_NEAR_RESOLUTION_MAX_PRICE", "0.975")),
-            near_resolution_size_usd=float(os.getenv("MARBLE_NEAR_RESOLUTION_SIZE", "10.0")),
+            near_resolution_enabled=os.getenv("GABAGOOL_NEAR_RESOLUTION_ENABLED", "false").lower() == "true",  # Disabled - creates unhedged positions
+            near_resolution_time_threshold=float(os.getenv("GABAGOOL_NEAR_RESOLUTION_TIME", "60.0")),
+            near_resolution_min_price=float(os.getenv("GABAGOOL_NEAR_RESOLUTION_MIN_PRICE", "0.94")),
+            near_resolution_max_price=float(os.getenv("GABAGOOL_NEAR_RESOLUTION_MAX_PRICE", "0.975")),
+            near_resolution_size_usd=float(os.getenv("GABAGOOL_NEAR_RESOLUTION_SIZE", "10.0")),
         )
 
 
@@ -185,7 +185,7 @@ class AppConfig:
     """Main application configuration."""
 
     polymarket: PolymarketSettings
-    mega_marble: MegaMarbleConfig
+    gabagool: GabagoolConfig
     copy_trading: CopyTradingConfig
 
     @classmethod
@@ -196,7 +196,7 @@ class AppConfig:
 
         return cls(
             polymarket=PolymarketSettings(),
-            mega_marble=MegaMarbleConfig.from_env(),
+            gabagool=GabagoolConfig.from_env(),
             copy_trading=CopyTradingConfig.from_env(),
         )
 

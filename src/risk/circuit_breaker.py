@@ -7,7 +7,7 @@ from typing import List, Optional
 
 import structlog
 
-from ..config import MegaMarbleConfig
+from ..config import GabagoolConfig
 from ..metrics import (
     CIRCUIT_BREAKER_LEVEL,
     CIRCUIT_BREAKER_TRIPS,
@@ -69,7 +69,7 @@ class CircuitBreaker:
     - HALT: Stop all trading
     """
 
-    def __init__(self, config: MegaMarbleConfig):
+    def __init__(self, config: GabagoolConfig):
         """Initialize circuit breaker.
 
         Args:

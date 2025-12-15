@@ -1,9 +1,11 @@
-"""Mega Marble arbitrage strategy for 15-minute up/down markets.
+"""Gabagool arbitrage strategy for 15-minute up/down markets.
 
 This strategy exploits temporary mispricing in binary markets where:
 - YES + NO should sum to $1.00
 - When sum < $1.00, buying both guarantees profit
 - Profit = $1.00 - (YES_cost + NO_cost)
+
+Named after the successful Polymarket trader @gabagool22.
 """
 
 import asyncio
@@ -21,7 +23,7 @@ from ..events import trade_events, EventTypes
 if TYPE_CHECKING:
     from ..liquidity.collector import LiquidityCollector
 from ..client.websocket import PolymarketWebSocket
-from ..config import AppConfig, MegaMarbleConfig
+from ..config import AppConfig, GabagoolConfig
 from .. import dashboard
 from ..dashboard import add_log, add_trade, add_decision, resolve_trade, update_stats, update_markets, stats
 from ..metrics import (
@@ -152,8 +154,8 @@ class DirectionalPosition:
         return False, ""
 
 
-class MegaMarbleStrategy(BaseStrategy):
-    """Mega Marble asymmetric binary arbitrage strategy.
+class GabagoolStrategy(BaseStrategy):
+    """Gabagool asymmetric binary arbitrage strategy.
 
     Key principles:
     1. Never predict direction - always hedge both sides
@@ -170,7 +172,7 @@ class MegaMarbleStrategy(BaseStrategy):
         config: AppConfig,
         db: Optional[Database] = None,
     ):
-        """Initialize Mega Marble strategy.
+        """Initialize Gabagool strategy.
 
         Args:
             client: Polymarket CLOB client
@@ -182,7 +184,7 @@ class MegaMarbleStrategy(BaseStrategy):
         super().__init__(client, config)
         self.ws = ws_client
         self.market_finder = market_finder
-        self.mega_marble_config: MegaMarbleConfig = config.mega_marble
+        self.gabagool_config: GabagoolConfig = config.gabagool
         self._db: Optional[Database] = db
 
         self._tracker: Optional[MultiMarketTracker] = None
@@ -367,22 +369,22 @@ class MegaMarbleStrategy(BaseStrategy):
 
     async def start(self) -> None:
         """Start the Gabagool strategy."""
-        if not self.mega_marble_config.enabled:
+        if not self.gabagool_config.enabled:
             log.info("Gabagool strategy is disabled")
             return
 
         self._running = True
         log.info(
             "Starting Gabagool strategy",
-            dry_run=self.mega_marble_config.dry_run,
-            min_spread=f"{self.mega_marble_config.min_spread_threshold * 100:.1f}¢",
-            max_trade=f"${self.mega_marble_config.max_trade_size_usd:.2f}",
+            dry_run=self.gabagool_config.dry_run,
+            min_spread=f"{self.gabagool_config.min_spread_threshold * 100:.1f}¢",
+            max_trade=f"${self.gabagool_config.max_trade_size_usd:.2f}",
         )
 
         # Initialize tracker
         self._tracker = MultiMarketTracker(
             self.ws,
-            min_spread_cents=self.mega_marble_config.min_spread_threshold * 100,
+            min_spread_cents=self.gabagool_config.min_spread_threshold * 100,
         )
 
         # Register callback for IMMEDIATE opportunity detection
@@ -394,14 +396,14 @@ class MegaMarbleStrategy(BaseStrategy):
 
         # Initialize active position manager for rebalancing
         rebalancing_config = RebalancingConfig(
-            rebalance_threshold=self.mega_marble_config.min_hedge_ratio,
+            rebalance_threshold=self.gabagool_config.min_hedge_ratio,
             min_profit_per_share=0.02,  # $0.02 minimum profit per share
             max_rebalance_wait_seconds=60.0,  # Don't rebalance in last minute
             prefer_sell_over_buy=True,  # Capital efficient
             allow_partial_rebalance=True,
             max_rebalance_trades=5,
-            max_position_size_usd=self.mega_marble_config.max_trade_size_usd,
-            min_spread_dollars=self.mega_marble_config.min_spread_threshold,
+            max_position_size_usd=self.gabagool_config.max_trade_size_usd,
+            min_spread_dollars=self.gabagool_config.min_spread_threshold,
         )
         self._position_manager = ActivePositionManager(
             client=self.client,
@@ -418,10 +420,10 @@ class MegaMarbleStrategy(BaseStrategy):
 
         # Update dashboard with strategy status and circuit breaker state
         update_stats(
-            arbitrage_enabled=self.mega_marble_config.enabled,
-            directional_enabled=self.mega_marble_config.directional_enabled,
-            near_resolution_enabled=self.mega_marble_config.near_resolution_enabled,
-            dry_run=self.mega_marble_config.dry_run,
+            arbitrage_enabled=self.gabagool_config.enabled,
+            directional_enabled=self.gabagool_config.directional_enabled,
+            near_resolution_enabled=self.gabagool_config.near_resolution_enabled,
+            dry_run=self.gabagool_config.dry_run,
             circuit_breaker_hit=self._circuit_breaker_hit,
             realized_pnl=self._realized_pnl,
             trading_mode=self._get_trading_mode(),
@@ -641,12 +643,12 @@ class MegaMarbleStrategy(BaseStrategy):
                 # =============================================================
                 #
                 # # Check directional strategy (runs alongside arbitrage)
-                # if self.mega_marble_config.directional_enabled:
+                # if self.gabagool_config.directional_enabled:
                 #     await self._check_directional_opportunities()
                 #     await self._manage_directional_positions()
                 #
                 # # Check near-resolution opportunities (high-confidence bets in final minute)
-                # if self.mega_marble_config.near_resolution_enabled:
+                # if self.gabagool_config.near_resolution_enabled:
                 #     await self._check_near_resolution_opportunities()
                 #
                 # =============================================================
@@ -671,7 +673,7 @@ class MegaMarbleStrategy(BaseStrategy):
     async def _update_active_markets(self) -> None:
         """Update the list of active markets being tracked."""
         markets = await self.market_finder.find_active_markets(
-            assets=self.mega_marble_config.markets
+            assets=self.gabagool_config.markets
         )
 
         # Add new markets
@@ -737,7 +739,7 @@ class MegaMarbleStrategy(BaseStrategy):
             # Log evaluation for tradeable markets with valid prices
             if market.is_tradeable and up_price and down_price:
                 spread_cents = (1.0 - up_price - down_price) * 100
-                min_spread = self.mega_marble_config.min_spread_threshold * 100
+                min_spread = self.gabagool_config.min_spread_threshold * 100
                 if spread_cents >= min_spread:
                     # Positive spread = arbitrage opportunity
                     action = "YES"
@@ -818,24 +820,24 @@ class MegaMarbleStrategy(BaseStrategy):
         # Calculate position budget
         # If balance sizing is enabled, use 25% of available balance
         # Otherwise use the fixed max_trade_size_usd
-        budget = self.mega_marble_config.max_trade_size_usd
-        if self.mega_marble_config.balance_sizing_enabled:
+        budget = self.gabagool_config.max_trade_size_usd
+        if self.gabagool_config.balance_sizing_enabled:
             try:
                 balance_info = self.client.get_balance()
                 available_balance = balance_info.get("balance", 0.0)
                 if available_balance > 0:
                     # Use configured percentage of balance
-                    balance_budget = available_balance * self.mega_marble_config.balance_sizing_pct
+                    balance_budget = available_balance * self.gabagool_config.balance_sizing_pct
                     # Still cap at max_trade_size if configured (acts as upper bound)
-                    if self.mega_marble_config.max_trade_size_usd > 0:
-                        budget = min(balance_budget, self.mega_marble_config.max_trade_size_usd)
+                    if self.gabagool_config.max_trade_size_usd > 0:
+                        budget = min(balance_budget, self.gabagool_config.max_trade_size_usd)
                     else:
                         budget = balance_budget
                     log.debug(
                         "Using balance-based sizing",
                         balance=f"${available_balance:.2f}",
                         budget=f"${budget:.2f}",
-                        pct=f"{self.mega_marble_config.balance_sizing_pct*100:.0f}%",
+                        pct=f"{self.gabagool_config.balance_sizing_pct*100:.0f}%",
                     )
             except Exception as e:
                 log.warning("Failed to get balance for sizing, using fixed max", error=str(e))
@@ -849,12 +851,12 @@ class MegaMarbleStrategy(BaseStrategy):
 
         # Check exposure limits (0 = unlimited)
         total_cost = yes_amount + no_amount
-        if self.mega_marble_config.max_daily_exposure_usd > 0:
-            if self._daily_exposure + total_cost > self.mega_marble_config.max_daily_exposure_usd:
+        if self.gabagool_config.max_daily_exposure_usd > 0:
+            if self._daily_exposure + total_cost > self.gabagool_config.max_daily_exposure_usd:
                 add_decision(
                     asset=opportunity.market.asset,
                     action="SKIP",
-                    reason=f"Exposure limit (${self._daily_exposure:.0f}+${total_cost:.0f} > ${self.mega_marble_config.max_daily_exposure_usd:.0f})",
+                    reason=f"Exposure limit (${self._daily_exposure:.0f}+${total_cost:.0f} > ${self.gabagool_config.max_daily_exposure_usd:.0f})",
                     up_price=opportunity.yes_price,
                     down_price=opportunity.no_price,
                     spread=opportunity.spread_cents,
@@ -957,7 +959,7 @@ class MegaMarbleStrategy(BaseStrategy):
         Returns:
             True if opportunity is valid
         """
-        min_spread_cents = self.mega_marble_config.min_spread_threshold * 100
+        min_spread_cents = self.gabagool_config.min_spread_threshold * 100
 
         # Check minimum spread
         if opportunity.spread_cents < min_spread_cents:
@@ -1058,7 +1060,7 @@ class MegaMarbleStrategy(BaseStrategy):
         no_amount = num_pairs * no_price
 
         # Ensure we don't exceed individual trade limits
-        max_single = self.mega_marble_config.max_trade_size_usd
+        max_single = self.gabagool_config.max_trade_size_usd
         if yes_amount > max_single or no_amount > max_single:
             # Scale down proportionally
             scale = max_single / max(yes_amount, no_amount)
@@ -1195,15 +1197,15 @@ class MegaMarbleStrategy(BaseStrategy):
             telemetry.record_order_placed()
 
         try:
-            if self.mega_marble_config.parallel_execution_enabled:
+            if self.gabagool_config.parallel_execution_enabled:
                 log.info(
                     "Using PARALLEL execution mode with EXACT pricing (no slippage)",
                     asset=market.asset,
                     yes_price=f"${opportunity.yes_price:.2f}",
                     no_price=f"${opportunity.no_price:.2f}",
                     total_cost=f"${opportunity.yes_price + opportunity.no_price:.2f}",
-                    timeout=self.mega_marble_config.parallel_fill_timeout_seconds,
-                    max_liquidity_pct=f"{self.mega_marble_config.max_liquidity_consumption_pct*100:.0f}%",
+                    timeout=self.gabagool_config.parallel_fill_timeout_seconds,
+                    max_liquidity_pct=f"{self.gabagool_config.max_liquidity_consumption_pct*100:.0f}%",
                 )
                 api_result = await self.client.execute_dual_leg_order_parallel(
                     yes_token_id=market.yes_token_id,
@@ -1212,8 +1214,8 @@ class MegaMarbleStrategy(BaseStrategy):
                     no_amount_usd=no_amount,
                     yes_price=opportunity.yes_price,  # EXACT price from opportunity, no slippage
                     no_price=opportunity.no_price,    # EXACT price from opportunity, no slippage
-                    timeout_seconds=self.mega_marble_config.parallel_fill_timeout_seconds,
-                    max_liquidity_consumption_pct=self.mega_marble_config.max_liquidity_consumption_pct,
+                    timeout_seconds=self.gabagool_config.parallel_fill_timeout_seconds,
+                    max_liquidity_consumption_pct=self.gabagool_config.max_liquidity_consumption_pct,
                     condition_id=market.condition_id,
                     asset=market.asset,
                 )
@@ -1224,7 +1226,7 @@ class MegaMarbleStrategy(BaseStrategy):
                     no_token_id=market.no_token_id,
                     yes_amount_usd=yes_amount,
                     no_amount_usd=no_amount,
-                    timeout_seconds=self.mega_marble_config.order_timeout_seconds,
+                    timeout_seconds=self.gabagool_config.order_timeout_seconds,
                     condition_id=market.condition_id,
                     asset=market.asset,
                 )
@@ -1334,43 +1336,43 @@ class MegaMarbleStrategy(BaseStrategy):
                 no_shares=actual_no_shares,
                 hedge_ratio=f"{actual_hedge_ratio:.1%}",
                 imbalance_shares=f"{position_imbalance:.2f}",
-                min_required=f"{self._config.mega_marble.min_hedge_ratio:.0%}",
+                min_required=f"{self._config.gabagool.min_hedge_ratio:.0%}",
             )
 
             # Phase 2: ENFORCE minimum hedge ratio
             # If hedge ratio is below minimum, this is a failed trade
-            if actual_hedge_ratio < self._config.mega_marble.min_hedge_ratio:
+            if actual_hedge_ratio < self._config.gabagool.min_hedge_ratio:
                 error_msg = (
                     f"Hedge ratio {actual_hedge_ratio:.0%} below minimum "
-                    f"{self._config.mega_marble.min_hedge_ratio:.0%} - "
+                    f"{self._config.gabagool.min_hedge_ratio:.0%} - "
                     f"YES: {actual_yes_shares:.2f}, NO: {actual_no_shares:.2f}"
                 )
                 log.error(
                     "HEDGE RATIO ENFORCEMENT: Trade rejected due to poor hedge",
                     asset=market.asset,
                     hedge_ratio=f"{actual_hedge_ratio:.1%}",
-                    min_required=f"{self._config.mega_marble.min_hedge_ratio:.0%}",
+                    min_required=f"{self._config.gabagool.min_hedge_ratio:.0%}",
                     yes_shares=actual_yes_shares,
                     no_shares=actual_no_shares,
                 )
                 add_log(
                     "error",
-                    f"REJECTED: {market.asset} hedge ratio {actual_hedge_ratio:.0%} < {self._config.mega_marble.min_hedge_ratio:.0%}",
+                    f"REJECTED: {market.asset} hedge ratio {actual_hedge_ratio:.0%} < {self._config.gabagool.min_hedge_ratio:.0%}",
                     yes_shares=actual_yes_shares,
                     no_shares=actual_no_shares,
                 )
                 TRADE_ERRORS_TOTAL.labels(error_type="hedge_ratio_violation").inc()
 
                 # Check if we hit critical threshold (circuit breaker)
-                if actual_hedge_ratio < self._config.mega_marble.critical_hedge_ratio:
+                if actual_hedge_ratio < self._config.gabagool.critical_hedge_ratio:
                     log.critical(
                         "CRITICAL: Hedge ratio below critical threshold! Consider halting.",
                         hedge_ratio=f"{actual_hedge_ratio:.1%}",
-                        critical_threshold=f"{self._config.mega_marble.critical_hedge_ratio:.0%}",
+                        critical_threshold=f"{self._config.gabagool.critical_hedge_ratio:.0%}",
                     )
                     add_log(
                         "error",
-                        f"CRITICAL: {market.asset} hedge ratio {actual_hedge_ratio:.0%} below {self._config.mega_marble.critical_hedge_ratio:.0%}",
+                        f"CRITICAL: {market.asset} hedge ratio {actual_hedge_ratio:.0%} below {self._config.gabagool.critical_hedge_ratio:.0%}",
                     )
 
                 # Return failed trade result
@@ -1390,12 +1392,12 @@ class MegaMarbleStrategy(BaseStrategy):
                 )
 
             # Also check position imbalance in absolute terms
-            if position_imbalance > self._config.mega_marble.max_position_imbalance_shares:
+            if position_imbalance > self._config.gabagool.max_position_imbalance_shares:
                 log.warning(
                     "Position imbalance exceeds maximum",
                     asset=market.asset,
                     imbalance=f"{position_imbalance:.2f} shares",
-                    max_allowed=f"{self._config.mega_marble.max_position_imbalance_shares:.2f} shares",
+                    max_allowed=f"{self._config.gabagool.max_position_imbalance_shares:.2f} shares",
                 )
                 add_log(
                     "warning",
@@ -1737,7 +1739,7 @@ class MegaMarbleStrategy(BaseStrategy):
         Returns:
             True if trading should be simulated, False if real trading is allowed
         """
-        return self.mega_marble_config.dry_run or self._circuit_breaker_hit
+        return self.gabagool_config.dry_run or self._circuit_breaker_hit
 
     def _get_trading_mode(self) -> str:
         """Get current trading mode for display.
@@ -1747,7 +1749,7 @@ class MegaMarbleStrategy(BaseStrategy):
         """
         if self._circuit_breaker_hit:
             return "CIRCUIT_BREAKER"
-        elif self.mega_marble_config.dry_run:
+        elif self.gabagool_config.dry_run:
             return "DRY_RUN"
         else:
             return "LIVE"
@@ -1894,7 +1896,7 @@ class MegaMarbleStrategy(BaseStrategy):
             claim_result = await self.client.claim_resolved_position(
                 token_id=token_id,
                 shares=shares,
-                timeout_seconds=self.mega_marble_config.order_timeout_seconds,
+                timeout_seconds=self.gabagool_config.order_timeout_seconds,
             )
 
             if claim_result["success"]:
@@ -2037,7 +2039,7 @@ class MegaMarbleStrategy(BaseStrategy):
                 trade_id=trade_id,
                 pnl_amount=actual_profit,
                 pnl_type=pnl_type,
-                max_daily_loss=self.mega_marble_config.max_daily_loss_usd,
+                max_daily_loss=self.gabagool_config.max_daily_loss_usd,
             )
 
             # Update local state
@@ -2049,7 +2051,7 @@ class MegaMarbleStrategy(BaseStrategy):
                 log.warning(
                     "CIRCUIT BREAKER TRIGGERED - switching to simulation mode",
                     realized_pnl=f"${self._realized_pnl:.2f}",
-                    max_loss=f"${self.mega_marble_config.max_daily_loss_usd:.2f}",
+                    max_loss=f"${self.gabagool_config.max_daily_loss_usd:.2f}",
                     trigger_trade=trade_id,
                 )
                 # Update dashboard immediately
@@ -2209,7 +2211,7 @@ class MegaMarbleStrategy(BaseStrategy):
         This catches high-confidence markets just before resolution where
         the price hasn't fully converged to $1.00 yet.
         """
-        cfg = self.mega_marble_config
+        cfg = self.gabagool_config
 
         for condition_id, market in self._active_markets.items():
             # Skip if we already executed a near-resolution trade on this market
@@ -2316,7 +2318,7 @@ class MegaMarbleStrategy(BaseStrategy):
             price: Current price of the side we're betting on
             token_id: Token ID to buy
         """
-        cfg = self.mega_marble_config
+        cfg = self.gabagool_config
         trade_size = cfg.near_resolution_size_usd
 
         # Check daily limits
@@ -2468,7 +2470,7 @@ class MegaMarbleStrategy(BaseStrategy):
 
     async def _check_directional_opportunities(self) -> None:
         """Check for directional trading opportunities on each market."""
-        cfg = self.mega_marble_config
+        cfg = self.gabagool_config
 
         for condition_id, market in self._active_markets.items():
             # Skip if already have a position in this market
@@ -2570,7 +2572,7 @@ class MegaMarbleStrategy(BaseStrategy):
         Returns:
             Target price for take-profit
         """
-        cfg = self.mega_marble_config
+        cfg = self.gabagool_config
 
         # Scale target: entry $0.20 -> target $0.40 (100% gain)
         #               entry $0.25 -> target $0.45 (80% gain)
@@ -2598,7 +2600,7 @@ class MegaMarbleStrategy(BaseStrategy):
             size_usd: Size in USD
             target_price: Take-profit target
         """
-        cfg = self.mega_marble_config
+        cfg = self.gabagool_config
         shares = size_usd / entry_price
 
         # Get market end time for display
@@ -2693,7 +2695,7 @@ class MegaMarbleStrategy(BaseStrategy):
 
     async def _manage_directional_positions(self) -> None:
         """Manage open directional positions - check for exits."""
-        cfg = self.mega_marble_config
+        cfg = self.gabagool_config
         positions_to_close = []
 
         for condition_id, position in self._directional_positions.items():
@@ -2801,7 +2803,7 @@ class MegaMarbleStrategy(BaseStrategy):
             profit: P&L amount
             exit_price: Price at exit
         """
-        cfg = self.mega_marble_config
+        cfg = self.gabagool_config
         won = profit > 0
 
         if cfg.dry_run:
@@ -2862,7 +2864,7 @@ class MegaMarbleStrategy(BaseStrategy):
     def _is_daily_limit_reached(self) -> bool:
         """Check if daily limits have been reached."""
         # Check daily loss limit
-        if self._daily_pnl < -self.mega_marble_config.max_daily_loss_usd:
+        if self._daily_pnl < -self.gabagool_config.max_daily_loss_usd:
             log.warning(
                 "Daily loss limit reached",
                 loss=f"${abs(self._daily_pnl):.2f}",
@@ -2870,7 +2872,7 @@ class MegaMarbleStrategy(BaseStrategy):
             return True
 
         # Check daily exposure limit (0 = unlimited)
-        if self.mega_marble_config.max_daily_exposure_usd > 0 and self._daily_exposure >= self.mega_marble_config.max_daily_exposure_usd:
+        if self.gabagool_config.max_daily_exposure_usd > 0 and self._daily_exposure >= self.gabagool_config.max_daily_exposure_usd:
             log.info("Daily exposure limit reached")
             return True
 

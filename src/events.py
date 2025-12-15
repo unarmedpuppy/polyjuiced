@@ -7,7 +7,7 @@ Strategy emits events when trades are created/updated, and
 dashboard subscribes to update its display state.
 
 Architecture:
-    Strategy (mega_marble.py) --> events.py --> Dashboard (dashboard.py)
+    Strategy (gabagool.py) --> events.py --> Dashboard (dashboard.py)
                                   |
                                   v
                               Database (persistence.py)

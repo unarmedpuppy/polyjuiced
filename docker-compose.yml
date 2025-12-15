@@ -13,10 +13,10 @@ services:
       - HTTP_PROXY=http://media-download-gluetun:8888
       - HTTPS_PROXY=http://media-download-gluetun:8888
       # Strategy settings - LIVE TRADING (enabled 2025-12-14 with circuit breaker safeguards)
-      - MARBLE_DRY_RUN=false
-      - MARBLE_MAX_DAILY_LOSS=10.0
-      - MARBLE_DIRECTIONAL_ENABLED=false
-      - MARBLE_NEAR_RESOLUTION_ENABLED=false
+      - GABAGOOL_DRY_RUN=false
+      - GABAGOOL_MAX_DAILY_LOSS=10.0
+      - GABAGOOL_DIRECTIONAL_ENABLED=false
+      - GABAGOOL_NEAR_RESOLUTION_ENABLED=false
     ports:
       - "8500:8000"  # Prometheus metrics
       - "8501:8080"  # Dashboard UI
@@ -61,7 +61,7 @@ services:
       - "homepage.name=Polymarket Bot"
       - "homepage.icon=si-ethereum"
       - "homepage.href=https://polymarket.server.unarmedpuppy.com/dashboard"
-      - "homepage.description=Mega Marble arbitrage strategy dashboard"
+      - "homepage.description=Gabagool arbitrage strategy dashboard"
 
 volumes:
   polymarket-data:

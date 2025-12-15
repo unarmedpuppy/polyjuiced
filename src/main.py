@@ -1,4 +1,4 @@
-"""Main entry point for Polymarket Mega Marble Trading Bot."""
+"""Main entry point for Polymarket Gabagool Trading Bot."""
 
 import asyncio
 import logging
@@ -22,7 +22,7 @@ from .metrics_server import MetricsServer
 from .monitoring.market_finder import MarketFinder
 from .persistence import get_database, close_database, Database
 from .risk import CircuitBreaker, PositionSizer
-from .strategies.mega_marble import MegaMarbleStrategy
+from .strategies.gabagool import GabagoolStrategy
 
 # Configure stdlib logging level (required for structlog filter_by_level)
 logging.basicConfig(
@@ -53,8 +53,8 @@ structlog.configure(
 log = structlog.get_logger()
 
 
-class MegaMarbleBot:
-    """Main bot orchestrator for Mega Marble arbitrage strategy."""
+class GabagoolBot:
+    """Main bot orchestrator for Gabagool arbitrage strategy."""
 
     def __init__(self, config: AppConfig):
         """Initialize the bot.
@@ -74,7 +74,7 @@ class MegaMarbleBot:
         self._market_finder: Optional[MarketFinder] = None
         self._circuit_breaker: Optional[CircuitBreaker] = None
         self._position_sizer: Optional[PositionSizer] = None
-        self._strategy: Optional[MegaMarbleStrategy] = None
+        self._strategy: Optional[GabagoolStrategy] = None
         self._metrics_server: Optional[MetricsServer] = None
         self._dashboard: Optional[DashboardServer] = None
         self._db: Optional[Database] = None
@@ -83,9 +83,9 @@ class MegaMarbleBot:
     async def start(self) -> None:
         """Start the bot and all components."""
         log.info(
-            "Starting Mega Marble Bot",
-            dry_run=self.config.mega_marble.dry_run,
-            markets=self.config.mega_marble.markets,
+            "Starting Gabagool Bot",
+            dry_run=self.config.gabagool.dry_run,
+            markets=self.config.gabagool.markets,
         )
 
         self._running = True
@@ -95,7 +95,7 @@ class MegaMarbleBot:
         log.info("Database initialized", path=str(self._db.db_path))
 
         # Initialize metrics
-        init_metrics(version="0.1.0", dry_run=self.config.mega_marble.dry_run)
+        init_metrics(version="0.1.0", dry_run=self.config.gabagool.dry_run)
 
         # Start metrics server
         self._metrics_server = MetricsServer(port=8000)
@@ -110,9 +110,9 @@ class MegaMarbleBot:
         await init_persistence(self._db)
 
         update_stats(
-            dry_run=self.config.mega_marble.dry_run,
-            arbitrage_enabled=self.config.mega_marble.enabled,
-            directional_enabled=self.config.mega_marble.directional_enabled,
+            dry_run=self.config.gabagool.dry_run,
+            arbitrage_enabled=self.config.gabagool.enabled,
+            directional_enabled=self.config.gabagool.directional_enabled,
         )
         add_log("info", "Dashboard started", url="http://localhost:8080/dashboard")
 
@@ -139,7 +139,7 @@ class MegaMarbleBot:
         if not self._running:
             return
 
-        log.info("Stopping Mega Marble Bot")
+        log.info("Stopping Gabagool Bot")
         self._running = False
         self._shutdown_event.set()
 
@@ -180,7 +180,7 @@ class MegaMarbleBot:
         # Close database
         await close_database()
 
-        log.info("Mega Marble Bot stopped")
+        log.info("Gabagool Bot stopped")
 
     async def _init_components(self) -> None:
         """Initialize all bot components."""
@@ -233,11 +233,11 @@ class MegaMarbleBot:
         self._market_finder = MarketFinder(self._gamma_client, db=self._db)
 
         # Create risk management components
-        self._circuit_breaker = CircuitBreaker(self.config.mega_marble)
-        self._position_sizer = PositionSizer(self.config.mega_marble)
+        self._circuit_breaker = CircuitBreaker(self.config.gabagool)
+        self._position_sizer = PositionSizer(self.config.gabagool)
 
         # Create strategy
-        self._strategy = MegaMarbleStrategy(
+        self._strategy = GabagoolStrategy(
             client=self._client,
             ws_client=self._ws_client,
             market_finder=self._market_finder,
@@ -279,31 +279,31 @@ class MegaMarbleBot:
 
     def _log_startup_info(self) -> None:
         """Log startup configuration info."""
-        mega_marble = self.config.mega_marble
+        gabagool = self.config.gabagool
 
         log.info(
-            "Mega Marble Configuration",
-            dry_run=mega_marble.dry_run,
-            min_spread=f"{mega_marble.min_spread_threshold * 100:.1f} cents",
-            max_trade_size=f"${mega_marble.max_trade_size_usd:.2f}",
-            max_daily_loss=f"${mega_marble.max_daily_loss_usd:.2f}",
-            max_daily_exposure=f"${mega_marble.max_daily_exposure_usd:.2f}",
-            markets=mega_marble.markets,
+            "Gabagool Configuration",
+            dry_run=gabagool.dry_run,
+            min_spread=f"{gabagool.min_spread_threshold * 100:.1f} cents",
+            max_trade_size=f"${gabagool.max_trade_size_usd:.2f}",
+            max_daily_loss=f"${gabagool.max_daily_loss_usd:.2f}",
+            max_daily_exposure=f"${gabagool.max_daily_exposure_usd:.2f}",
+            markets=gabagool.markets,
         )
 
-        if mega_marble.dry_run:
+        if gabagool.dry_run:
             log.warning(
                 "DRY RUN MODE - No real trades will be executed",
             )
 
 
 async def run_bot() -> None:
-    """Run the Mega Marble bot."""
+    """Run the Gabagool bot."""
     # Load configuration
     config = AppConfig.load()
 
     # Create and start bot
-    bot = MegaMarbleBot(config)
+    bot = GabagoolBot(config)
 
     try:
         await bot.start()
@@ -319,7 +319,7 @@ async def run_bot() -> None:
 def main() -> None:
     """Main entry point."""
     log.info(
-        "Mega Marble Arbitrage Bot",
+        "Gabagool Arbitrage Bot",
         version="0.1.0",
         started_at=datetime.utcnow().isoformat(),
     )

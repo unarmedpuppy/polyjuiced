@@ -58,84 +58,76 @@ DASHBOARD_HTML = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MEGA MARBLE // POLYMARKET BOT</title>
+    <title>GABAGOOL // POLYMARKET BOT</title>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=VT323&family=Share+Tech+Mono&display=swap');
 
         :root {
-            --primary: #ffffff;
-            --dim: #888888;
-            --dark: #333333;
-            --amber: #cccccc;
+            --green: #00ff41;
+            --dim-green: #00aa2a;
+            --dark-green: #003b00;
+            --amber: #ffb000;
             --red: #ff0040;
-            --cyan: #aaaaaa;
-            --bg: #000000;
-            --panel-bg: #0a0a0a;
-            --border: #333333;
+            --cyan: #00ffff;
+            --bg: #0a0a0a;
+            --panel-bg: #0d1117;
+            --border: #1a3a1a;
         }
 
         * { margin: 0; padding: 0; box-sizing: border-box; }
 
         body {
             background: var(--bg);
-            color: var(--primary);
+            color: var(--green);
             font-family: 'Share Tech Mono', 'Courier New', monospace;
             min-height: 100vh;
             overflow-x: hidden;
         }
 
-        /* Dithered noise texture overlay */
+        /* CRT scan line effect */
         body::before {
             content: "";
             position: fixed;
             top: 0; left: 0;
             width: 100%; height: 100%;
             pointer-events: none;
-            background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 4 4' xmlns='http://www.w3.org/2000/svg'%3E%3Crect x='0' y='0' width='1' height='1' fill='%23222'/%3E%3Crect x='2' y='2' width='1' height='1' fill='%23222'/%3E%3C/svg%3E");
-            background-size: 4px 4px;
-            opacity: 0.3;
+            background: repeating-linear-gradient(
+                0deg,
+                rgba(0, 0, 0, 0.15),
+                rgba(0, 0, 0, 0.15) 1px,
+                transparent 1px,
+                transparent 2px
+            );
             z-index: 1000;
         }
+
+        /* Removed flicker animation - caused annoying UI flashing */
+        /* @keyframes flicker { ... } */
 
         .container {
             max-width: 1600px;
             margin: 0 auto;
             padding: 20px;
+            /* animation: flicker 4s infinite; - DISABLED: caused UI flashing */
         }
 
         .header {
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 30px;
+            text-align: center;
             padding: 20px 0;
             border-bottom: 1px solid var(--border);
             margin-bottom: 20px;
-        }
-
-        .marble-art {
-            font-family: 'Courier New', monospace;
-            font-size: 10px;
-            line-height: 1.1;
-            white-space: pre;
-            color: var(--primary);
-            text-shadow: 0 0 2px var(--primary);
-        }
-
-        .header-text {
-            text-align: center;
         }
 
         .header h1 {
             font-family: 'VT323', monospace;
             font-size: 3rem;
             letter-spacing: 8px;
-            text-shadow: 0 0 5px var(--primary);
+            text-shadow: 0 0 10px var(--green), 0 0 20px var(--green);
             margin-bottom: 5px;
         }
 
         .header .subtitle {
-            color: var(--dim);
+            color: var(--dim-green);
             font-size: 0.9rem;
             letter-spacing: 4px;
         }
@@ -158,8 +150,8 @@ DASHBOARD_HTML = """
             width: 8px;
             height: 8px;
             border-radius: 50%;
-            background: var(--primary);
-            box-shadow: 0 0 6px var(--primary);
+            background: var(--green);
+            box-shadow: 0 0 6px var(--green);
             animation: pulse 2s infinite;
         }
 
@@ -193,7 +185,7 @@ DASHBOARD_HTML = """
         }
 
         .panel-header {
-            background: linear-gradient(90deg, var(--dark), transparent);
+            background: linear-gradient(90deg, var(--dark-green), transparent);
             padding: 10px 15px;
             border-bottom: 1px solid var(--border);
             display: flex;
@@ -204,7 +196,7 @@ DASHBOARD_HTML = """
         .panel-title {
             font-size: 0.9rem;
             letter-spacing: 2px;
-            color: var(--primary);
+            color: var(--green);
         }
 
         .panel-body { padding: 15px; }
@@ -226,17 +218,17 @@ DASHBOARD_HTML = """
         .stat-value {
             font-family: 'VT323', monospace;
             font-size: 2rem;
-            color: var(--primary);
-            text-shadow: 0 0 5px var(--primary);
+            color: var(--green);
+            text-shadow: 0 0 5px var(--green);
         }
 
-        .stat-value.positive { color: #00ff41; }
+        .stat-value.positive { color: var(--green); }
         .stat-value.negative { color: var(--red); text-shadow: 0 0 5px var(--red); }
         .stat-value.warning { color: var(--amber); text-shadow: 0 0 5px var(--amber); }
 
         .stat-label {
             font-size: 0.75rem;
-            color: var(--dim);
+            color: var(--dim-green);
             letter-spacing: 1px;
             margin-top: 5px;
         }
@@ -257,13 +249,13 @@ DASHBOARD_HTML = """
         }
 
         .trade-item:last-child { border-bottom: none; }
-        .trade-item.win { border-left: 3px solid #00ff41; }
+        .trade-item.win { border-left: 3px solid var(--green); }
         .trade-item.loss { border-left: 3px solid var(--red); }
         .trade-item.pending { border-left: 3px solid var(--amber); }
 
         .trade-time {
             font-size: 0.75rem;
-            color: var(--dim);
+            color: var(--dim-green);
         }
 
         .trade-info { }
@@ -276,7 +268,7 @@ DASHBOARD_HTML = """
 
         .trade-details {
             font-size: 0.75rem;
-            color: var(--dim);
+            color: var(--dim-green);
             margin-top: 3px;
         }
 
@@ -341,7 +333,7 @@ DASHBOARD_HTML = """
             border-bottom: 1px solid rgba(0, 255, 65, 0.05);
         }
 
-        .log-time { color: var(--dim); margin-right: 10px; }
+        .log-time { color: var(--dim-green); margin-right: 10px; }
 
         .log-level {
             display: inline-block;
@@ -359,7 +351,7 @@ DASHBOARD_HTML = """
         .log-level.resolution { color: #ff00ff; }
 
         .log-msg { color: #ccc; }
-        .log-extra { color: var(--dim); font-size: 0.75rem; }
+        .log-extra { color: var(--dim-green); font-size: 0.75rem; }
 
         /* P&L Chart */
         .chart-timeframe {
@@ -370,7 +362,7 @@ DASHBOARD_HTML = """
         .timeframe-btn {
             background: var(--dark-green);
             border: 1px solid var(--border);
-            color: var(--dim);
+            color: var(--dim-green);
             padding: 2px 8px;
             font-family: inherit;
             font-size: 0.7rem;
@@ -379,13 +371,13 @@ DASHBOARD_HTML = """
         }
 
         .timeframe-btn.active {
-            background: var(--primary);
+            background: var(--green);
             color: var(--bg);
-            border-color: var(--primary);
+            border-color: var(--green);
         }
 
         .timeframe-btn:hover {
-            border-color: var(--primary);
+            border-color: var(--green);
         }
 
         #pnl-chart {
@@ -417,13 +409,13 @@ DASHBOARD_HTML = """
 
         .winloss-label {
             font-size: 0.7rem;
-            color: var(--dim);
+            color: var(--dim-green);
         }
 
         .footer {
             text-align: center;
             padding: 20px;
-            color: var(--dim);
+            color: var(--dim-green);
             font-size: 0.8rem;
             border-top: 1px solid var(--border);
         }
@@ -500,38 +492,9 @@ DASHBOARD_HTML = """
 
     <div class="container">
         <header class="header">
-            <div class="marble-art">
-       ▄▄▄▄▄▄▄▄▄
-    ▄██████████████▄
-  ▄██▀▀░░░░░░░░▀▀██▄
- ███░░▄▄████▄▄░░░███
-███░▄██▀▀▀▀▀▀██▄░░██
-██░░██░░░░░░░░██░░██
-██░░██░░████░░██░░██
-███░▀██▄▄▄▄▄▄██▀░███
- ███░░▀▀████▀▀░░███
-  ▀██▄▄░░░░░░▄▄██▀
-    ▀██████████▀
-       ▀▀▀▀▀▀▀</div>
-            <div class="header-text">
-                <h1>MEGA MARBLE</h1>
-                <div class="subtitle">POLYMARKET ARBITRAGE BOT v0.1.0</div>
-            </div>
-            <div class="marble-art">
-       ▄▄▄▄▄▄▄▄▄
-    ▄██████████████▄
-  ▄██▀▀░░░░░░░░▀▀██▄
- ███░░▄▄████▄▄░░░███
-███░▄██▀▀▀▀▀▀██▄░░██
-██░░██░░░░░░░░██░░██
-██░░██░░████░░██░░██
-███░▀██▄▄▄▄▄▄██▀░███
- ███░░▀▀████▀▀░░███
-  ▀██▄▄░░░░░░▄▄██▀
-    ▀██████████▀
-       ▀▀▀▀▀▀▀</div>
-        </header>
-        <div class="status-bar">
+            <h1>GABAGOOL</h1>
+            <div class="subtitle">POLYMARKET ARBITRAGE BOT v0.1.0</div>
+            <div class="status-bar">
                 <div class="status-item">
                     <div id="ws-status" class="status-dot"></div>
                     <span>WEBSOCKET</span>
@@ -562,6 +525,7 @@ DASHBOARD_HTML = """
                     <span>NEAR-RES</span>
                 </div>
             </div>
+        </header>
 
         <div class="grid">
             <!-- Total Stats -->
@@ -633,13 +597,13 @@ DASHBOARD_HTML = """
         <div class="panel" style="margin-bottom: 20px;">
             <div class="panel-header">
                 <span class="panel-title">[ ACTIVE MARKETS ]</span>
-                <span style="color: var(--dim); font-size: 0.8rem;">
+                <span style="color: var(--dim-green); font-size: 0.8rem;">
                     <span id="market-count">0</span> found / <span id="tradeable-count">0</span> tradeable
                 </span>
             </div>
             <div class="panel-body" style="padding: 0;">
                 <div id="markets-list" style="max-height: 430px; overflow-y: auto;">
-                    <div style="padding: 20px; text-align: center; color: var(--dim);">
+                    <div style="padding: 20px; text-align: center; color: var(--dim-green);">
                         Searching for markets...
                     </div>
                 </div>
@@ -651,13 +615,13 @@ DASHBOARD_HTML = """
             <div class="panel">
                 <div class="panel-header">
                     <span class="panel-title">[ TRADE HISTORY ]</span>
-                    <span style="color: var(--dim); font-size: 0.8rem;">
+                    <span style="color: var(--dim-green); font-size: 0.8rem;">
                         <span id="trade-count">0</span> trades
                     </span>
                 </div>
                 <div class="panel-body" style="padding: 0;">
                     <div id="trade-list" class="trade-list">
-                        <div style="padding: 20px; text-align: center; color: var(--dim);">
+                        <div style="padding: 20px; text-align: center; color: var(--dim-green);">
                             No trades yet...
                         </div>
                     </div>
@@ -668,7 +632,7 @@ DASHBOARD_HTML = """
             <div class="panel">
                 <div class="panel-header">
                     <span class="panel-title">[ SYSTEM LOG ]</span>
-                    <span style="color: var(--dim); font-size: 0.8rem;">
+                    <span style="color: var(--dim-green); font-size: 0.8rem;">
                         <span id="log-count">0</span> entries
                     </span>
                 </div>
@@ -679,7 +643,7 @@ DASHBOARD_HTML = """
         </div>
 
         <footer class="footer">
-            MEGA MARBLE // POLYMARKET CLOB //
+            GABAGOOL ARBITRAGE BOT // POLYMARKET CLOB //
             <span id="current-time"></span>
         </footer>
     </div>
@@ -813,7 +777,7 @@ DASHBOARD_HTML = """
 
             // Handle empty state
             if (marketIds.size === 0) {
-                marketsList.innerHTML = '<div style="padding: 20px; text-align: center; color: var(--dim);">No markets found. Waiting for next 15-minute window...</div>';
+                marketsList.innerHTML = '<div style="padding: 20px; text-align: center; color: var(--dim-green);">No markets found. Waiting for next 15-minute window...</div>';
                 marketRowCache.clear();
                 marketEndTimes.clear();
                 document.getElementById('market-count').textContent = '0';
@@ -829,7 +793,7 @@ DASHBOARD_HTML = """
                 table.style.cssText = 'width: 100%; border-collapse: collapse; font-size: 0.85rem;';
 
                 const header = document.createElement('tr');
-                header.style.cssText = 'background: var(--dark); color: var(--primary);';
+                header.style.cssText = 'background: var(--dark-green); color: var(--green);';
                 header.innerHTML = `
                     <th style="padding: 8px; text-align: left;">Asset</th>
                     <th style="padding: 8px; text-align: left;">End Time</th>
@@ -895,7 +859,7 @@ DASHBOARD_HTML = """
                     : null;
                 const spreadNum = spread ? parseFloat(spread) : 0;
                 const meetsArbCriteria = isTradeable && spreadNum >= 2.0;
-                const spreadColor = spreadNum >= 2.0 ? '#00ff41' : spreadNum > 0 ? 'var(--amber)' : 'var(--red)';
+                const spreadColor = spreadNum >= 2.0 ? 'var(--green)' : spreadNum > 0 ? 'var(--amber)' : 'var(--red)';
 
                 let row = marketRowCache.get(id);
                 if (!row) {
@@ -911,7 +875,7 @@ DASHBOARD_HTML = """
 
                     row.innerHTML = `
                         <td style="padding: 8px; color: var(--cyan); font-weight: bold;" class="cell-asset">${assetDisplay}</td>
-                        <td style="padding: 8px; color: var(--dim);" class="cell-endtime">${utcToCst(m.end_time) || 'N/A'}</td>
+                        <td style="padding: 8px; color: var(--dim-green);" class="cell-endtime">${utcToCst(m.end_time) || 'N/A'}</td>
                         <td style="padding: 8px; text-align: right;" class="cell-timeleft">${timeLeft}</td>
                         <td style="padding: 8px; text-align: right;" class="cell-upprice">${m.up_price ? (m.up_price * 100).toFixed(1) + '¢' : 'N/A'}</td>
                         <td style="padding: 8px; text-align: right;" class="cell-downprice">${m.down_price ? (m.down_price * 100).toFixed(1) + '¢' : 'N/A'}</td>
@@ -932,7 +896,7 @@ DASHBOARD_HTML = """
                     const downText = m.down_price ? (m.down_price * 100).toFixed(1) + '¢' : 'N/A';
                     const spreadText = spread ? spread + '¢' : 'N/A';
                     const arbText = meetsArbCriteria ? '✓' : '—';
-                    const arbColor = meetsArbCriteria ? '#00ff41' : 'var(--dim)';
+                    const arbColor = meetsArbCriteria ? 'var(--green)' : 'var(--dim-green)';
                     const arbWeight = meetsArbCriteria ? 'bold' : 'normal';
 
                     if (upCell && upCell.textContent !== upText) upCell.textContent = upText;
@@ -972,7 +936,7 @@ DASHBOARD_HTML = """
                 const mins = Math.floor(secondsRemaining / 60);
                 const secs = Math.floor(secondsRemaining % 60);
                 const timeLeft = secondsRemaining > 0 ? `${mins}m ${secs}s` : 'ENDED';
-                const timeColor = secondsRemaining > 60 ? 'var(--primary)' : 'var(--red)';
+                const timeColor = secondsRemaining > 60 ? 'var(--green)' : 'var(--red)';
 
                 const timeCell = row.querySelector('.cell-timeleft');
 
