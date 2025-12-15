@@ -155,12 +155,12 @@ class TestPositionSizingMinimumEnforcement:
         from src.strategies.gabagool import GabagoolStrategy
         import inspect
 
-        # Get the _process_opportunity method source (where budget is checked)
-        source = inspect.getsource(GabagoolStrategy._process_opportunity)
+        # Get the on_opportunity method source (where budget is checked)
+        source = inspect.getsource(GabagoolStrategy.on_opportunity)
 
         # Should check minimum budget requirement
         assert 'min_budget_required' in source or 'min_trade_size_usd' in source, (
-            "_process_opportunity must enforce minimum budget"
+            "on_opportunity must enforce minimum budget"
         )
 
 
@@ -209,17 +209,17 @@ class TestPositionSizingBounds:
         sizer = PositionSizer(config)
 
         # Calculate position with budget at max
-        yes_amount, no_amount = sizer.calculate_position_sizes(
-            budget=5.0,
+        result = sizer.calculate(
             yes_price=0.48,
             no_price=0.49,
+            available_budget=5.0,
         )
 
         # Should not exceed max
-        assert yes_amount <= config.max_trade_size_usd, (
+        assert result.yes_amount_usd <= config.max_trade_size_usd, (
             "YES amount should not exceed max_trade_size_usd"
         )
-        assert no_amount <= config.max_trade_size_usd, (
+        assert result.no_amount_usd <= config.max_trade_size_usd, (
             "NO amount should not exceed max_trade_size_usd"
         )
 

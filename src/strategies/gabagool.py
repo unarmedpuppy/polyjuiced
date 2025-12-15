@@ -1300,7 +1300,6 @@ class GabagoolStrategy(BaseStrategy):
             Aggregated trade result from all tranches
         """
         num_tranches = self.gabagool_config.gradual_entry_tranches
-        delay_seconds = self.gabagool_config.gradual_entry_delay_seconds
         market = opportunity.market
 
         # Calculate per-tranche amounts
@@ -1322,13 +1321,11 @@ class GabagoolStrategy(BaseStrategy):
             )
 
         log.info(
-            "GRADUAL ENTRY: Starting multi-tranche execution",
+            "GRADUAL ENTRY: Starting multi-tranche execution (back-to-back, no delays)",
             asset=market.asset,
             num_tranches=num_tranches,
             yes_per_tranche=f"${yes_per_tranche:.2f}",
             no_per_tranche=f"${no_per_tranche:.2f}",
-            delay_seconds=delay_seconds,
-            total_time=f"{(num_tranches - 1) * delay_seconds:.0f}s",
         )
 
         # Track cumulative results
@@ -1398,13 +1395,8 @@ class GabagoolStrategy(BaseStrategy):
                     error=tranche_result.error if tranche_result else "No result",
                 )
 
-            # Delay before next tranche (except for last one)
-            if tranche_num < num_tranches - 1:
-                log.debug(
-                    f"GRADUAL ENTRY: Waiting {delay_seconds}s before next tranche",
-                    asset=market.asset,
-                )
-                await asyncio.sleep(delay_seconds)
+            # No delay between tranches - execute back-to-back as fast as possible
+            # Goal: chip away at liquidity quickly without scaring away the spread
 
         # Build aggregated result
         if tranches_executed == 0:

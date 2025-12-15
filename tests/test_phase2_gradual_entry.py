@@ -92,36 +92,39 @@ class TestGradualEntryTranchesConfig:
             )
 
 
-class TestGradualEntryDelayConfig:
-    """Test gradual_entry_delay_seconds configuration parameter."""
+class TestGradualEntryNoDelays:
+    """Test that gradual entry executes back-to-back without delays.
 
-    def test_gabagool_config_has_delay_field(self):
-        """Verify GabagoolConfig has gradual_entry_delay_seconds field."""
-        from src.config import GabagoolConfig
+    Tranches are executed immediately after each fills - no waiting.
+    Goal: chip away at liquidity as fast as possible without scaring away the spread.
+    """
 
-        config = GabagoolConfig()
-        assert hasattr(config, 'gradual_entry_delay_seconds'), (
-            "GabagoolConfig must have gradual_entry_delay_seconds field"
+    def test_gradual_entry_no_sleep_between_tranches(self):
+        """Verify _execute_gradual_entry does NOT use asyncio.sleep for delays.
+
+        We want back-to-back execution, not delays between tranches.
+        """
+        from src.strategies.gabagool import GabagoolStrategy
+        import inspect
+
+        source = inspect.getsource(GabagoolStrategy._execute_gradual_entry)
+
+        # Should NOT use asyncio.sleep - we execute back-to-back
+        assert 'asyncio.sleep' not in source, (
+            "_execute_gradual_entry should NOT use asyncio.sleep - execute back-to-back"
         )
 
-    def test_delay_default_is_30_seconds(self):
-        """Verify default delay is 30 seconds between tranches."""
-        from src.config import GabagoolConfig
+    def test_gradual_entry_comment_explains_no_delay(self):
+        """Verify code has comment explaining why no delays."""
+        from src.strategies.gabagool import GabagoolStrategy
+        import inspect
 
-        config = GabagoolConfig()
-        assert config.gradual_entry_delay_seconds == 30.0, (
-            "Default gradual_entry_delay_seconds should be 30.0"
+        source = inspect.getsource(GabagoolStrategy._execute_gradual_entry)
+
+        # Should have comment explaining the approach
+        assert 'back-to-back' in source.lower() or 'no delay' in source.lower(), (
+            "_execute_gradual_entry should explain back-to-back execution"
         )
-
-    def test_delay_loaded_from_env(self):
-        """Verify gradual_entry_delay_seconds is loaded from env var."""
-        from src.config import GabagoolConfig
-
-        with patch.dict(os.environ, {"GABAGOOL_GRADUAL_ENTRY_DELAY": "15.0"}):
-            config = GabagoolConfig.from_env()
-            assert config.gradual_entry_delay_seconds == 15.0, (
-                "gradual_entry_delay_seconds should be loaded from env var"
-            )
 
 
 class TestGradualEntryMinSpreadConfig:
@@ -261,19 +264,22 @@ class TestGradualEntryTrancheSizing:
         )
 
 
-class TestGradualEntryDelay:
-    """Test delay between tranches in gradual entry."""
+class TestGradualEntryBackToBack:
+    """Test that tranches execute back-to-back without delays."""
 
-    def test_gradual_entry_has_delay_between_tranches(self):
-        """Verify _execute_gradual_entry waits between tranches."""
+    def test_gradual_entry_executes_immediately(self):
+        """Verify _execute_gradual_entry loops through tranches without delays.
+
+        Each tranche should execute immediately after the previous one fills.
+        """
         from src.strategies.gabagool import GabagoolStrategy
         import inspect
 
         source = inspect.getsource(GabagoolStrategy._execute_gradual_entry)
 
-        # Should use asyncio.sleep for delay
-        assert 'asyncio.sleep' in source, (
-            "_execute_gradual_entry must use asyncio.sleep for delays"
+        # Should have a for loop for tranches
+        assert 'for tranche_num in range' in source, (
+            "_execute_gradual_entry must loop through tranches"
         )
 
 
@@ -351,14 +357,17 @@ class TestEnvTemplateHasGradualEntry:
             ".env.template must document GABAGOOL_GRADUAL_ENTRY_TRANCHES"
         )
 
-    def test_env_template_has_gradual_entry_delay(self):
-        """Verify .env.template documents GABAGOOL_GRADUAL_ENTRY_DELAY."""
+    def test_env_template_no_delay_parameter(self):
+        """Verify .env.template does NOT have GABAGOOL_GRADUAL_ENTRY_DELAY.
+
+        Delays were removed - tranches execute back-to-back.
+        """
         from pathlib import Path
 
         template_path = Path(__file__).parent.parent / ".env.template"
         content = template_path.read_text()
-        assert "GABAGOOL_GRADUAL_ENTRY_DELAY" in content, (
-            ".env.template must document GABAGOOL_GRADUAL_ENTRY_DELAY"
+        assert "GABAGOOL_GRADUAL_ENTRY_DELAY" not in content, (
+            ".env.template should NOT have GABAGOOL_GRADUAL_ENTRY_DELAY - delays removed"
         )
 
     def test_env_template_has_gradual_entry_min_spread(self):
@@ -444,23 +453,22 @@ class TestGradualEntryMatchesGabagool22Pattern:
         assert config.gradual_entry_tranches >= 2, (
             "Default tranches should be >= 2 for meaningful scaling"
         )
-        assert config.gradual_entry_delay_seconds >= 10.0, (
-            "Default delay should be >= 10s to spread entries"
-        )
         assert config.gradual_entry_min_spread_cents >= 2.0, (
             "Default min spread should be >= 2 cents for safety"
         )
 
-    def test_total_time_calculation(self):
-        """Verify total time for gradual entry is reasonable."""
-        from src.config import GabagoolConfig
+    def test_back_to_back_execution_is_fast(self):
+        """Verify gradual entry executes as fast as possible.
 
-        config = GabagoolConfig()
+        Since we removed delays, tranches execute back-to-back.
+        This matches gabagool22's pattern of ~2.8 trades/second.
+        """
+        from src.strategies.gabagool import GabagoolStrategy
+        import inspect
 
-        # Total time = (tranches - 1) * delay
-        total_time = (config.gradual_entry_tranches - 1) * config.gradual_entry_delay_seconds
+        source = inspect.getsource(GabagoolStrategy._execute_gradual_entry)
 
-        # Should complete within 2 minutes for reasonable UX
-        assert total_time <= 120, (
-            f"Total gradual entry time ({total_time}s) should be <= 120s"
+        # Should NOT have any asyncio.sleep for delays
+        assert 'asyncio.sleep' not in source, (
+            "Gradual entry should execute back-to-back without delays"
         )

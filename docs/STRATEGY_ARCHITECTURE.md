@@ -1049,19 +1049,20 @@ SINGLE ENTRY (default):
 GRADUAL ENTRY (when enabled for spreads >= 3¢):
 1. Opportunity detected: $5 spread on BTC market
 2. Split into 3 tranches: $1.67 per tranche
-3. Tranche 1: Execute $1.67 YES + $1.67 NO
-4. Wait 30 seconds
-5. Tranche 2: Execute $1.67 YES + $1.67 NO (if still tradeable)
-6. Wait 30 seconds
-7. Tranche 3: Execute $1.67 YES + $1.67 NO (if still tradeable)
-8. Return aggregated result
+3. Tranche 1: Execute $1.67 YES + $1.67 NO → fills
+4. Tranche 2: Execute immediately → fills (if still tradeable)
+5. Tranche 3: Execute immediately → fills (if still tradeable)
+6. Return aggregated result
+
+No delays between tranches - execute back-to-back as fast as possible.
+Goal: chip away at liquidity without scaring away the spread.
+Uses GTC orders (FOK has precision bugs in py-clob-client).
 ```
 
 **Config (disabled by default):**
 ```env
 GABAGOOL_GRADUAL_ENTRY_ENABLED=false
 GABAGOOL_GRADUAL_ENTRY_TRANCHES=3
-GABAGOOL_GRADUAL_ENTRY_DELAY=30.0
 GABAGOOL_GRADUAL_ENTRY_MIN_SPREAD=3.0
 ```
 
