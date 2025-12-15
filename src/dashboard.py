@@ -70,7 +70,7 @@ DASHBOARD_HTML = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>TURN 1 SOL RING // POLYMARKET BOT</title>
+    <title>turn1solring // polymarket bot</title>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=VT323&family=Share+Tech+Mono&display=swap');
 
@@ -626,8 +626,8 @@ DASHBOARD_HTML = """
     <div class="container">
         <header class="header">
             <div class="header-text">
-                <h1>TURN 1 SOL RING</h1>
-                <div class="subtitle">POLYMARKET ARBITRAGE BOT v1.0.0</div>
+                <h1>turn1solring</h1>
+                <div class="subtitle">polymarket bot v1.0.0</div>
             </div>
         </header>
         <div class="status-bar">
@@ -816,7 +816,7 @@ DASHBOARD_HTML = """
         </div>
 
         <footer class="footer">
-            TURN 1 SOL RING // POLYMARKET CLOB //
+            turn1solring // polymarket clob //
             <span id="current-time"></span>
         </footer>
     </div>
