@@ -259,11 +259,16 @@ class VolHappensStrategy(BaseStrategy):
         )
 
         if filtered_markets:
+            # Initialize tracker with websocket client (same pattern as Gabagool)
+            # Use a tight spread for Vol Happens - we want to catch all price movements
             self._tracker = MultiMarketTracker(
-                markets=filtered_markets,
-                config=self.config,
-                dashboard_callback=None,
+                self.ws,
+                min_spread_cents=2.0,  # 2 cent min spread for opportunity detection
             )
+
+            # Add markets to tracker
+            for market in filtered_markets:
+                await self._tracker.add_market(market)
 
     async def _monitor_loop(self) -> None:
         """Main monitoring loop - checks for entry opportunities."""
