@@ -45,6 +45,8 @@ services:
       - "traefik.http.routers.polymarket.tls=true"
       - "traefik.http.routers.polymarket.middlewares=polymarket-auth"
       - "traefik.http.routers.polymarket.service=polymarket"
+      # Disable response buffering for SSE (Server-Sent Events)
+      - "traefik.http.services.polymarket.loadbalancer.responseforwarding.flushinterval=100ms"
       # Service and auth middleware
       - "traefik.http.services.polymarket.loadbalancer.server.port=8080"
       - "traefik.http.services.polymarket-metrics.loadbalancer.server.port=8000"
