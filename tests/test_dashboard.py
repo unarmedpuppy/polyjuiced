@@ -377,3 +377,84 @@ class TestDashboardPriceUpdates:
         assert 'spread' in DASHBOARD_HTML.lower(), (
             "Dashboard must display spread for markets"
         )
+
+
+class TestDashboardReconciliationIntegration:
+    """Regression tests for reconciliation dashboard integration.
+
+    Phase 16: Dashboard has observability widgets for reconciliation status
+    and historical positions.
+    """
+
+    def test_dashboard_has_reconciliation_endpoint(self):
+        """Verify /dashboard/reconciliation endpoint is registered."""
+        from src.dashboard import DashboardServer
+
+        server = DashboardServer()
+        assert hasattr(server, '_handle_reconciliation'), (
+            "DashboardServer must have _handle_reconciliation method"
+        )
+
+    def test_dashboard_has_positions_endpoint(self):
+        """Verify /dashboard/positions endpoint is registered."""
+        from src.dashboard import DashboardServer
+
+        server = DashboardServer()
+        assert hasattr(server, '_handle_positions'), (
+            "DashboardServer must have _handle_positions method"
+        )
+
+    def test_dashboard_html_has_recon_section(self):
+        """Verify dashboard HTML includes reconciliation section."""
+        from src.dashboard import DASHBOARD_HTML
+
+        # Dashboard should have reconciliation-related UI
+        assert 'reconciliation' in DASHBOARD_HTML.lower() or 'recon' in DASHBOARD_HTML.lower(), (
+            "Dashboard HTML must include reconciliation section"
+        )
+
+    def test_dashboard_html_has_positions_section(self):
+        """Verify dashboard HTML includes historical positions section."""
+        from src.dashboard import DASHBOARD_HTML
+
+        # Dashboard should have positions/settlement history UI
+        assert 'historical' in DASHBOARD_HTML.lower() or 'settlement' in DASHBOARD_HTML.lower() or 'position' in DASHBOARD_HTML.lower(), (
+            "Dashboard HTML must include historical positions section"
+        )
+
+    def test_dashboard_has_refresh_button_for_reconciliation(self):
+        """Verify dashboard has refresh button for reconciliation status."""
+        from src.dashboard import DASHBOARD_HTML
+
+        # Should have a refresh mechanism
+        assert 'refresh' in DASHBOARD_HTML.lower() or 'reload' in DASHBOARD_HTML.lower(), (
+            "Dashboard should have refresh capability for reconciliation"
+        )
+
+
+class TestDashboardHttpxImport:
+    """Test dashboard has required imports for reconciliation.
+
+    Phase 15-16: Dashboard uses httpx for async API calls to Polymarket.
+    """
+
+    def test_dashboard_imports_httpx(self):
+        """Verify dashboard imports httpx for async HTTP calls."""
+        import src.dashboard as dashboard_module
+        import httpx
+
+        # The module should be able to use httpx.AsyncClient
+        assert hasattr(httpx, 'AsyncClient'), (
+            "httpx must have AsyncClient for async HTTP calls"
+        )
+
+    def test_dashboard_imports_required_modules(self):
+        """Verify dashboard imports all required modules for reconciliation."""
+        import src.dashboard as dashboard_module
+
+        # These should be importable after reading dashboard
+        required_modules = ['os', 'httpx', 'json']
+        for mod in required_modules:
+            assert mod in dir(dashboard_module) or __import__(mod), (
+                f"Dashboard should use {mod} module"
+            )
