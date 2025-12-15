@@ -1191,6 +1191,31 @@ class GabagoolStrategy(BaseStrategy):
         # Execute real trade
         # Phase 3: Use parallel execution if enabled for better atomicity
 
+        # ========== CRITICAL: LOG BEFORE ORDER PLACEMENT ==========
+        # This log MUST appear BEFORE we attempt any real money operations
+        # so we have a record even if the process crashes mid-trade
+        log.warning(
+            "💰 ATTEMPTING REAL TRADE - SUBMITTING ORDERS",
+            asset=market.asset,
+            condition_id=market.condition_id[:20] + "...",
+            yes_token_id=market.yes_token_id[:16] + "...",
+            no_token_id=market.no_token_id[:16] + "...",
+            yes_price=f"${opportunity.yes_price:.4f}",
+            no_price=f"${opportunity.no_price:.4f}",
+            yes_amount_usd=f"${yes_amount:.2f}",
+            no_amount_usd=f"${no_amount:.2f}",
+            total_cost=f"${total_cost:.2f}",
+            expected_profit=f"${expected_profit:.4f}",
+            parallel_mode=self.gabagool_config.parallel_execution_enabled,
+        )
+        add_log(
+            "warning",
+            f"💰 ATTEMPTING TRADE: {market.asset}",
+            yes_price=f"${opportunity.yes_price:.2f}",
+            no_price=f"${opportunity.no_price:.2f}",
+            total=f"${total_cost:.2f}",
+        )
+
         # Record order_placed telemetry
         telemetry = self._pending_telemetry.get(market.condition_id)
         if telemetry:
@@ -1425,6 +1450,32 @@ class GabagoolStrategy(BaseStrategy):
                 execution_status = "one_leg_only"
             else:
                 execution_status = "failed"
+
+            # ========== CRITICAL: LOG ALL TRADE EXECUTIONS ==========
+            log.warning(
+                "🚨 TRADE EXECUTED - REAL MONEY",
+                asset=market.asset,
+                condition_id=market.condition_id[:20] + "...",
+                yes_shares=f"{actual_yes_shares:.4f}",
+                no_shares=f"{actual_no_shares:.4f}",
+                yes_cost=f"${yes_amount:.2f}",
+                no_cost=f"${no_amount:.2f}",
+                total_cost=f"${total_cost:.2f}",
+                expected_profit=f"${expected_profit:.4f}",
+                hedge_ratio=f"{actual_hedge_ratio:.2%}",
+                execution_status=execution_status,
+                yes_order_status=yes_order_status,
+                no_order_status=no_order_status,
+            )
+            # Also log to dashboard for visibility
+            add_log(
+                "warning" if execution_status != "full_fill" else "info",
+                f"🚨 TRADE COMPLETE: {market.asset}",
+                status=execution_status,
+                yes_shares=f"{actual_yes_shares:.2f}",
+                no_shares=f"{actual_no_shares:.2f}",
+                total=f"${total_cost:.2f}",
+            )
 
             # Add to dashboard trade history (kept for backward compat during transition)
             trade_id = add_trade(
