@@ -775,7 +775,7 @@ DASHBOARD_HTML = """
                 </span>
             </div>
             <div class="panel-body" style="padding: 0;">
-                <div id="markets-list" style="max-height: 430px; overflow-y: auto;">
+                <div id="markets-list" style="max-height: 180px; overflow-y: auto;">
                     <div style="padding: 20px; text-align: center; color: var(--dim-green);">
                         Searching for markets...
                     </div>
@@ -1009,11 +1009,31 @@ DASHBOARD_HTML = """
                 return (a[1].asset || '').localeCompare(b[1].asset || '');
             });
 
+            // Filter to only show markets within 15-minute window (900 seconds)
+            const filteredMarkets = sortedMarkets.filter(([id, m]) => {
+                const endMs = marketEndTimes.get(id);
+                const secondsRemaining = endMs ? calculateSecondsRemaining(endMs) : 0;
+                return secondsRemaining > 0 && secondsRemaining <= 900;
+            });
+
+            // Handle case where all markets are filtered out (none within 15-min window)
+            if (filteredMarkets.length === 0) {
+                // Clear any existing rows since they're all outside the window
+                for (const [id, row] of marketRowCache.entries()) {
+                    row.remove();
+                    marketRowCache.delete(id);
+                }
+                // Don't show empty message - markets exist but are >15min away
+                document.getElementById('market-count').textContent = '0';
+                document.getElementById('tradeable-count').textContent = '0';
+                return;
+            }
+
             let foundCount = 0;
             let tradeableCount = 0;
 
             // Update or create rows for each market (but don't reorder existing rows)
-            for (const [id, m] of sortedMarkets) {
+            for (const [id, m] of filteredMarkets) {
                 foundCount++;
 
                 // Calculate time remaining client-side from stored end time
