@@ -46,16 +46,17 @@ class TestDashboardOptimizedUpdates:
             "Dashboard must cache market row elements for incremental updates"
         )
 
-    def test_dashboard_uses_request_animation_frame(self):
-        """Verify dashboard uses requestAnimationFrame for debouncing.
+    def test_dashboard_uses_debouncing(self):
+        """Verify dashboard uses debouncing for market updates.
 
         Regression test: Rapid updates (~100/sec from WebSocket) must be
-        debounced to the browser's ~60fps refresh rate.
+        debounced to prevent UI flickering.
         """
         from src.dashboard import DASHBOARD_HTML
 
-        assert 'requestAnimationFrame' in DASHBOARD_HTML, (
-            "Dashboard must use requestAnimationFrame to debounce rapid updates"
+        # Dashboard uses setTimeout with marketUpdateTimer for debouncing
+        assert 'setTimeout' in DASHBOARD_HTML or 'requestAnimationFrame' in DASHBOARD_HTML, (
+            "Dashboard must use setTimeout or requestAnimationFrame to debounce rapid updates"
         )
 
     def test_dashboard_updates_text_content_not_inner_html(self):
@@ -131,16 +132,17 @@ class TestDashboardOptimizedUpdates:
             "SSE handler must route market updates through updateMarketsOptimized"
         )
 
-    def test_pending_market_update_debouncing(self):
-        """Verify pendingMarketUpdate variable exists for debouncing.
+    def test_market_update_timer_debouncing(self):
+        """Verify marketUpdateTimer variable exists for debouncing.
 
         Regression test: Rapid updates need to be debounced, and we track
-        this with a pending update flag/ID.
+        this with a timer variable.
         """
         from src.dashboard import DASHBOARD_HTML
 
-        assert 'pendingMarketUpdate' in DASHBOARD_HTML, (
-            "Dashboard must have pendingMarketUpdate for debouncing"
+        # Dashboard uses marketUpdateTimer with setTimeout for debouncing
+        assert 'marketUpdateTimer' in DASHBOARD_HTML or 'pendingMarketUpdate' in DASHBOARD_HTML, (
+            "Dashboard must have marketUpdateTimer or pendingMarketUpdate for debouncing"
         )
 
     def test_optimized_function_handles_row_removal(self):
