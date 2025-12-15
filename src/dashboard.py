@@ -1531,10 +1531,8 @@ DASHBOARD_HTML = """
                         </div>
                     ` : '';
 
-                    // Strategy and mode badges
-                    const strategyId = trade.strategy_id || 'gabagool';
+                    // Strategy and mode badges (strategyId and isDryRun defined above)
                     const strategyLabel = strategyId === 'vol_happens' ? 'VOL' : 'GAB';
-                    const isDryRun = trade.dry_run || trade.trading_mode === 'DRY_RUN';
                     const modeLabel = isDryRun ? 'PAPER' : 'LIVE';
                     const modeBadgeClass = isDryRun ? 'badge-paper' : 'badge-live';
                     const strategyBadgeClass = strategyId === 'vol_happens' ? 'badge-vol' : 'badge-gab';
