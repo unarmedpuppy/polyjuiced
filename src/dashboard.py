@@ -2,10 +2,13 @@
 
 import asyncio
 import json
-from collections import deque
-from datetime import datetime
+import os
+from collections import defaultdict, deque
+from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Deque, Dict, Any, List, Optional, TYPE_CHECKING
 
+import httpx
 import structlog
 from aiohttp import web
 
@@ -661,6 +664,11 @@ DASHBOARD_HTML = """
                     <div id="nr-status" class="status-dot"></div>
                     <span>NEAR-RES</span>
                 </div>
+                <!-- Reconciliation Status -->
+                <div class="status-item" style="margin-left: 20px; padding-left: 20px; border-left: 1px solid var(--border);">
+                    <div id="recon-status" class="status-dot" title="Reconciliation status"></div>
+                    <span>RECON</span>
+                </div>
             </div>
         </header>
 
@@ -780,6 +788,38 @@ DASHBOARD_HTML = """
                     <div style="padding: 20px; text-align: center; color: var(--dim-green);">
                         Searching for markets...
                     </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Reconciliation Status Panel -->
+        <div class="panel" style="margin-bottom: 20px;">
+            <div class="panel-header">
+                <span class="panel-title">[ RECONCILIATION STATUS ]</span>
+                <span style="color: var(--dim-green); font-size: 0.8rem;">
+                    <span id="recon-last-run">never</span>
+                    <button id="recon-refresh-btn" onclick="loadReconciliation()" style="margin-left: 10px; background: var(--dark-green); border: 1px solid var(--border); color: var(--green); cursor: pointer; padding: 2px 8px; font-family: inherit; font-size: 0.75rem;">REFRESH</button>
+                </span>
+            </div>
+            <div class="panel-body" style="padding: 10px;">
+                <div id="recon-content" style="display: flex; gap: 30px; align-items: center; flex-wrap: wrap;">
+                    <div style="text-align: center;">
+                        <div id="recon-untracked" style="font-size: 1.5rem; font-weight: bold; color: var(--dim-green);">-</div>
+                        <div style="font-size: 0.75rem; color: var(--dim-green);">UNTRACKED</div>
+                    </div>
+                    <div style="text-align: center;">
+                        <div id="recon-value" style="font-size: 1.5rem; font-weight: bold; color: var(--dim-green);">-</div>
+                        <div style="font-size: 0.75rem; color: var(--dim-green);">UNTRACKED VALUE</div>
+                    </div>
+                    <div style="text-align: center;">
+                        <div id="recon-polymarket" style="font-size: 1.5rem; font-weight: bold; color: var(--dim-green);">-</div>
+                        <div style="font-size: 0.75rem; color: var(--dim-green);">POLYMARKET TRADES</div>
+                    </div>
+                    <div style="text-align: center;">
+                        <div id="recon-local" style="font-size: 1.5rem; font-weight: bold; color: var(--dim-green);">-</div>
+                        <div style="font-size: 0.75rem; color: var(--dim-green);">LOCAL TRACKED</div>
+                    </div>
+                    <div id="recon-message" style="flex: 1; min-width: 200px; font-size: 0.85rem; color: var(--dim-green);"></div>
                 </div>
             </div>
         </div>
@@ -1592,6 +1632,86 @@ DASHBOARD_HTML = """
             });
         });
 
+        // ========== Reconciliation Status ==========
+        let reconLoading = false;
+
+        async function loadReconciliation() {
+            if (reconLoading) return;
+            reconLoading = true;
+
+            const btn = document.getElementById('recon-refresh-btn');
+            const statusDot = document.getElementById('recon-status');
+            if (btn) btn.disabled = true;
+            if (btn) btn.textContent = 'LOADING...';
+
+            try {
+                const resp = await fetch('/dashboard/reconciliation');
+                const data = await resp.json();
+                renderReconciliation(data);
+            } catch (e) {
+                console.error('Failed to load reconciliation:', e);
+                document.getElementById('recon-message').textContent = 'Error: ' + e.message;
+                if (statusDot) {
+                    statusDot.className = 'status-dot error';
+                    statusDot.title = 'Reconciliation error';
+                }
+            } finally {
+                reconLoading = false;
+                if (btn) btn.disabled = false;
+                if (btn) btn.textContent = 'REFRESH';
+            }
+        }
+
+        function renderReconciliation(data) {
+            const statusDot = document.getElementById('recon-status');
+            const untrackedEl = document.getElementById('recon-untracked');
+            const valueEl = document.getElementById('recon-value');
+            const polymarketEl = document.getElementById('recon-polymarket');
+            const localEl = document.getElementById('recon-local');
+            const messageEl = document.getElementById('recon-message');
+            const lastRunEl = document.getElementById('recon-last-run');
+
+            // Update last run time
+            if (data.last_run) {
+                const d = new Date(data.last_run);
+                lastRunEl.textContent = d.toLocaleTimeString();
+            }
+
+            // Update stats
+            const untracked = data.untracked_count || 0;
+            const untrackedValue = data.total_untracked_value || 0;
+
+            untrackedEl.textContent = untracked;
+            valueEl.textContent = '$' + untrackedValue.toFixed(2);
+            polymarketEl.textContent = data.polymarket_trades || 0;
+            localEl.textContent = (data.local_trades || 0) + (data.settlement_queue || 0);
+
+            // Update status dot and colors based on discrepancies
+            if (data.error) {
+                statusDot.className = 'status-dot error';
+                statusDot.title = 'Reconciliation error';
+                messageEl.textContent = data.error;
+                messageEl.style.color = 'var(--red)';
+            } else if (untracked > 0) {
+                statusDot.className = 'status-dot warning';
+                statusDot.title = untracked + ' untracked positions';
+                untrackedEl.style.color = 'var(--amber)';
+                valueEl.style.color = 'var(--amber)';
+                messageEl.innerHTML = '<span style="color: var(--amber);">WARNING:</span> ' + untracked + ' positions on Polymarket not tracked locally. Value at risk: $' + untrackedValue.toFixed(2);
+                messageEl.style.color = 'var(--amber)';
+            } else {
+                statusDot.className = 'status-dot';
+                statusDot.title = 'All positions tracked';
+                untrackedEl.style.color = 'var(--status-active)';
+                valueEl.style.color = 'var(--status-active)';
+                messageEl.textContent = 'All positions are tracked. No discrepancies found.';
+                messageEl.style.color = 'var(--status-active)';
+            }
+        }
+
+        // Load reconciliation on page load
+        loadReconciliation();
+
         // ========== Historical Positions ==========
         async function loadPositions() {
             try {
@@ -1723,6 +1843,7 @@ class DashboardServer:
         self._app.router.add_get("/dashboard/events", self._handle_events)
         self._app.router.add_get("/dashboard/pnl-history", self._handle_pnl_history)
         self._app.router.add_get("/dashboard/positions", self._handle_positions)
+        self._app.router.add_get("/dashboard/reconciliation", self._handle_reconciliation)
 
         self._runner = web.AppRunner(self._app)
         await self._runner.setup()
@@ -1834,6 +1955,152 @@ class DashboardServer:
             "positions": positions,
             "stats": settlement_stats,
         })
+
+    async def _handle_reconciliation(self, request: web.Request) -> web.Response:
+        """Run trade reconciliation and return status."""
+        try:
+            # Get wallet address from environment
+            wallet = os.getenv("POLYMARKET_PROXY_WALLET")
+            if not wallet:
+                # Try to read from .env file
+                env_path = Path("/app/.env")
+                if env_path.exists():
+                    with open(env_path) as f:
+                        for line in f:
+                            if line.startswith("POLYMARKET_PROXY_WALLET="):
+                                wallet = line.split("=", 1)[1].strip().strip('"').strip("'")
+                                break
+
+            if not wallet:
+                return web.json_response({
+                    "error": "POLYMARKET_PROXY_WALLET not configured",
+                    "last_run": datetime.utcnow().isoformat(),
+                })
+
+            # Get days parameter (default 7)
+            days = int(request.query.get("days", "7"))
+            days = min(days, 30)  # Cap at 30 days
+
+            # Fetch trades from Polymarket API
+            DATA_API_BASE = "https://data-api.polymarket.com"
+            cutoff = datetime.now() - timedelta(days=days)
+            since_timestamp = int(cutoff.timestamp())
+
+            all_trades = []
+            offset = 0
+            limit = 500
+
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                while True:
+                    params = {
+                        "user": wallet,
+                        "limit": limit,
+                        "offset": offset,
+                    }
+                    response = await client.get(f"{DATA_API_BASE}/trades", params=params)
+                    response.raise_for_status()
+                    trades = response.json()
+
+                    if not trades:
+                        break
+
+                    # Filter by timestamp
+                    trades = [t for t in trades if t.get("timestamp", 0) >= since_timestamp]
+                    if not trades:
+                        break
+
+                    all_trades.extend(trades)
+
+                    if len(trades) < limit:
+                        break
+
+                    offset += limit
+
+            # Analyze trades by market
+            markets = defaultdict(lambda: {
+                "up_trades": [],
+                "down_trades": [],
+                "up_shares": 0.0,
+                "down_shares": 0.0,
+                "up_cost": 0.0,
+                "down_cost": 0.0,
+                "title": "",
+                "condition_id": "",
+            })
+
+            for t in all_trades:
+                cid = t.get("conditionId", "")
+                outcome = t.get("outcome", "").lower()
+                size = float(t.get("size", 0))
+                price = float(t.get("price", 0))
+                cost = size * price
+
+                markets[cid]["condition_id"] = cid
+                markets[cid]["title"] = t.get("title", "")
+
+                if outcome == "up":
+                    markets[cid]["up_trades"].append(t)
+                    markets[cid]["up_shares"] += size
+                    markets[cid]["up_cost"] += cost
+                elif outcome == "down":
+                    markets[cid]["down_trades"].append(t)
+                    markets[cid]["down_shares"] += size
+                    markets[cid]["down_cost"] += cost
+
+            # Get local data
+            local_trades = []
+            settlement_queue = []
+            if _db:
+                # Get trades from local DB
+                async with _db._conn.execute("SELECT * FROM trades") as cursor:
+                    rows = await cursor.fetchall()
+                    local_trades = [dict(row) for row in rows]
+
+                # Get settlement queue
+                async with _db._conn.execute("SELECT * FROM settlement_queue WHERE claimed = 0") as cursor:
+                    rows = await cursor.fetchall()
+                    settlement_queue = [dict(row) for row in rows]
+
+            # Find untracked positions
+            tracked_conditions = set()
+            for t in local_trades:
+                if t.get("condition_id"):
+                    tracked_conditions.add(t["condition_id"])
+            for p in settlement_queue:
+                if p.get("condition_id"):
+                    tracked_conditions.add(p["condition_id"])
+
+            untracked = []
+            for cid, data in markets.items():
+                if cid not in tracked_conditions:
+                    untracked.append({
+                        "condition_id": cid,
+                        "title": data["title"],
+                        "up_shares": data["up_shares"],
+                        "down_shares": data["down_shares"],
+                        "total_cost": data["up_cost"] + data["down_cost"],
+                        "is_hedged": data["up_shares"] > 0 and data["down_shares"] > 0,
+                    })
+
+            return web.json_response({
+                "wallet": wallet,
+                "days_checked": days,
+                "polymarket_trades": len(all_trades),
+                "polymarket_markets": len(markets),
+                "local_trades": len(local_trades),
+                "settlement_queue": len(settlement_queue),
+                "untracked_positions": untracked,
+                "untracked_count": len(untracked),
+                "total_untracked_value": sum(p["total_cost"] for p in untracked),
+                "last_run": datetime.utcnow().isoformat(),
+            })
+
+        except Exception as e:
+            log.exception("Reconciliation failed", error=str(e))
+            return web.json_response({
+                "error": str(e),
+                "last_run": datetime.utcnow().isoformat(),
+            })
 
     async def broadcast(self, data: Dict[str, Any]) -> None:
         """Broadcast update to all connected clients."""
