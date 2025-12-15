@@ -493,7 +493,7 @@ DASHBOARD_HTML = """
         <header class="header">
             <div class="header-text">
                 <h1>TURN 1 SOL RING</h1>
-                <div class="subtitle">POLYMARKET ARBITRAGE BOT v0.1.0</div>
+                <div class="subtitle">POLYMARKET ARBITRAGE BOT v1.0.0</div>
             </div>
         </header>
         <div class="status-bar">
