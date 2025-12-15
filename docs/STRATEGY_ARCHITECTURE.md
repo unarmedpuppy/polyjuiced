@@ -1011,6 +1011,22 @@ python scripts/reconcile_trades.py --days 14
 - [x] Allows parallel execution to detect when one leg fills and other fails
 - [x] Partial fills now properly recorded to database and settlement queue
 
+### Phase 18: Configurable Position Sizing ✅ COMPLETE (2025-12-15)
+- [x] Added `min_trade_size_usd` config parameter (default $3.00)
+- [x] Configurable via `GABAGOOL_MIN_TRADE_SIZE` environment variable
+- [x] Replaced hardcoded `min_trade = 1.0` in `_adjust_for_liquidity()`
+- [x] Added minimum budget enforcement in `_process_opportunity()`
+- [x] Skip trades when budget < min_trade_size_usd * 2 (need funds for both legs)
+- [x] Matches gabagool22's successful pattern: $3-8 per trade
+- [x] Regression tests in `tests/test_phase1_position_sizing.py`
+
+**Production Config (already set):**
+```env
+GABAGOOL_MIN_TRADE_SIZE=3.0   # New: minimum per leg
+GABAGOOL_MAX_TRADE_SIZE=5.0   # Already in production
+GABAGOOL_MAX_SLIPPAGE=0.0     # Already in production (zero slippage)
+```
+
 **Root Cause of Untracked Positions:**
 ```
 BEFORE FIX:
@@ -1050,6 +1066,7 @@ AFTER FIX:
 | 2025-12-15 | Claude | **Phase 15 COMPLETE**: Trade reconciliation script (`scripts/reconcile_trades.py`). Fetches trades from Polymarket Data API, compares with local DB, identifies untracked positions. `--fix` flag adds to settlement queue. |
 | 2025-12-15 | Claude | **Phase 16 COMPLETE**: Dashboard observability widgets. Added Historical Positions panel, Reconciliation Status panel with RECON indicator, `/dashboard/positions` and `/dashboard/reconciliation` endpoints. |
 | 2025-12-15 | Claude | **Phase 17 COMPLETE**: Partial fill detection fix. `place_order_sync()` now catches exceptions and returns error dict instead of raising. Allows detection of partial fills when one leg fills and other throws exception. |
+| 2025-12-15 | Claude | **Phase 18 COMPLETE**: Configurable position sizing. Added `min_trade_size_usd` config (default $3.0), `GABAGOOL_MIN_TRADE_SIZE` env var, minimum budget enforcement. Matches gabagool22's $3-8 per trade pattern. |
 
 ---
 
