@@ -58,7 +58,7 @@ DASHBOARD_HTML = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MEGA MARBLE // POLYMARKET BOT</title>
+    <title>TURN 1 SOL RING // POLYMARKET BOT</title>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=VT323&family=Share+Tech+Mono&display=swap');
 
@@ -84,16 +84,16 @@ DASHBOARD_HTML = """
             overflow-x: hidden;
         }
 
-        /* Dithered noise texture overlay - organic random dots pattern */
+        /* Dithered noise texture overlay - visible grain pattern */
         body::before {
             content: "";
             position: fixed;
             top: 0; left: 0;
             width: 100%; height: 100%;
             pointer-events: none;
-            background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 100 100' xmlns='http://www.w3.org/2000/svg'%3E%3Ccircle cx='3' cy='7' r='0.8' fill='%23333'/%3E%3Ccircle cx='12' cy='2' r='0.6' fill='%23222'/%3E%3Ccircle cx='23' cy='9' r='0.7' fill='%23333'/%3E%3Ccircle cx='31' cy='4' r='0.5' fill='%23222'/%3E%3Ccircle cx='45' cy='6' r='0.8' fill='%23333'/%3E%3Ccircle cx='52' cy='1' r='0.6' fill='%23222'/%3E%3Ccircle cx='67' cy='8' r='0.7' fill='%23333'/%3E%3Ccircle cx='78' cy='3' r='0.5' fill='%23222'/%3E%3Ccircle cx='89' cy='7' r='0.8' fill='%23333'/%3E%3Ccircle cx='95' cy='2' r='0.6' fill='%23222'/%3E%3Ccircle cx='7' cy='15' r='0.7' fill='%23222'/%3E%3Ccircle cx='18' cy='19' r='0.5' fill='%23333'/%3E%3Ccircle cx='28' cy='12' r='0.8' fill='%23222'/%3E%3Ccircle cx='37' cy='17' r='0.6' fill='%23333'/%3E%3Ccircle cx='49' cy='14' r='0.7' fill='%23222'/%3E%3Ccircle cx='58' cy='18' r='0.5' fill='%23333'/%3E%3Ccircle cx='71' cy='11' r='0.8' fill='%23222'/%3E%3Ccircle cx='82' cy='16' r='0.6' fill='%23333'/%3E%3Ccircle cx='93' cy='13' r='0.7' fill='%23222'/%3E%3Ccircle cx='4' cy='24' r='0.5' fill='%23333'/%3E%3Ccircle cx='14' cy='28' r='0.8' fill='%23222'/%3E%3Ccircle cx='25' cy='21' r='0.6' fill='%23333'/%3E%3Ccircle cx='34' cy='26' r='0.7' fill='%23222'/%3E%3Ccircle cx='46' cy='23' r='0.5' fill='%23333'/%3E%3Ccircle cx='55' cy='29' r='0.8' fill='%23222'/%3E%3Ccircle cx='68' cy='22' r='0.6' fill='%23333'/%3E%3Ccircle cx='79' cy='27' r='0.7' fill='%23222'/%3E%3Ccircle cx='91' cy='24' r='0.5' fill='%23333'/%3E%3Ccircle cx='8' cy='33' r='0.8' fill='%23333'/%3E%3Ccircle cx='17' cy='38' r='0.6' fill='%23222'/%3E%3Ccircle cx='29' cy='31' r='0.7' fill='%23333'/%3E%3Ccircle cx='38' cy='36' r='0.5' fill='%23222'/%3E%3Ccircle cx='47' cy='34' r='0.8' fill='%23333'/%3E%3Ccircle cx='59' cy='39' r='0.6' fill='%23222'/%3E%3Ccircle cx='72' cy='32' r='0.7' fill='%23333'/%3E%3Ccircle cx='83' cy='37' r='0.5' fill='%23222'/%3E%3Ccircle cx='94' cy='33' r='0.8' fill='%23333'/%3E%3Ccircle cx='2' cy='44' r='0.6' fill='%23222'/%3E%3Ccircle cx='13' cy='48' r='0.7' fill='%23333'/%3E%3Ccircle cx='24' cy='41' r='0.5' fill='%23222'/%3E%3Ccircle cx='33' cy='46' r='0.8' fill='%23333'/%3E%3Ccircle cx='44' cy='43' r='0.6' fill='%23222'/%3E%3Ccircle cx='56' cy='49' r='0.7' fill='%23333'/%3E%3Ccircle cx='65' cy='42' r='0.5' fill='%23222'/%3E%3Ccircle cx='76' cy='47' r='0.8' fill='%23333'/%3E%3Ccircle cx='88' cy='44' r='0.6' fill='%23222'/%3E%3Ccircle cx='97' cy='48' r='0.7' fill='%23333'/%3E%3Ccircle cx='6' cy='53' r='0.5' fill='%23222'/%3E%3Ccircle cx='16' cy='58' r='0.8' fill='%23333'/%3E%3Ccircle cx='27' cy='51' r='0.6' fill='%23222'/%3E%3Ccircle cx='36' cy='56' r='0.7' fill='%23333'/%3E%3Ccircle cx='48' cy='54' r='0.5' fill='%23222'/%3E%3Ccircle cx='57' cy='59' r='0.8' fill='%23333'/%3E%3Ccircle cx='69' cy='52' r='0.6' fill='%23222'/%3E%3Ccircle cx='81' cy='57' r='0.7' fill='%23333'/%3E%3Ccircle cx='92' cy='53' r='0.5' fill='%23222'/%3E%3Ccircle cx='1' cy='64' r='0.8' fill='%23333'/%3E%3Ccircle cx='11' cy='68' r='0.6' fill='%23222'/%3E%3Ccircle cx='22' cy='61' r='0.7' fill='%23333'/%3E%3Ccircle cx='32' cy='66' r='0.5' fill='%23222'/%3E%3Ccircle cx='43' cy='63' r='0.8' fill='%23333'/%3E%3Ccircle cx='54' cy='69' r='0.6' fill='%23222'/%3E%3Ccircle cx='66' cy='62' r='0.7' fill='%23333'/%3E%3Ccircle cx='77' cy='67' r='0.5' fill='%23222'/%3E%3Ccircle cx='87' cy='64' r='0.8' fill='%23333'/%3E%3Ccircle cx='98' cy='68' r='0.6' fill='%23222'/%3E%3Ccircle cx='5' cy='73' r='0.7' fill='%23333'/%3E%3Ccircle cx='15' cy='78' r='0.5' fill='%23222'/%3E%3Ccircle cx='26' cy='71' r='0.8' fill='%23333'/%3E%3Ccircle cx='35' cy='76' r='0.6' fill='%23222'/%3E%3Ccircle cx='47' cy='74' r='0.7' fill='%23333'/%3E%3Ccircle cx='58' cy='79' r='0.5' fill='%23222'/%3E%3Ccircle cx='68' cy='72' r='0.8' fill='%23333'/%3E%3Ccircle cx='79' cy='77' r='0.6' fill='%23222'/%3E%3Ccircle cx='91' cy='73' r='0.7' fill='%23333'/%3E%3Ccircle cx='9' cy='83' r='0.5' fill='%23222'/%3E%3Ccircle cx='19' cy='88' r='0.8' fill='%23333'/%3E%3Ccircle cx='28' cy='81' r='0.6' fill='%23222'/%3E%3Ccircle cx='39' cy='86' r='0.7' fill='%23333'/%3E%3Ccircle cx='51' cy='84' r='0.5' fill='%23222'/%3E%3Ccircle cx='62' cy='89' r='0.8' fill='%23333'/%3E%3Ccircle cx='73' cy='82' r='0.6' fill='%23222'/%3E%3Ccircle cx='84' cy='87' r='0.7' fill='%23333'/%3E%3Ccircle cx='96' cy='83' r='0.5' fill='%23222'/%3E%3Ccircle cx='3' cy='93' r='0.8' fill='%23333'/%3E%3Ccircle cx='14' cy='98' r='0.6' fill='%23222'/%3E%3Ccircle cx='24' cy='91' r='0.7' fill='%23333'/%3E%3Ccircle cx='35' cy='96' r='0.5' fill='%23222'/%3E%3Ccircle cx='46' cy='94' r='0.8' fill='%23333'/%3E%3Ccircle cx='57' cy='99' r='0.6' fill='%23222'/%3E%3Ccircle cx='67' cy='92' r='0.7' fill='%23333'/%3E%3Ccircle cx='78' cy='97' r='0.5' fill='%23222'/%3E%3Ccircle cx='89' cy='93' r='0.8' fill='%23333'/%3E%3Ccircle cx='99' cy='98' r='0.6' fill='%23222'/%3E%3C/svg%3E");
-            background-size: 150px 150px;
-            opacity: 0.4;
+            background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 64 64' xmlns='http://www.w3.org/2000/svg'%3E%3Crect x='2' y='3' width='1' height='1' fill='%23555'/%3E%3Crect x='7' y='1' width='1' height='1' fill='%23444'/%3E%3Crect x='13' y='5' width='1' height='1' fill='%23666'/%3E%3Crect x='19' y='2' width='1' height='1' fill='%23555'/%3E%3Crect x='26' y='4' width='1' height='1' fill='%23444'/%3E%3Crect x='31' y='1' width='1' height='1' fill='%23666'/%3E%3Crect x='38' y='6' width='1' height='1' fill='%23555'/%3E%3Crect x='44' y='3' width='1' height='1' fill='%23444'/%3E%3Crect x='51' y='5' width='1' height='1' fill='%23666'/%3E%3Crect x='58' y='2' width='1' height='1' fill='%23555'/%3E%3Crect x='4' y='9' width='1' height='1' fill='%23666'/%3E%3Crect x='10' y='11' width='1' height='1' fill='%23555'/%3E%3Crect x='16' y='8' width='1' height='1' fill='%23444'/%3E%3Crect x='22' y='12' width='1' height='1' fill='%23666'/%3E%3Crect x='29' y='10' width='1' height='1' fill='%23555'/%3E%3Crect x='35' y='7' width='1' height='1' fill='%23444'/%3E%3Crect x='41' y='11' width='1' height='1' fill='%23666'/%3E%3Crect x='48' y='9' width='1' height='1' fill='%23555'/%3E%3Crect x='54' y='12' width='1' height='1' fill='%23444'/%3E%3Crect x='61' y='8' width='1' height='1' fill='%23666'/%3E%3Crect x='1' y='15' width='1' height='1' fill='%23555'/%3E%3Crect x='8' y='18' width='1' height='1' fill='%23444'/%3E%3Crect x='14' y='14' width='1' height='1' fill='%23666'/%3E%3Crect x='20' y='17' width='1' height='1' fill='%23555'/%3E%3Crect x='27' y='16' width='1' height='1' fill='%23444'/%3E%3Crect x='33' y='19' width='1' height='1' fill='%23666'/%3E%3Crect x='39' y='14' width='1' height='1' fill='%23555'/%3E%3Crect x='46' y='18' width='1' height='1' fill='%23444'/%3E%3Crect x='52' y='15' width='1' height='1' fill='%23666'/%3E%3Crect x='59' y='17' width='1' height='1' fill='%23555'/%3E%3Crect x='5' y='22' width='1' height='1' fill='%23444'/%3E%3Crect x='11' y='24' width='1' height='1' fill='%23666'/%3E%3Crect x='17' y='21' width='1' height='1' fill='%23555'/%3E%3Crect x='24' y='25' width='1' height='1' fill='%23444'/%3E%3Crect x='30' y='23' width='1' height='1' fill='%23666'/%3E%3Crect x='36' y='20' width='1' height='1' fill='%23555'/%3E%3Crect x='43' y='24' width='1' height='1' fill='%23444'/%3E%3Crect x='49' y='22' width='1' height='1' fill='%23666'/%3E%3Crect x='56' y='25' width='1' height='1' fill='%23555'/%3E%3Crect x='62' y='21' width='1' height='1' fill='%23444'/%3E%3Crect x='3' y='28' width='1' height='1' fill='%23666'/%3E%3Crect x='9' y='31' width='1' height='1' fill='%23555'/%3E%3Crect x='15' y='27' width='1' height='1' fill='%23444'/%3E%3Crect x='21' y='30' width='1' height='1' fill='%23666'/%3E%3Crect x='28' y='29' width='1' height='1' fill='%23555'/%3E%3Crect x='34' y='32' width='1' height='1' fill='%23444'/%3E%3Crect x='40' y='27' width='1' height='1' fill='%23666'/%3E%3Crect x='47' y='31' width='1' height='1' fill='%23555'/%3E%3Crect x='53' y='28' width='1' height='1' fill='%23444'/%3E%3Crect x='60' y='30' width='1' height='1' fill='%23666'/%3E%3Crect x='6' y='35' width='1' height='1' fill='%23555'/%3E%3Crect x='12' y='37' width='1' height='1' fill='%23444'/%3E%3Crect x='18' y='34' width='1' height='1' fill='%23666'/%3E%3Crect x='25' y='38' width='1' height='1' fill='%23555'/%3E%3Crect x='31' y='36' width='1' height='1' fill='%23444'/%3E%3Crect x='37' y='33' width='1' height='1' fill='%23666'/%3E%3Crect x='44' y='37' width='1' height='1' fill='%23555'/%3E%3Crect x='50' y='35' width='1' height='1' fill='%23444'/%3E%3Crect x='57' y='38' width='1' height='1' fill='%23666'/%3E%3Crect x='63' y='34' width='1' height='1' fill='%23555'/%3E%3Crect x='2' y='41' width='1' height='1' fill='%23444'/%3E%3Crect x='8' y='44' width='1' height='1' fill='%23666'/%3E%3Crect x='14' y='40' width='1' height='1' fill='%23555'/%3E%3Crect x='20' y='43' width='1' height='1' fill='%23444'/%3E%3Crect x='27' y='42' width='1' height='1' fill='%23666'/%3E%3Crect x='33' y='45' width='1' height='1' fill='%23555'/%3E%3Crect x='39' y='40' width='1' height='1' fill='%23444'/%3E%3Crect x='46' y='44' width='1' height='1' fill='%23666'/%3E%3Crect x='52' y='41' width='1' height='1' fill='%23555'/%3E%3Crect x='59' y='43' width='1' height='1' fill='%23444'/%3E%3Crect x='4' y='48' width='1' height='1' fill='%23666'/%3E%3Crect x='10' y='50' width='1' height='1' fill='%23555'/%3E%3Crect x='16' y='47' width='1' height='1' fill='%23444'/%3E%3Crect x='23' y='51' width='1' height='1' fill='%23666'/%3E%3Crect x='29' y='49' width='1' height='1' fill='%23555'/%3E%3Crect x='35' y='46' width='1' height='1' fill='%23444'/%3E%3Crect x='42' y='50' width='1' height='1' fill='%23666'/%3E%3Crect x='48' y='48' width='1' height='1' fill='%23555'/%3E%3Crect x='55' y='51' width='1' height='1' fill='%23444'/%3E%3Crect x='61' y='47' width='1' height='1' fill='%23666'/%3E%3Crect x='1' y='54' width='1' height='1' fill='%23555'/%3E%3Crect x='7' y='57' width='1' height='1' fill='%23444'/%3E%3Crect x='13' y='53' width='1' height='1' fill='%23666'/%3E%3Crect x='19' y='56' width='1' height='1' fill='%23555'/%3E%3Crect x='26' y='55' width='1' height='1' fill='%23444'/%3E%3Crect x='32' y='58' width='1' height='1' fill='%23666'/%3E%3Crect x='38' y='53' width='1' height='1' fill='%23555'/%3E%3Crect x='45' y='57' width='1' height='1' fill='%23444'/%3E%3Crect x='51' y='54' width='1' height='1' fill='%23666'/%3E%3Crect x='58' y='56' width='1' height='1' fill='%23555'/%3E%3Crect x='5' y='61' width='1' height='1' fill='%23444'/%3E%3Crect x='11' y='63' width='1' height='1' fill='%23666'/%3E%3Crect x='17' y='60' width='1' height='1' fill='%23555'/%3E%3Crect x='24' y='62' width='1' height='1' fill='%23444'/%3E%3Crect x='30' y='59' width='1' height='1' fill='%23666'/%3E%3Crect x='36' y='62' width='1' height='1' fill='%23555'/%3E%3Crect x='43' y='60' width='1' height='1' fill='%23444'/%3E%3Crect x='49' y='63' width='1' height='1' fill='%23666'/%3E%3Crect x='56' y='61' width='1' height='1' fill='%23555'/%3E%3Crect x='62' y='59' width='1' height='1' fill='%23444'/%3E%3C/svg%3E");
+            background-size: 64px 64px;
+            opacity: 0.6;
             z-index: 1000;
         }
 
@@ -113,13 +113,27 @@ DASHBOARD_HTML = """
             margin-bottom: 20px;
         }
 
-        .marble-art {
+        .ring-art {
             font-family: 'Courier New', monospace;
-            font-size: 10px;
-            line-height: 1.1;
+            font-size: 9px;
+            line-height: 1.0;
             white-space: pre;
             color: var(--green);
-            text-shadow: 0 0 2px var(--green);
+            text-shadow: 0 0 3px var(--green);
+            position: relative;
+            width: 120px;
+            height: 70px;
+        }
+
+        .ring-frame {
+            position: absolute;
+            top: 0;
+            left: 0;
+            opacity: 0;
+        }
+
+        .ring-frame.active {
+            opacity: 1;
         }
 
         .header-text {
@@ -500,36 +514,142 @@ DASHBOARD_HTML = """
 
     <div class="container">
         <header class="header">
-            <div class="marble-art">
-        ░░▒▒▓▓██▓▓▒▒░░
-     ░▒▓██▀▀░░░░▀▀██▓▒░
-   ░▓█▀░░▄▄▓▓▓▓▄▄░░▀█▓░
-  ▒█▀░▄▓▀▀░░░░▀▀▓▄░░▀█▒
- ░█▓░▓▀░▄▓▓▓▓▓▄░▀▓░░▓█░
- ▒█░▓▀░▓▀░░░░▀▓░▀▓░░█▒
- ▒█░▓░▓░░▓▓▓░░▓░░▓░░█▒
- ░█▓░▓▄░▓░░░▓░▄▓░░▓█░
-  ▒█▄░▀▓▄▄▄▄▄▓▀░░▄█▒
-   ░▓█▄░░▀▀▀▀░░▄█▓░
-     ░▒▓██▄▄██▓▒░
-        ░░▒▒░░</div>
+            <div class="ring-art" id="ring-left">
+<div class="ring-frame active" data-frame="0">
+    ╭───────╮
+   ╱         ╲
+  │           │
+  │     ◯     │
+  │           │
+   ╲         ╱
+    ╰───────╯</div>
+<div class="ring-frame" data-frame="1">
+    ╭──────╮
+   ╱        ╲
+  ╱          ╲
+ │      ◯     │
+  ╲          ╱
+   ╲        ╱
+    ╰──────╯</div>
+<div class="ring-frame" data-frame="2">
+   ╭─────╮
+  ╱       ╲
+ ╱         ╲
+│     ◯     │
+ ╲         ╱
+  ╲       ╱
+   ╰─────╯</div>
+<div class="ring-frame" data-frame="3">
+  ╭────╮
+ ╱      ╲
+╱        ╲
+│    ◯    │
+╲        ╱
+ ╲      ╱
+  ╰────╯</div>
+<div class="ring-frame" data-frame="4">
+   ╭───╮
+  ╱     ╲
+ ╱       ╲
+│    ◯    │
+ ╲       ╱
+  ╲     ╱
+   ╰───╯</div>
+<div class="ring-frame" data-frame="5">
+  ╭────╮
+ ╱      ╲
+╱        ╲
+│    ◯    │
+╲        ╱
+ ╲      ╱
+  ╰────╯</div>
+<div class="ring-frame" data-frame="6">
+   ╭─────╮
+  ╱       ╲
+ ╱         ╲
+│     ◯     │
+ ╲         ╱
+  ╲       ╱
+   ╰─────╯</div>
+<div class="ring-frame" data-frame="7">
+    ╭──────╮
+   ╱        ╲
+  ╱          ╲
+ │      ◯     │
+  ╲          ╱
+   ╲        ╱
+    ╰──────╯</div>
+            </div>
             <div class="header-text">
-                <h1>MEGA MARBLE</h1>
+                <h1>TURN 1 SOL RING</h1>
                 <div class="subtitle">POLYMARKET ARBITRAGE BOT v0.1.0</div>
             </div>
-            <div class="marble-art">
-        ░░▒▒▓▓██▓▓▒▒░░
-     ░▒▓██▀▀░░░░▀▀██▓▒░
-   ░▓█▀░░▄▄▓▓▓▓▄▄░░▀█▓░
-  ▒█▀░▄▓▀▀░░░░▀▀▓▄░░▀█▒
- ░█▓░▓▀░▄▓▓▓▓▓▄░▀▓░░▓█░
- ▒█░▓▀░▓▀░░░░▀▓░▀▓░░█▒
- ▒█░▓░▓░░▓▓▓░░▓░░▓░░█▒
- ░█▓░▓▄░▓░░░▓░▄▓░░▓█░
-  ▒█▄░▀▓▄▄▄▄▄▓▀░░▄█▒
-   ░▓█▄░░▀▀▀▀░░▄█▓░
-     ░▒▓██▄▄██▓▒░
-        ░░▒▒░░</div>
+            <div class="ring-art" id="ring-right">
+<div class="ring-frame active" data-frame="0">
+    ╭───────╮
+   ╱         ╲
+  │           │
+  │     ◯     │
+  │           │
+   ╲         ╱
+    ╰───────╯</div>
+<div class="ring-frame" data-frame="1">
+    ╭──────╮
+   ╱        ╲
+  ╱          ╲
+ │      ◯     │
+  ╲          ╱
+   ╲        ╱
+    ╰──────╯</div>
+<div class="ring-frame" data-frame="2">
+   ╭─────╮
+  ╱       ╲
+ ╱         ╲
+│     ◯     │
+ ╲         ╱
+  ╲       ╱
+   ╰─────╯</div>
+<div class="ring-frame" data-frame="3">
+  ╭────╮
+ ╱      ╲
+╱        ╲
+│    ◯    │
+╲        ╱
+ ╲      ╱
+  ╰────╯</div>
+<div class="ring-frame" data-frame="4">
+   ╭───╮
+  ╱     ╲
+ ╱       ╲
+│    ◯    │
+ ╲       ╱
+  ╲     ╱
+   ╰───╯</div>
+<div class="ring-frame" data-frame="5">
+  ╭────╮
+ ╱      ╲
+╱        ╲
+│    ◯    │
+╲        ╱
+ ╲      ╱
+  ╰────╯</div>
+<div class="ring-frame" data-frame="6">
+   ╭─────╮
+  ╱       ╲
+ ╱         ╲
+│     ◯     │
+ ╲         ╱
+  ╲       ╱
+   ╰─────╯</div>
+<div class="ring-frame" data-frame="7">
+    ╭──────╮
+   ╱        ╲
+  ╱          ╲
+ │      ◯     │
+  ╲          ╱
+   ╲        ╱
+    ╰──────╯</div>
+            </div>
         </header>
         <div class="status-bar">
                 <div class="status-item">
@@ -680,7 +800,7 @@ DASHBOARD_HTML = """
         </div>
 
         <footer class="footer">
-            MEGA MARBLE // POLYMARKET CLOB //
+            TURN 1 SOL RING // POLYMARKET CLOB //
             <span id="current-time"></span>
         </footer>
     </div>
@@ -1328,6 +1448,30 @@ DASHBOARD_HTML = """
                 // Load P&L chart data
                 loadPnlData(currentTimeframe);
             });
+
+        // ========== Ring Animation ==========
+        let ringFrame = 0;
+        const totalFrames = 8;
+
+        function animateRings() {
+            // Animate left ring
+            const leftFrames = document.querySelectorAll('#ring-left .ring-frame');
+            leftFrames.forEach((f, i) => {
+                f.classList.toggle('active', i === ringFrame);
+            });
+
+            // Animate right ring (offset by 4 frames for opposite rotation effect)
+            const rightFrames = document.querySelectorAll('#ring-right .ring-frame');
+            const rightFrame = (ringFrame + 4) % totalFrames;
+            rightFrames.forEach((f, i) => {
+                f.classList.toggle('active', i === rightFrame);
+            });
+
+            ringFrame = (ringFrame + 1) % totalFrames;
+        }
+
+        // Run animation at ~8fps for smooth spinning
+        setInterval(animateRings, 125);
     </script>
 </body>
 </html>
