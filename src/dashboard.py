@@ -58,20 +58,20 @@ DASHBOARD_HTML = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>GABAGOOL // POLYMARKET BOT</title>
+    <title>MEGA MARBLE // POLYMARKET BOT</title>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=VT323&family=Share+Tech+Mono&display=swap');
 
         :root {
-            --green: #00ff41;
-            --dim-green: #00aa2a;
-            --dark-green: #003b00;
-            --amber: #ffb000;
+            --green: #ffffff;
+            --dim-green: #888888;
+            --dark-green: #333333;
+            --amber: #cccccc;
             --red: #ff0040;
-            --cyan: #00ffff;
-            --bg: #0a0a0a;
-            --panel-bg: #0d1117;
-            --border: #1a3a1a;
+            --cyan: #aaaaaa;
+            --bg: #000000;
+            --panel-bg: #0a0a0a;
+            --border: #333333;
         }
 
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -84,45 +84,53 @@ DASHBOARD_HTML = """
             overflow-x: hidden;
         }
 
-        /* CRT scan line effect */
+        /* Dithered noise texture overlay */
         body::before {
             content: "";
             position: fixed;
             top: 0; left: 0;
             width: 100%; height: 100%;
             pointer-events: none;
-            background: repeating-linear-gradient(
-                0deg,
-                rgba(0, 0, 0, 0.15),
-                rgba(0, 0, 0, 0.15) 1px,
-                transparent 1px,
-                transparent 2px
-            );
+            background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 4 4' xmlns='http://www.w3.org/2000/svg'%3E%3Crect x='0' y='0' width='1' height='1' fill='%23222'/%3E%3Crect x='2' y='2' width='1' height='1' fill='%23222'/%3E%3C/svg%3E");
+            background-size: 4px 4px;
+            opacity: 0.3;
             z-index: 1000;
         }
-
-        /* Removed flicker animation - caused annoying UI flashing */
-        /* @keyframes flicker { ... } */
 
         .container {
             max-width: 1600px;
             margin: 0 auto;
             padding: 20px;
-            /* animation: flicker 4s infinite; - DISABLED: caused UI flashing */
         }
 
         .header {
-            text-align: center;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 30px;
             padding: 20px 0;
             border-bottom: 1px solid var(--border);
             margin-bottom: 20px;
+        }
+
+        .marble-art {
+            font-family: 'Courier New', monospace;
+            font-size: 10px;
+            line-height: 1.1;
+            white-space: pre;
+            color: var(--green);
+            text-shadow: 0 0 2px var(--green);
+        }
+
+        .header-text {
+            text-align: center;
         }
 
         .header h1 {
             font-family: 'VT323', monospace;
             font-size: 3rem;
             letter-spacing: 8px;
-            text-shadow: 0 0 10px var(--green), 0 0 20px var(--green);
+            text-shadow: 0 0 5px var(--green);
             margin-bottom: 5px;
         }
 
@@ -492,9 +500,38 @@ DASHBOARD_HTML = """
 
     <div class="container">
         <header class="header">
-            <h1>GABAGOOL</h1>
-            <div class="subtitle">POLYMARKET ARBITRAGE BOT v0.1.0</div>
-            <div class="status-bar">
+            <div class="marble-art">
+       ▄▄▄▄▄▄▄▄▄
+    ▄██████████████▄
+  ▄██▀▀░░░░░░░░▀▀██▄
+ ███░░▄▄████▄▄░░░███
+███░▄██▀▀▀▀▀▀██▄░░██
+██░░██░░░░░░░░██░░██
+██░░██░░████░░██░░██
+███░▀██▄▄▄▄▄▄██▀░███
+ ███░░▀▀████▀▀░░███
+  ▀██▄▄░░░░░░▄▄██▀
+    ▀██████████▀
+       ▀▀▀▀▀▀▀</div>
+            <div class="header-text">
+                <h1>MEGA MARBLE</h1>
+                <div class="subtitle">POLYMARKET ARBITRAGE BOT v0.1.0</div>
+            </div>
+            <div class="marble-art">
+       ▄▄▄▄▄▄▄▄▄
+    ▄██████████████▄
+  ▄██▀▀░░░░░░░░▀▀██▄
+ ███░░▄▄████▄▄░░░███
+███░▄██▀▀▀▀▀▀██▄░░██
+██░░██░░░░░░░░██░░██
+██░░██░░████░░██░░██
+███░▀██▄▄▄▄▄▄██▀░███
+ ███░░▀▀████▀▀░░███
+  ▀██▄▄░░░░░░▄▄██▀
+    ▀██████████▀
+       ▀▀▀▀▀▀▀</div>
+        </header>
+        <div class="status-bar">
                 <div class="status-item">
                     <div id="ws-status" class="status-dot"></div>
                     <span>WEBSOCKET</span>
@@ -643,7 +680,7 @@ DASHBOARD_HTML = """
         </div>
 
         <footer class="footer">
-            GABAGOOL ARBITRAGE BOT // POLYMARKET CLOB //
+            MEGA MARBLE // POLYMARKET CLOB //
             <span id="current-time"></span>
         </footer>
     </div>
