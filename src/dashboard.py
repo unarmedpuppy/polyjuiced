@@ -113,15 +113,6 @@ DASHBOARD_HTML = """
             margin-bottom: 20px;
         }
 
-        .ring-art {
-            font-family: 'Courier New', monospace;
-            font-size: 11px;
-            line-height: 1.15;
-            white-space: pre;
-            color: var(--green);
-            text-shadow: 0 0 4px var(--green);
-        }
-
         .header-text {
             text-align: center;
         }
@@ -500,28 +491,10 @@ DASHBOARD_HTML = """
 
     <div class="container">
         <header class="header">
-            <div class="ring-art">     ▄▄████▄▄
-   ▄██▀▀▀▀▀▀██▄
-  ██▀  ▄██▄  ▀██
- ██   ██▀▀██   ██
- ██   ██  ██   ██
- ██   ██▄▄██   ██
-  ██▄  ▀██▀  ▄██
-   ▀██▄▄▄▄▄▄██▀
-     ▀▀████▀▀</div>
             <div class="header-text">
                 <h1>TURN 1 SOL RING</h1>
                 <div class="subtitle">POLYMARKET ARBITRAGE BOT v0.1.0</div>
             </div>
-            <div class="ring-art">     ▄▄████▄▄
-   ▄██▀▀▀▀▀▀██▄
-  ██▀  ▄██▄  ▀██
- ██   ██▀▀██   ██
- ██   ██  ██   ██
- ██   ██▄▄██   ██
-  ██▄  ▀██▀  ▄██
-   ▀██▄▄▄▄▄▄██▀
-     ▀▀████▀▀</div>
         </header>
         <div class="status-bar">
                 <div class="status-item">
