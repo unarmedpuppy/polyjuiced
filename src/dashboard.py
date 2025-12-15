@@ -47,6 +47,16 @@ stats: Dict[str, Any] = {
     "arbitrage_enabled": True,
     "directional_enabled": False,
     "near_resolution_enabled": True,
+    # Execution metrics (Phase 8 observability)
+    "avg_execution_latency_ms": 0.0,
+    "avg_fill_latency_ms": 0.0,
+    "fok_failures_today": 0,
+    "full_fills_today": 0,
+    "partial_fills_today": 0,
+    "avg_hedge_ratio": 0.0,
+    "avg_yes_liquidity": 0.0,
+    "avg_no_liquidity": 0.0,
+    "last_trade_time": None,
 }
 
 # Database reference (set during initialization)
@@ -244,7 +254,7 @@ DASHBOARD_HTML = """
             display: grid;
             grid-template-columns: 70px 1fr 100px 80px;
             gap: 15px;
-            align-items: center;
+            align-items: start;
         }
 
         .trade-item:last-child { border-bottom: none; }
@@ -309,6 +319,115 @@ DASHBOARD_HTML = """
 
         .trade-profit.positive { color: var(--green); }
         .trade-profit.negative { color: var(--red); }
+
+        /* Enhanced trade details - Phase 8 */
+        .trade-execution-details {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 8px;
+            margin-top: 8px;
+            padding: 8px;
+            background: rgba(0, 255, 65, 0.02);
+            border: 1px solid var(--border);
+            border-radius: 3px;
+            font-size: 0.7rem;
+        }
+
+        .exec-metric {
+            text-align: center;
+        }
+
+        .exec-metric-value {
+            font-family: 'VT323', monospace;
+            font-size: 1rem;
+            color: var(--cyan);
+        }
+
+        .exec-metric-label {
+            color: var(--dim-green);
+            font-size: 0.65rem;
+            text-transform: uppercase;
+        }
+
+        .exec-metric-value.good { color: var(--green); }
+        .exec-metric-value.warn { color: var(--amber); }
+        .exec-metric-value.bad { color: var(--red); }
+
+        /* Trade timeline - Phase 8 */
+        .trade-timeline {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            margin-top: 6px;
+            font-size: 0.65rem;
+        }
+
+        .timeline-stage {
+            display: flex;
+            align-items: center;
+            gap: 2px;
+            padding: 2px 6px;
+            border-radius: 2px;
+            background: rgba(0, 255, 65, 0.1);
+            border: 1px solid var(--border);
+        }
+
+        .timeline-stage.active {
+            background: rgba(0, 255, 65, 0.2);
+            border-color: var(--green);
+        }
+
+        .timeline-stage.completed {
+            background: rgba(0, 255, 65, 0.15);
+            border-color: var(--green);
+        }
+
+        .timeline-stage.failed {
+            background: rgba(255, 0, 64, 0.15);
+            border-color: var(--red);
+        }
+
+        .timeline-arrow {
+            color: var(--dim-green);
+        }
+
+        .timeline-time {
+            color: var(--dim-green);
+            font-family: 'VT323', monospace;
+        }
+
+        /* Execution Metrics Panel - Phase 8 */
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(5, 1fr);
+            gap: 15px;
+        }
+
+        .metric-card {
+            text-align: center;
+            padding: 10px;
+            background: rgba(0, 255, 65, 0.03);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+        }
+
+        .metric-card-value {
+            font-family: 'VT323', monospace;
+            font-size: 1.5rem;
+            color: var(--green);
+        }
+
+        .metric-card-label {
+            font-size: 0.7rem;
+            color: var(--dim-green);
+            letter-spacing: 1px;
+            margin-top: 4px;
+        }
+
+        .metric-card-sublabel {
+            font-size: 0.6rem;
+            color: var(--dark-green);
+        }
 
         /* Log terminal - newest messages at top, no scrolling needed */
         .log-terminal {
@@ -591,6 +710,43 @@ DASHBOARD_HTML = """
                 </div>
                 <div class="panel-body" style="padding: 10px;">
                     <canvas id="pnl-chart" width="280" height="100"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <!-- Execution Metrics Panel - Phase 8 -->
+        <div class="panel" style="margin-bottom: 20px;">
+            <div class="panel-header">
+                <span class="panel-title">[ EXECUTION METRICS ]</span>
+                <span style="color: var(--dim-green); font-size: 0.8rem;">Today's Performance</span>
+            </div>
+            <div class="panel-body">
+                <div class="metrics-grid">
+                    <div class="metric-card">
+                        <div id="avg-exec-latency" class="metric-card-value">--</div>
+                        <div class="metric-card-label">AVG LATENCY</div>
+                        <div class="metric-card-sublabel">detected → placed</div>
+                    </div>
+                    <div class="metric-card">
+                        <div id="avg-fill-latency" class="metric-card-value">--</div>
+                        <div class="metric-card-label">AVG FILL TIME</div>
+                        <div class="metric-card-sublabel">placed → filled</div>
+                    </div>
+                    <div class="metric-card">
+                        <div id="fill-rate" class="metric-card-value">--</div>
+                        <div class="metric-card-label">FILL RATE</div>
+                        <div class="metric-card-sublabel">full / partial / failed</div>
+                    </div>
+                    <div class="metric-card">
+                        <div id="avg-hedge-ratio" class="metric-card-value">--</div>
+                        <div class="metric-card-label">AVG HEDGE</div>
+                        <div class="metric-card-sublabel">position balance</div>
+                    </div>
+                    <div class="metric-card">
+                        <div id="time-since-trade" class="metric-card-value">--</div>
+                        <div class="metric-card-label">LAST TRADE</div>
+                        <div class="metric-card-sublabel">time since</div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -1024,6 +1180,23 @@ DASHBOARD_HTML = """
                         pnlEl.className = s.realized_pnl >= 0 ? 'positive' : 'negative';
                     }
                 }
+
+                // Update execution metrics panel (Phase 8)
+                if (s.avg_execution_latency_ms !== undefined) {
+                    updateText('avg-exec-latency', Math.round(s.avg_execution_latency_ms) + 'ms');
+                }
+                if (s.avg_fill_latency_ms !== undefined) {
+                    updateText('avg-fill-latency', Math.round(s.avg_fill_latency_ms) + 'ms');
+                }
+                if (s.full_fills_today !== undefined) {
+                    const full = s.full_fills_today || 0;
+                    const partial = s.partial_fills_today || 0;
+                    const fok = s.fok_failures_today || 0;
+                    updateText('fill-rate', full + '/' + partial + '/' + fok);
+                }
+                if (s.avg_hedge_ratio !== undefined && s.avg_hedge_ratio > 0) {
+                    updateText('avg-hedge-ratio', (s.avg_hedge_ratio * 100).toFixed(1) + '%');
+                }
             }
 
             if (data.logs) {
@@ -1064,6 +1237,9 @@ DASHBOARD_HTML = """
                 }
 
                 data.trades.forEach(trade => {
+                    // Update last trade time (Phase 8)
+                    lastTradeTime = Date.now();
+
                     const item = document.createElement('div');
                     const status = trade.status || 'pending';
                     item.className = 'trade-item ' + status;
@@ -1082,15 +1258,82 @@ DASHBOARD_HTML = """
                         ? `<a href="${tradeUrl}" target="_blank" style="color: inherit; text-decoration: none;">${trade.asset} ↗</a>`
                         : trade.asset;
 
+                    // Enhanced execution details (Phase 8)
+                    const hasExecDetails = trade.execution_latency_ms !== undefined || trade.hedge_ratio !== undefined;
+
+                    // Format execution latency
+                    const execLatency = trade.execution_latency_ms !== undefined
+                        ? Math.round(trade.execution_latency_ms) + 'ms'
+                        : '--';
+                    const execLatencyClass = trade.execution_latency_ms < 100 ? 'good' :
+                        trade.execution_latency_ms < 500 ? 'warn' : 'bad';
+
+                    // Format hedge ratio
+                    const hedgeRatio = trade.hedge_ratio !== undefined
+                        ? (trade.hedge_ratio * 100).toFixed(1) + '%'
+                        : '--';
+                    const hedgeClass = trade.hedge_ratio >= 0.95 ? 'good' :
+                        trade.hedge_ratio >= 0.8 ? 'warn' : 'bad';
+
+                    // Format shares
+                    const yesShares = trade.yes_shares !== undefined ? trade.yes_shares.toFixed(1) : '--';
+                    const noShares = trade.no_shares !== undefined ? trade.no_shares.toFixed(1) : '--';
+
+                    // Format liquidity at execution
+                    const yesLiq = trade.yes_liquidity_at_price !== undefined
+                        ? Math.round(trade.yes_liquidity_at_price)
+                        : '--';
+                    const noLiq = trade.no_liquidity_at_price !== undefined
+                        ? Math.round(trade.no_liquidity_at_price)
+                        : '--';
+
+                    // Format order statuses
+                    const yesStatus = trade.yes_order_status || '--';
+                    const noStatus = trade.no_order_status || '--';
+                    const yesStatusClass = yesStatus === 'MATCHED' ? 'good' : yesStatus === 'LIVE' ? 'warn' : 'bad';
+                    const noStatusClass = noStatus === 'MATCHED' ? 'good' : noStatus === 'LIVE' ? 'warn' : 'bad';
+
+                    // Build execution details HTML
+                    const execDetailsHtml = hasExecDetails ? `
+                        <div class="trade-execution-details">
+                            <div class="exec-metric">
+                                <div class="exec-metric-value ${execLatencyClass}">${execLatency}</div>
+                                <div class="exec-metric-label">Latency</div>
+                            </div>
+                            <div class="exec-metric">
+                                <div class="exec-metric-value ${hedgeClass}">${hedgeRatio}</div>
+                                <div class="exec-metric-label">Hedge</div>
+                            </div>
+                            <div class="exec-metric">
+                                <div class="exec-metric-value">${yesShares}/${noShares}</div>
+                                <div class="exec-metric-label">Shares Y/N</div>
+                            </div>
+                            <div class="exec-metric">
+                                <div class="exec-metric-value">${yesLiq}/${noLiq}</div>
+                                <div class="exec-metric-label">Liq @ Price</div>
+                            </div>
+                        </div>
+                        <div class="trade-timeline">
+                            <span class="timeline-stage completed">DETECTED</span>
+                            <span class="timeline-arrow">→</span>
+                            <span class="timeline-stage ${yesStatusClass === 'good' && noStatusClass === 'good' ? 'completed' : 'active'}">PLACED</span>
+                            <span class="timeline-arrow">→</span>
+                            <span class="timeline-stage ${status !== 'pending' ? 'completed' : yesStatusClass === 'good' && noStatusClass === 'good' ? 'active' : ''}">FILLED</span>
+                            <span class="timeline-arrow">→</span>
+                            <span class="timeline-stage ${status === 'win' ? 'completed' : status === 'loss' ? 'failed' : ''}">${status === 'pending' ? 'AWAITING' : status.toUpperCase()}</span>
+                        </div>
+                    ` : '';
+
                     item.innerHTML = `
                         <div class="trade-time">${utcToCst(trade.time)}<br>${utcToCst(trade.market_time) || ''}</div>
-                        <div class="trade-info">
+                        <div class="trade-info" style="grid-column: span 2;">
                             <div class="trade-asset">${tradeAssetDisplay}</div>
                             <div class="trade-details">
-                                YES: $${trade.yes_cost.toFixed(2)} @ ${(trade.yes_price * 100).toFixed(1)}¢ |
-                                NO: $${trade.no_cost.toFixed(2)} @ ${(trade.no_price * 100).toFixed(1)}¢ |
+                                YES: $${trade.yes_cost.toFixed(2)} @ ${(trade.yes_price * 100).toFixed(1)}¢ (${yesStatus}) |
+                                NO: $${trade.no_cost.toFixed(2)} @ ${(trade.no_price * 100).toFixed(1)}¢ (${noStatus}) |
                                 Spread: ${trade.spread.toFixed(1)}¢
                             </div>
+                            ${execDetailsHtml}
                         </div>
                         <div class="trade-result">
                             <span class="trade-status ${status}">${statusLabel}</span>
@@ -1168,6 +1411,26 @@ DASHBOARD_HTML = """
             document.getElementById('uptime').textContent = h + ':' + m + ':' + s;
         }
         setInterval(updateUptime, 1000);
+
+        // ========== Time Since Last Trade (Phase 8) ==========
+        let lastTradeTime = null;
+        function updateTimeSinceTrade() {
+            const el = document.getElementById('time-since-trade');
+            if (!el) return;
+            if (!lastTradeTime) {
+                el.textContent = '--';
+                return;
+            }
+            const diff = Math.floor((Date.now() - lastTradeTime) / 1000);
+            if (diff < 60) {
+                el.textContent = diff + 's';
+            } else if (diff < 3600) {
+                el.textContent = Math.floor(diff / 60) + 'm';
+            } else {
+                el.textContent = Math.floor(diff / 3600) + 'h ' + Math.floor((diff % 3600) / 60) + 'm';
+            }
+        }
+        setInterval(updateTimeSinceTrade, 1000);
 
         // ========== P&L Chart ==========
         let currentTimeframe = '24h';
@@ -1522,6 +1785,10 @@ async def init_persistence(db: "Database") -> None:
     try:
         recent_trades = await db.get_recent_trades(limit=50)
         for trade in reversed(recent_trades):  # oldest first
+            # Load telemetry for this trade if available
+            telemetry = await db.get_trade_telemetry(trade["id"])
+            exec_latency = telemetry.get("execution_latency_ms") if telemetry else None
+
             trade_dict = {
                 "id": trade["id"],
                 "time": trade["created_at"].split("T")[1][:8] if "T" in str(trade.get("created_at", "")) else "00:00:00",
@@ -1536,6 +1803,16 @@ async def init_persistence(db: "Database") -> None:
                 "actual_profit": trade.get("actual_profit"),
                 "status": trade.get("status", "pending"),
                 "dry_run": trade.get("dry_run", False),
+                # Phase 8: Enhanced execution details
+                "yes_shares": trade.get("yes_shares"),
+                "no_shares": trade.get("no_shares"),
+                "hedge_ratio": trade.get("hedge_ratio"),
+                "execution_status": trade.get("execution_status"),
+                "yes_order_status": trade.get("yes_order_status"),
+                "no_order_status": trade.get("no_order_status"),
+                "yes_liquidity_at_price": trade.get("yes_liquidity_at_price"),
+                "no_liquidity_at_price": trade.get("no_liquidity_at_price"),
+                "execution_latency_ms": exec_latency,
             }
             trade_history.append(trade_dict)
 
@@ -1563,6 +1840,51 @@ async def init_persistence(db: "Database") -> None:
         today_stats = await db.get_today_stats()
         if today_stats:
             stats["daily_exposure"] = today_stats.get("exposure") or 0.0
+
+        # Phase 8: Load execution metrics for today
+        exec_latency_stats = await db.get_execution_latency_stats(lookback_hours=24)
+        if exec_latency_stats:
+            stats["avg_execution_latency_ms"] = exec_latency_stats.get("avg_execution_latency_ms") or 0.0
+            stats["avg_fill_latency_ms"] = exec_latency_stats.get("avg_fill_latency_ms") or 0.0
+
+        # Calculate fill type counts from recent trades
+        full_fills = 0
+        partial_fills = 0
+        fok_failures = 0
+        total_hedge_ratio = 0.0
+        hedge_count = 0
+        total_yes_liq = 0.0
+        total_no_liq = 0.0
+        liq_count = 0
+
+        for trade in recent_trades:
+            exec_status = trade.get("execution_status", "")
+            if exec_status == "full_fill":
+                full_fills += 1
+            elif exec_status == "partial_fill":
+                partial_fills += 1
+            elif exec_status == "failed" or exec_status == "fok_failed":
+                fok_failures += 1
+
+            if trade.get("hedge_ratio") is not None:
+                total_hedge_ratio += trade["hedge_ratio"]
+                hedge_count += 1
+
+            if trade.get("yes_liquidity_at_price") is not None:
+                total_yes_liq += trade["yes_liquidity_at_price"]
+                total_no_liq += trade.get("no_liquidity_at_price", 0) or 0
+                liq_count += 1
+
+        stats["full_fills_today"] = full_fills
+        stats["partial_fills_today"] = partial_fills
+        stats["fok_failures_today"] = fok_failures
+        stats["avg_hedge_ratio"] = (total_hedge_ratio / hedge_count) if hedge_count > 0 else 0.0
+        stats["avg_yes_liquidity"] = (total_yes_liq / liq_count) if liq_count > 0 else 0.0
+        stats["avg_no_liquidity"] = (total_no_liq / liq_count) if liq_count > 0 else 0.0
+
+        # Set last trade time if we have trades
+        if recent_trades:
+            stats["last_trade_time"] = recent_trades[0].get("created_at")
 
         # Load recent logs
         recent_logs = await db.get_recent_logs(limit=100)
