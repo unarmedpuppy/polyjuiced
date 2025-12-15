@@ -1,7 +1,7 @@
 # Gabagool Strategy Architecture
 
-**Last Updated:** December 14, 2025
-**Status:** AUDIT IN PROGRESS - Execution bugs identified
+**Last Updated:** December 15, 2025
+**Status:** PRODUCTION - All phases complete, blackout protection enabled
 
 > **MAINTENANCE RULE:** This document MUST be updated with every code change to strategy files.
 > PR checklist item: "Updated STRATEGY_ARCHITECTURE.md? [ ]"
@@ -542,6 +542,67 @@ Dashboard DOES:
   - Broadcast to connected browsers via SSE
 ```
 
+**Active Markets Display:**
+- Only shows markets within 15-minute trading window (≤900 seconds remaining)
+- Markets with >15 minutes remaining are filtered out
+- Container height limited to ~4 rows (180px max-height)
+- Client-side countdown timer for smooth updates
+
+**Status Banners (Priority Order):**
+1. **BLACKOUT** (purple) - Server restart blackout window active
+2. **CIRCUIT_BREAKER** (red) - Daily loss limit hit
+3. **DRY_RUN** (yellow) - Paper trading mode
+
+---
+
+### 7. Server Restart Blackout Protection
+
+**Purpose:** Prevent trades from being interrupted by daily server restart at 5:15 AM CST.
+
+**Window:** 5:00 AM - 5:29 AM CST (configurable)
+
+**Architecture:**
+```
+_blackout_checker_loop() [BACKGROUND TASK - every 60s]
+    │
+    ├──▶ _check_blackout_window()
+    │       │
+    │       ├──▶ Get current time in configured timezone
+    │       │
+    │       └──▶ Return True if within start/end window
+    │
+    └──▶ Set _in_blackout flag (atomic read by trade path)
+
+
+_is_trading_disabled()
+    │
+    ├──▶ Check _in_blackout flag (read-only, no performance impact)
+    │
+    ├──▶ Check circuit_breaker_hit flag
+    │
+    └──▶ Return True if any condition met
+```
+
+**Key Design Decisions:**
+- Background task updates flag every 60 seconds (not on every trade)
+- Trade execution path only reads the flag (no time calculations)
+- Uses `zoneinfo` for proper timezone handling (CST/CDT aware)
+- Blackout has highest priority over other trading modes
+
+**Trading Mode Priority:**
+```
+BLACKOUT > CIRCUIT_BREAKER > DRY_RUN > LIVE
+```
+
+**Relevant Files:**
+- `src/config.py` - Blackout configuration (GabagoolConfig)
+- `src/strategies/gabagool.py`:
+  - `_check_blackout_window()` - Time check logic
+  - `_blackout_checker_loop()` - Background task
+  - `_is_trading_disabled()` - Includes blackout check
+  - `_get_trading_mode()` - Returns "BLACKOUT" when in window
+- `tests/test_blackout.py` - Regression tests
+
 ---
 
 ## Error Handling Paths
@@ -610,6 +671,17 @@ _place_order() raises RateLimitError
 | max_daily_exposure | GABAGOOL_MAX_DAILY_EXPOSURE | 90.0 | Max daily USD exposure |
 | max_slippage | GABAGOOL_MAX_SLIPPAGE | 0.02 | Price slippage buffer |
 | markets | GABAGOOL_MARKETS | BTC,ETH,SOL | Assets to trade |
+
+### Blackout Window Configuration
+
+| Parameter | Env Var | Default | Description |
+|-----------|---------|---------|-------------|
+| blackout_enabled | GABAGOOL_BLACKOUT_ENABLED | true | Enable server restart blackout |
+| blackout_start_hour | GABAGOOL_BLACKOUT_START_HOUR | 5 | Start hour (24h format) |
+| blackout_start_minute | GABAGOOL_BLACKOUT_START_MINUTE | 0 | Start minute |
+| blackout_end_hour | GABAGOOL_BLACKOUT_END_HOUR | 5 | End hour (24h format) |
+| blackout_end_minute | GABAGOOL_BLACKOUT_END_MINUTE | 29 | End minute |
+| blackout_timezone | GABAGOOL_BLACKOUT_TIMEZONE | America/Chicago | Timezone for window |
 
 ---
 
@@ -866,6 +938,25 @@ Failure → record_claim_attempt() → Tracks error, will retry next cycle
 
 **Note:** Settlement requires `dry_run=False`. Claim workaround sells at $0.99 (py-clob-client has no native redeem API per GitHub issue #117).
 
+### Phase 13: Server Restart Blackout Protection ✅ COMPLETE (2025-12-15)
+- [x] Add blackout window configuration to GabagoolConfig
+- [x] Add `_in_blackout` flag to GabagoolStrategy
+- [x] Implement `_check_blackout_window()` - time check logic with zoneinfo
+- [x] Implement `_blackout_checker_loop()` - background task (every 60s)
+- [x] Update `_is_trading_disabled()` to include blackout check
+- [x] Update `_get_trading_mode()` to return "BLACKOUT" when in window
+- [x] Add purple "BLACKOUT" banner to dashboard
+- [x] Start/stop blackout checker in strategy start()/stop()
+- [x] Create regression tests (test_blackout.py)
+
+**Design Decision:** Background task updates flag every 60 seconds rather than calculating time on every trade execution. This optimizes performance by keeping the hot trade path free of time calculations.
+
+### Phase 14: Dashboard Active Markets Filter ✅ COMPLETE (2025-12-15)
+- [x] Filter active markets to only show those within 15-minute window
+- [x] Markets with >900 seconds remaining are hidden
+- [x] Shrink container max-height from 430px to 180px (~4 rows)
+- [x] Handle case where all markets are filtered out
+
 ---
 
 ## Change Log
@@ -883,6 +974,8 @@ Failure → record_claim_attempt() → Tracks error, will retry next cycle
 | 2025-12-14 | Claude | **Phase 8-10 COMPLETE**: Comprehensive regression test suite. Created test_phase8_pricing_logic.py (magic number detection), test_phase8_execution_flow.py (E2E tests), test_phase8_invariants.py (business invariants). Added scripts/audit_magic_numbers.py for codebase auditing. |
 | 2025-12-14 | Claude | **Phase 11 DESIGNED**: Position rebalancing strategy for partial fills. Created REBALANCING_STRATEGY.md, test_e2e_scenarios.py (comprehensive E2E tests), test_rebalancing.py (rebalancing logic tests). Two strategies: sell excess at profit OR buy deficit cheaply. 80% hedge threshold, $0.02/share min profit. |
 | 2025-12-14 | Claude | **Phase 12 COMPLETE**: Position persistence for auto-settlement. Added `settlement_queue` table. Positions survive bot restarts. `_track_position()` saves to DB, `_load_unclaimed_positions()` restores on startup, `_check_settlement()` queries DB for claimable positions. |
+| 2025-12-15 | Claude | **Server Restart Blackout Protection**: Added 5:00-5:29 AM CST blackout window to prevent trades during daily server restart at 5:15 AM. Background task updates `_in_blackout` flag every 60 seconds. Trading mode priority: BLACKOUT > CIRCUIT_BREAKER > DRY_RUN > LIVE. Purple "BLACKOUT" banner on dashboard. |
+| 2025-12-15 | Claude | **Dashboard Active Markets Filter**: Markets display now filtered to only show those within 15-minute window (≤900 seconds remaining). Shrunk container to 180px (fits ~4 rows). Improves focus on actionable markets. |
 
 ---
 
