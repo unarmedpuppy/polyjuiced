@@ -1010,10 +1010,10 @@ DASHBOARD_HTML = """
             });
 
             // Filter to only show markets within 15-minute window (900 seconds)
+            // Use server-provided seconds_remaining for filtering (more reliable than client-side calc)
             const filteredMarkets = sortedMarkets.filter(([id, m]) => {
-                const endMs = marketEndTimes.get(id);
-                const secondsRemaining = endMs ? calculateSecondsRemaining(endMs) : 0;
-                return secondsRemaining > 0 && secondsRemaining <= 900;
+                const serverSeconds = m.seconds_remaining || 0;
+                return serverSeconds > 0 && serverSeconds <= 900;
             });
 
             // Handle case where all markets are filtered out (none within 15-min window)
