@@ -1612,6 +1612,43 @@ class Database:
             row = await cursor.fetchone()
             return dict(row) if row else {}
 
+    async def get_settlement_history(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Get settlement queue history for dashboard display.
+
+        Returns positions ordered by most recent first (by created_at or market_end_time).
+
+        Args:
+            limit: Maximum number of positions to return
+
+        Returns:
+            List of position dicts with relevant fields for display
+        """
+        async with self._conn.execute(
+            """
+            SELECT
+                id,
+                created_at,
+                trade_id,
+                condition_id,
+                side,
+                asset,
+                shares,
+                entry_price,
+                entry_cost,
+                market_end_time,
+                claimed,
+                claimed_at,
+                claim_proceeds,
+                claim_profit
+            FROM settlement_queue
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
     async def cleanup_old_claimed_positions(self, days: int = 30) -> int:
         """Delete claimed positions older than specified days.
 

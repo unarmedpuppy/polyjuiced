@@ -784,6 +784,25 @@ DASHBOARD_HTML = """
             </div>
         </div>
 
+        <!-- Historical Positions Panel -->
+        <div class="panel" style="margin-bottom: 20px;">
+            <div class="panel-header">
+                <span class="panel-title">[ HISTORICAL POSITIONS ]</span>
+                <span style="color: var(--dim-green); font-size: 0.8rem;">
+                    <span id="positions-claimed">0</span> claimed /
+                    <span id="positions-total">0</span> total
+                    <span id="positions-profit" style="margin-left: 10px;"></span>
+                </span>
+            </div>
+            <div class="panel-body" style="padding: 0;">
+                <div id="positions-list" style="max-height: 200px; overflow-y: auto;">
+                    <div style="padding: 20px; text-align: center; color: var(--dim-green);">
+                        Loading positions...
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <div class="grid-2col">
             <!-- Trade History -->
             <div class="panel">
@@ -1573,6 +1592,91 @@ DASHBOARD_HTML = """
             });
         });
 
+        // ========== Historical Positions ==========
+        async function loadPositions() {
+            try {
+                const resp = await fetch('/dashboard/positions?limit=50');
+                const data = await resp.json();
+                renderPositions(data.positions || [], data.stats || {});
+            } catch (e) {
+                console.error('Failed to load positions:', e);
+            }
+        }
+
+        function renderPositions(positions, stats) {
+            const container = document.getElementById('positions-list');
+
+            // Update header stats
+            document.getElementById('positions-claimed').textContent = stats.claimed || 0;
+            document.getElementById('positions-total').textContent = stats.total_positions || 0;
+            const profitEl = document.getElementById('positions-profit');
+            const totalProfit = stats.total_claim_profit || 0;
+            if (totalProfit !== 0) {
+                profitEl.textContent = (totalProfit >= 0 ? '+' : '') + '$' + totalProfit.toFixed(2);
+                profitEl.style.color = totalProfit >= 0 ? 'var(--status-active)' : 'var(--red)';
+            }
+
+            if (!positions || positions.length === 0) {
+                container.innerHTML = '<div style="padding: 20px; text-align: center; color: var(--dim-green);">No positions found</div>';
+                return;
+            }
+
+            // Build table
+            let html = '<table style="width: 100%; border-collapse: collapse; font-size: 0.85rem;">';
+            html += '<thead><tr style="border-bottom: 1px solid var(--border);">';
+            html += '<th style="padding: 8px; text-align: left;">Time</th>';
+            html += '<th style="padding: 8px; text-align: left;">Side</th>';
+            html += '<th style="padding: 8px; text-align: right;">Shares</th>';
+            html += '<th style="padding: 8px; text-align: right;">Entry</th>';
+            html += '<th style="padding: 8px; text-align: right;">Cost</th>';
+            html += '<th style="padding: 8px; text-align: center;">Status</th>';
+            html += '<th style="padding: 8px; text-align: right;">Profit</th>';
+            html += '</tr></thead><tbody>';
+
+            positions.forEach(pos => {
+                const isClaimed = pos.claimed === 1;
+                const isReconciled = pos.asset === 'RECONCILED';
+                const statusColor = isClaimed ? 'var(--status-active)' : 'var(--amber)';
+                const statusText = isClaimed ? 'CLAIMED' : 'PENDING';
+                const sideColor = pos.side === 'YES' ? 'var(--status-active)' : 'var(--red)';
+
+                // Format time
+                let timeStr = '--';
+                if (pos.market_end_time) {
+                    const d = new Date(pos.market_end_time);
+                    timeStr = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) +
+                              ' ' + d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+                }
+
+                // Format profit
+                let profitStr = '--';
+                let profitColor = 'var(--dim-green)';
+                if (isClaimed && pos.claim_profit !== null) {
+                    profitStr = (pos.claim_profit >= 0 ? '+' : '') + '$' + pos.claim_profit.toFixed(2);
+                    profitColor = pos.claim_profit >= 0 ? 'var(--status-active)' : 'var(--red)';
+                }
+
+                html += '<tr style="border-bottom: 1px solid var(--dark-green);">';
+                html += '<td style="padding: 6px 8px; color: var(--dim-green);">' + timeStr + '</td>';
+                html += '<td style="padding: 6px 8px; color: ' + sideColor + ';">' + pos.side + '</td>';
+                html += '<td style="padding: 6px 8px; text-align: right;">' + (pos.shares || 0).toFixed(1) + '</td>';
+                html += '<td style="padding: 6px 8px; text-align: right;">$' + (pos.entry_price || 0).toFixed(3) + '</td>';
+                html += '<td style="padding: 6px 8px; text-align: right;">$' + (pos.entry_cost || 0).toFixed(2) + '</td>';
+                html += '<td style="padding: 6px 8px; text-align: center; color: ' + statusColor + ';">' + statusText;
+                if (isReconciled) html += ' <span style="color: var(--amber);">*</span>';
+                html += '</td>';
+                html += '<td style="padding: 6px 8px; text-align: right; color: ' + profitColor + ';">' + profitStr + '</td>';
+                html += '</tr>';
+            });
+
+            html += '</tbody></table>';
+            container.innerHTML = html;
+        }
+
+        // Load positions on page load and refresh every 30 seconds
+        loadPositions();
+        setInterval(loadPositions, 30000);
+
         fetch('/dashboard/state')
             .then(r => r.json())
             .then(data => {
@@ -1618,6 +1722,7 @@ class DashboardServer:
         self._app.router.add_get("/dashboard/state", self._handle_state)
         self._app.router.add_get("/dashboard/events", self._handle_events)
         self._app.router.add_get("/dashboard/pnl-history", self._handle_pnl_history)
+        self._app.router.add_get("/dashboard/positions", self._handle_positions)
 
         self._runner = web.AppRunner(self._app)
         await self._runner.setup()
@@ -1712,6 +1817,23 @@ class DashboardServer:
             points = []
 
         return web.json_response({"points": points})
+
+    async def _handle_positions(self, request: web.Request) -> web.Response:
+        """Get historical positions from settlement queue."""
+        limit = int(request.query.get("limit", "50"))
+        limit = min(limit, 100)  # Cap at 100
+
+        if _db:
+            positions = await _db.get_settlement_history(limit)
+            settlement_stats = await _db.get_settlement_stats()
+        else:
+            positions = []
+            settlement_stats = {}
+
+        return web.json_response({
+            "positions": positions,
+            "stats": settlement_stats,
+        })
 
     async def broadcast(self, data: Dict[str, Any]) -> None:
         """Broadcast update to all connected clients."""
