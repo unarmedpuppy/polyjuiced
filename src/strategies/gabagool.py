@@ -936,11 +936,27 @@ class GabagoolStrategy(BaseStrategy):
                 return None
 
         # Execute or simulate trade
-        result = await self._execute_trade(
-            opportunity=opportunity,
-            yes_amount=yes_amount,
-            no_amount=no_amount,
+        # Check if gradual entry is enabled and conditions are met
+        use_gradual_entry = (
+            self.gabagool_config.gradual_entry_enabled
+            and opportunity.spread_cents >= self.gabagool_config.gradual_entry_min_spread_cents
+            and self.gabagool_config.gradual_entry_tranches > 1
         )
+
+        if use_gradual_entry:
+            # Gradual position building: split into tranches with delays
+            result = await self._execute_gradual_entry(
+                opportunity=opportunity,
+                yes_amount=yes_amount,
+                no_amount=no_amount,
+            )
+        else:
+            # Single entry (default behavior)
+            result = await self._execute_trade(
+                opportunity=opportunity,
+                yes_amount=yes_amount,
+                no_amount=no_amount,
+            )
 
         if result and result.success:
             # Update tracking
@@ -1263,6 +1279,176 @@ class GabagoolStrategy(BaseStrategy):
             no_needed=f"{no_shares:.1f}",
         )
         return (yes_amount, no_amount)
+
+    async def _execute_gradual_entry(
+        self,
+        opportunity: ArbitrageOpportunity,
+        yes_amount: float,
+        no_amount: float,
+    ) -> Optional[TradeResult]:
+        """Execute arbitrage trade using gradual position building.
+
+        Phase 2 Strategy: Split trade into multiple tranches with delays
+        to reduce market impact and get better average fills.
+
+        Args:
+            opportunity: The arbitrage opportunity
+            yes_amount: Total USD to spend on YES
+            no_amount: Total USD to spend on NO
+
+        Returns:
+            Aggregated trade result from all tranches
+        """
+        num_tranches = self.gabagool_config.gradual_entry_tranches
+        delay_seconds = self.gabagool_config.gradual_entry_delay_seconds
+        market = opportunity.market
+
+        # Calculate per-tranche amounts
+        yes_per_tranche = yes_amount / num_tranches
+        no_per_tranche = no_amount / num_tranches
+
+        # Check if tranche sizes meet minimum requirements
+        if yes_per_tranche < self.gabagool_config.min_trade_size_usd:
+            log.info(
+                "Gradual entry: tranche size below minimum, using single entry",
+                yes_per_tranche=f"${yes_per_tranche:.2f}",
+                min_trade_size=f"${self.gabagool_config.min_trade_size_usd:.2f}",
+                asset=market.asset,
+            )
+            return await self._execute_trade(
+                opportunity=opportunity,
+                yes_amount=yes_amount,
+                no_amount=no_amount,
+            )
+
+        log.info(
+            "GRADUAL ENTRY: Starting multi-tranche execution",
+            asset=market.asset,
+            num_tranches=num_tranches,
+            yes_per_tranche=f"${yes_per_tranche:.2f}",
+            no_per_tranche=f"${no_per_tranche:.2f}",
+            delay_seconds=delay_seconds,
+            total_time=f"{(num_tranches - 1) * delay_seconds:.0f}s",
+        )
+
+        # Track cumulative results
+        total_yes_cost = 0.0
+        total_no_cost = 0.0
+        total_yes_shares = 0.0
+        total_no_shares = 0.0
+        tranches_executed = 0
+        tranches_failed = 0
+        last_result: Optional[TradeResult] = None
+
+        for tranche_num in range(num_tranches):
+            # Check if market is still tradeable before each tranche
+            if not market.is_tradeable:
+                log.warning(
+                    "GRADUAL ENTRY: Market no longer tradeable, stopping",
+                    asset=market.asset,
+                    tranche=f"{tranche_num + 1}/{num_tranches}",
+                    tranches_completed=tranches_executed,
+                )
+                break
+
+            # Check if trading is still enabled (circuit breaker, blackout, etc.)
+            if self._is_trading_disabled() and not self.gabagool_config.dry_run:
+                log.warning(
+                    "GRADUAL ENTRY: Trading disabled, stopping",
+                    asset=market.asset,
+                    tranche=f"{tranche_num + 1}/{num_tranches}",
+                    tranches_completed=tranches_executed,
+                )
+                break
+
+            # Execute tranche
+            log.info(
+                f"GRADUAL ENTRY: Executing tranche {tranche_num + 1}/{num_tranches}",
+                asset=market.asset,
+                yes_amount=f"${yes_per_tranche:.2f}",
+                no_amount=f"${no_per_tranche:.2f}",
+            )
+
+            tranche_result = await self._execute_trade(
+                opportunity=opportunity,
+                yes_amount=yes_per_tranche,
+                no_amount=no_per_tranche,
+            )
+
+            if tranche_result and tranche_result.success:
+                tranches_executed += 1
+                total_yes_cost += tranche_result.yes_cost
+                total_no_cost += tranche_result.no_cost
+                total_yes_shares += tranche_result.yes_shares
+                total_no_shares += tranche_result.no_shares
+                last_result = tranche_result
+
+                log.info(
+                    f"GRADUAL ENTRY: Tranche {tranche_num + 1} completed",
+                    asset=market.asset,
+                    profit=f"${tranche_result.expected_profit:.2f}",
+                    cumulative_yes=f"${total_yes_cost:.2f}",
+                    cumulative_no=f"${total_no_cost:.2f}",
+                )
+            else:
+                tranches_failed += 1
+                log.warning(
+                    f"GRADUAL ENTRY: Tranche {tranche_num + 1} failed",
+                    asset=market.asset,
+                    error=tranche_result.error if tranche_result else "No result",
+                )
+
+            # Delay before next tranche (except for last one)
+            if tranche_num < num_tranches - 1:
+                log.debug(
+                    f"GRADUAL ENTRY: Waiting {delay_seconds}s before next tranche",
+                    asset=market.asset,
+                )
+                await asyncio.sleep(delay_seconds)
+
+        # Build aggregated result
+        if tranches_executed == 0:
+            log.error(
+                "GRADUAL ENTRY: All tranches failed",
+                asset=market.asset,
+                tranches_attempted=num_tranches,
+            )
+            return TradeResult(
+                success=False,
+                error="All tranches failed",
+                yes_cost=0.0,
+                no_cost=0.0,
+                yes_shares=0.0,
+                no_shares=0.0,
+                total_cost=0.0,
+                expected_profit=0.0,
+                dry_run=self.gabagool_config.dry_run,
+            )
+
+        total_cost = total_yes_cost + total_no_cost
+        min_shares = min(total_yes_shares, total_no_shares)
+        expected_profit = min_shares - total_cost
+
+        log.info(
+            "GRADUAL ENTRY: Complete",
+            asset=market.asset,
+            tranches_executed=tranches_executed,
+            tranches_failed=tranches_failed,
+            total_yes=f"${total_yes_cost:.2f}",
+            total_no=f"${total_no_cost:.2f}",
+            expected_profit=f"${expected_profit:.2f}",
+        )
+
+        return TradeResult(
+            success=True,
+            yes_cost=total_yes_cost,
+            no_cost=total_no_cost,
+            yes_shares=total_yes_shares,
+            no_shares=total_no_shares,
+            total_cost=total_cost,
+            expected_profit=expected_profit,
+            dry_run=last_result.dry_run if last_result else self.gabagool_config.dry_run,
+        )
 
     async def _execute_trade(
         self,

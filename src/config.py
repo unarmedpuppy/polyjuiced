@@ -84,6 +84,13 @@ class GabagoolConfig:
     order_timeout_seconds: float = 10.0  # Increased - API needs time for tick-size, neg-risk, fee-rate calls
     ws_reconnect_delay_seconds: float = 1.0
 
+    # Phase 2 Strategy (Dec 15, 2025): Gradual position building
+    # Split trades into multiple tranches to reduce market impact and get better fills
+    gradual_entry_enabled: bool = False  # Disabled by default - single entry
+    gradual_entry_tranches: int = 3  # Number of tranches (e.g., 3 means 3 smaller orders)
+    gradual_entry_delay_seconds: float = 30.0  # Delay between tranches
+    gradual_entry_min_spread_cents: float = 3.0  # Only use gradual for spreads >= 3 cents
+
     # Phase 3: Better order execution (Dec 13, 2025)
     # Parallel execution places both orders simultaneously for true atomicity
     parallel_execution_enabled: bool = True  # Use parallel order placement
@@ -143,6 +150,11 @@ class GabagoolConfig:
             max_position_imbalance_shares=float(os.getenv("GABAGOOL_MAX_POSITION_IMBALANCE", "5.0")),
             order_timeout_seconds=float(os.getenv("GABAGOOL_ORDER_TIMEOUT", "10.0")),
             ws_reconnect_delay_seconds=float(os.getenv("GABAGOOL_WS_RECONNECT_DELAY", "1.0")),
+            # Phase 2: Gradual position building
+            gradual_entry_enabled=os.getenv("GABAGOOL_GRADUAL_ENTRY_ENABLED", "false").lower() == "true",
+            gradual_entry_tranches=int(os.getenv("GABAGOOL_GRADUAL_ENTRY_TRANCHES", "3")),
+            gradual_entry_delay_seconds=float(os.getenv("GABAGOOL_GRADUAL_ENTRY_DELAY", "30.0")),
+            gradual_entry_min_spread_cents=float(os.getenv("GABAGOOL_GRADUAL_ENTRY_MIN_SPREAD", "3.0")),
             # Phase 3: Better order execution
             parallel_execution_enabled=os.getenv("GABAGOOL_PARALLEL_EXECUTION", "true").lower() == "true",
             max_liquidity_consumption_pct=float(os.getenv("GABAGOOL_MAX_LIQUIDITY_CONSUMPTION", "0.50")),

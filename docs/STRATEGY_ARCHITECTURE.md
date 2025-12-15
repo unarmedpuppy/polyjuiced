@@ -1027,6 +1027,44 @@ GABAGOOL_MAX_TRADE_SIZE=5.0   # Already in production
 GABAGOOL_MAX_SLIPPAGE=0.0     # Already in production (zero slippage)
 ```
 
+### Phase 19: Gradual Position Building ✅ COMPLETE (2025-12-15)
+- [x] Added `gradual_entry_enabled` config (default: false)
+- [x] Added `gradual_entry_tranches` config (default: 3)
+- [x] Added `gradual_entry_delay_seconds` config (default: 30.0)
+- [x] Added `gradual_entry_min_spread_cents` config (default: 3.0)
+- [x] Implemented `_execute_gradual_entry()` method in GabagoolStrategy
+- [x] Split trades into multiple tranches with configurable delays
+- [x] Fallback to single entry when tranche size < min_trade_size
+- [x] Safety checks: market tradeable, trading enabled before each tranche
+- [x] Aggregated result tracking across all tranches
+- [x] Regression tests in `tests/test_phase2_gradual_entry.py`
+
+**How Gradual Entry Works:**
+```
+SINGLE ENTRY (default):
+1. Opportunity detected: $5 spread on BTC market
+2. Execute full position: $5 YES + $5 NO in one dual-leg order
+3. Done
+
+GRADUAL ENTRY (when enabled for spreads >= 3¢):
+1. Opportunity detected: $5 spread on BTC market
+2. Split into 3 tranches: $1.67 per tranche
+3. Tranche 1: Execute $1.67 YES + $1.67 NO
+4. Wait 30 seconds
+5. Tranche 2: Execute $1.67 YES + $1.67 NO (if still tradeable)
+6. Wait 30 seconds
+7. Tranche 3: Execute $1.67 YES + $1.67 NO (if still tradeable)
+8. Return aggregated result
+```
+
+**Config (disabled by default):**
+```env
+GABAGOOL_GRADUAL_ENTRY_ENABLED=false
+GABAGOOL_GRADUAL_ENTRY_TRANCHES=3
+GABAGOOL_GRADUAL_ENTRY_DELAY=30.0
+GABAGOOL_GRADUAL_ENTRY_MIN_SPREAD=3.0
+```
+
 **Root Cause of Untracked Positions:**
 ```
 BEFORE FIX:
@@ -1067,6 +1105,7 @@ AFTER FIX:
 | 2025-12-15 | Claude | **Phase 16 COMPLETE**: Dashboard observability widgets. Added Historical Positions panel, Reconciliation Status panel with RECON indicator, `/dashboard/positions` and `/dashboard/reconciliation` endpoints. |
 | 2025-12-15 | Claude | **Phase 17 COMPLETE**: Partial fill detection fix. `place_order_sync()` now catches exceptions and returns error dict instead of raising. Allows detection of partial fills when one leg fills and other throws exception. |
 | 2025-12-15 | Claude | **Phase 18 COMPLETE**: Configurable position sizing. Added `min_trade_size_usd` config (default $3.0), `GABAGOOL_MIN_TRADE_SIZE` env var, minimum budget enforcement. Matches gabagool22's $3-8 per trade pattern. |
+| 2025-12-15 | Claude | **Phase 19 COMPLETE**: Gradual position building. Split trades into tranches with delays. `gradual_entry_enabled`, `gradual_entry_tranches` (default 3), `gradual_entry_delay_seconds` (default 30s), `gradual_entry_min_spread_cents` (default 3¢). Disabled by default. |
 
 ---
 
