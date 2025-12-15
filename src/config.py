@@ -111,6 +111,15 @@ class GabagoolConfig:
     near_resolution_max_price: float = 0.975  # Max price to bet (97.5 cents)
     near_resolution_size_usd: float = 10.0  # Fixed trade size for near-resolution
 
+    # Server restart blackout window (5:00-5:29 AM CST)
+    # The server restarts at 5:15 AM CST daily - we blackout to avoid interrupted trades
+    blackout_enabled: bool = True
+    blackout_start_hour: int = 5  # 5 AM CST
+    blackout_start_minute: int = 0
+    blackout_end_hour: int = 5  # 5 AM CST
+    blackout_end_minute: int = 29  # 5:29 AM CST
+    blackout_timezone: str = "America/Chicago"  # CST/CDT
+
     @classmethod
     def from_env(cls) -> "GabagoolConfig":
         """Load configuration from environment variables."""
@@ -153,6 +162,13 @@ class GabagoolConfig:
             near_resolution_min_price=float(os.getenv("GABAGOOL_NEAR_RESOLUTION_MIN_PRICE", "0.94")),
             near_resolution_max_price=float(os.getenv("GABAGOOL_NEAR_RESOLUTION_MAX_PRICE", "0.975")),
             near_resolution_size_usd=float(os.getenv("GABAGOOL_NEAR_RESOLUTION_SIZE", "10.0")),
+            # Server restart blackout window
+            blackout_enabled=os.getenv("GABAGOOL_BLACKOUT_ENABLED", "true").lower() == "true",
+            blackout_start_hour=int(os.getenv("GABAGOOL_BLACKOUT_START_HOUR", "5")),
+            blackout_start_minute=int(os.getenv("GABAGOOL_BLACKOUT_START_MINUTE", "0")),
+            blackout_end_hour=int(os.getenv("GABAGOOL_BLACKOUT_END_HOUR", "5")),
+            blackout_end_minute=int(os.getenv("GABAGOOL_BLACKOUT_END_MINUTE", "29")),
+            blackout_timezone=os.getenv("GABAGOOL_BLACKOUT_TIMEZONE", "America/Chicago"),
         )
 
 

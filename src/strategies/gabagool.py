@@ -229,6 +229,10 @@ class GabagoolStrategy(BaseStrategy):
         # Circuit breaker state (loaded from DB on startup)
         self._circuit_breaker_hit: bool = False
         self._realized_pnl: float = 0.0
+        # Blackout state (server restart protection)
+        # This flag is updated by a background task every minute - trades just read it
+        self._in_blackout: bool = False
+        self._blackout_checker_task: Optional[asyncio.Task] = None
 
     def set_liquidity_collector(self, collector: "LiquidityCollector") -> None:
         """Set the liquidity collector for data collection.
@@ -439,6 +443,23 @@ class GabagoolStrategy(BaseStrategy):
         )
         log.info("Started dedicated opportunity queue processor task")
 
+        # Check blackout status immediately on startup (don't wait for first interval)
+        self._in_blackout = self._check_blackout_window()
+        if self._in_blackout:
+            log.warning(
+                "BOT STARTED IN BLACKOUT PERIOD - trading disabled",
+                until=f"{self.gabagool_config.blackout_end_hour:02d}:{self.gabagool_config.blackout_end_minute:02d}",
+                timezone=self.gabagool_config.blackout_timezone,
+            )
+            update_stats(in_blackout=True, trading_mode="BLACKOUT")
+
+        # Start blackout checker background task
+        if self.gabagool_config.blackout_enabled:
+            self._blackout_checker_task = asyncio.create_task(
+                self._blackout_checker_loop(),
+                name="blackout-checker"
+            )
+
         # Start the main loop
         await self._run_loop()
 
@@ -454,6 +475,15 @@ class GabagoolStrategy(BaseStrategy):
             except asyncio.CancelledError:
                 pass
             log.info("Stopped opportunity queue processor task")
+
+        # Cancel the blackout checker task
+        if self._blackout_checker_task and not self._blackout_checker_task.done():
+            self._blackout_checker_task.cancel()
+            try:
+                await self._blackout_checker_task
+            except asyncio.CancelledError:
+                pass
+            log.info("Stopped blackout checker task")
 
         log.info(
             "Stopping Gabagool strategy",
@@ -1269,8 +1299,13 @@ class GabagoolStrategy(BaseStrategy):
         trading_mode = self._get_trading_mode()
 
         if trading_disabled:
-            # Simulate trade (dry run or circuit breaker mode)
-            mode_label = "CIRCUIT BREAKER" if self._circuit_breaker_hit else "DRY RUN"
+            # Simulate trade (dry run, circuit breaker, or blackout mode)
+            if self._in_blackout:
+                mode_label = "BLACKOUT"
+            elif self._circuit_breaker_hit:
+                mode_label = "CIRCUIT BREAKER"
+            else:
+                mode_label = "DRY RUN"
             log.info(
                 f"{mode_label}: Would execute trade",
                 asset=market.asset,
@@ -1959,25 +1994,120 @@ class GabagoolStrategy(BaseStrategy):
             self._realized_pnl = 0.0
 
     def _is_trading_disabled(self) -> bool:
-        """Check if trading is disabled (dry_run OR circuit_breaker_hit).
+        """Check if trading is disabled (dry_run OR circuit_breaker_hit OR blackout).
 
         Returns:
             True if trading should be simulated, False if real trading is allowed
         """
-        return self.gabagool_config.dry_run or self._circuit_breaker_hit
+        return self.gabagool_config.dry_run or self._circuit_breaker_hit or self._in_blackout
 
     def _get_trading_mode(self) -> str:
         """Get current trading mode for display.
 
         Returns:
-            'LIVE', 'DRY_RUN', or 'CIRCUIT_BREAKER'
+            'LIVE', 'DRY_RUN', 'CIRCUIT_BREAKER', or 'BLACKOUT'
         """
-        if self._circuit_breaker_hit:
+        if self._in_blackout:
+            return "BLACKOUT"
+        elif self._circuit_breaker_hit:
             return "CIRCUIT_BREAKER"
         elif self.gabagool_config.dry_run:
             return "DRY_RUN"
         else:
             return "LIVE"
+
+    def _check_blackout_window(self) -> bool:
+        """Check if current time is within the blackout window.
+
+        This is called by the background task - NOT during trade execution.
+        Trade execution just reads self._in_blackout flag.
+
+        Returns:
+            True if in blackout window, False otherwise
+        """
+        if not self.gabagool_config.blackout_enabled:
+            return False
+
+        try:
+            from zoneinfo import ZoneInfo
+        except ImportError:
+            from backports.zoneinfo import ZoneInfo
+
+        # Get current time in configured timezone (e.g., America/Chicago)
+        tz = ZoneInfo(self.gabagool_config.blackout_timezone)
+        now = datetime.now(tz)
+
+        # Calculate blackout start and end times for today
+        blackout_start = now.replace(
+            hour=self.gabagool_config.blackout_start_hour,
+            minute=self.gabagool_config.blackout_start_minute,
+            second=0,
+            microsecond=0,
+        )
+        blackout_end = now.replace(
+            hour=self.gabagool_config.blackout_end_hour,
+            minute=self.gabagool_config.blackout_end_minute,
+            second=59,
+            microsecond=999999,
+        )
+
+        return blackout_start <= now <= blackout_end
+
+    async def _blackout_checker_loop(self) -> None:
+        """Background task that checks blackout window every minute.
+
+        Updates self._in_blackout flag which trades read.
+        This design keeps blackout check off the critical trade path.
+        """
+        log.info(
+            "Blackout checker started",
+            enabled=self.gabagool_config.blackout_enabled,
+            window=f"{self.gabagool_config.blackout_start_hour:02d}:{self.gabagool_config.blackout_start_minute:02d}-{self.gabagool_config.blackout_end_hour:02d}:{self.gabagool_config.blackout_end_minute:02d}",
+            timezone=self.gabagool_config.blackout_timezone,
+        )
+
+        while self._running:
+            try:
+                was_in_blackout = self._in_blackout
+                self._in_blackout = self._check_blackout_window()
+
+                # Log state transitions
+                if self._in_blackout and not was_in_blackout:
+                    log.warning(
+                        "BLACKOUT PERIOD STARTED - trading disabled for server restart",
+                        until=f"{self.gabagool_config.blackout_end_hour:02d}:{self.gabagool_config.blackout_end_minute:02d}",
+                    )
+                    update_stats(
+                        in_blackout=True,
+                        trading_mode="BLACKOUT",
+                    )
+
+                elif not self._in_blackout and was_in_blackout:
+                    # Exiting blackout - only resume if circuit breaker hasn't been hit
+                    if self._circuit_breaker_hit:
+                        log.info(
+                            "Blackout ended but circuit breaker still active - remaining in simulation mode",
+                            realized_pnl=f"${self._realized_pnl:.2f}",
+                        )
+                        update_stats(
+                            in_blackout=False,
+                            trading_mode="CIRCUIT_BREAKER",
+                        )
+                    else:
+                        log.info(
+                            "BLACKOUT PERIOD ENDED - trading resumed",
+                            mode=self._get_trading_mode(),
+                        )
+                        update_stats(
+                            in_blackout=False,
+                            trading_mode=self._get_trading_mode(),
+                        )
+
+            except Exception as e:
+                log.error("Blackout checker error", error=str(e))
+
+            # Check every 60 seconds
+            await asyncio.sleep(60)
 
     async def _check_settlement(self) -> None:
         """Check for positions that need settlement (claiming winnings).

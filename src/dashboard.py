@@ -57,6 +57,8 @@ stats: Dict[str, Any] = {
     "avg_yes_liquidity": 0.0,
     "avg_no_liquidity": 0.0,
     "last_trade_time": None,
+    # Blackout status (server restart protection)
+    "in_blackout": False,
 }
 
 # Database reference (set during initialization)
@@ -558,6 +560,16 @@ DASHBOARD_HTML = """
             animation: blink 1s infinite;
         }
 
+        .blackout-banner {
+            background: linear-gradient(90deg, #6f42c1, transparent);
+            color: #fff;
+            text-align: center;
+            padding: 8px;
+            font-weight: bold;
+            letter-spacing: 2px;
+            animation: blink 2s infinite;
+        }
+
         @media (max-width: 1200px) {
             .grid { grid-template-columns: repeat(2, 1fr); }
             .grid-2col { grid-template-columns: 1fr; }
@@ -606,6 +618,9 @@ DASHBOARD_HTML = """
     </div>
     <div id="circuit-breaker-banner" class="circuit-breaker-banner" style="display: none;">
         [ ⚠️ CIRCUIT BREAKER ACTIVE - DAILY LOSS LIMIT REACHED ]
+    </div>
+    <div id="blackout-banner" class="blackout-banner" style="display: none;">
+        [ 🌙 BLACKOUT PERIOD - SERVER RESTART PROTECTION (5:00-5:29 AM CST) ]
     </div>
 
     <div class="container">
@@ -1157,19 +1172,20 @@ DASHBOARD_HTML = """
                 // Show appropriate banner based on trading mode
                 const dryRunBanner = document.getElementById('dry-run-banner');
                 const cbBanner = document.getElementById('circuit-breaker-banner');
+                const blackoutBanner = document.getElementById('blackout-banner');
 
-                if (s.circuit_breaker_hit) {
-                    // Circuit breaker takes priority
+                // Hide all banners first
+                if (dryRunBanner.style.display !== 'none') dryRunBanner.style.display = 'none';
+                if (cbBanner.style.display !== 'none') cbBanner.style.display = 'none';
+                if (blackoutBanner.style.display !== 'none') blackoutBanner.style.display = 'none';
+
+                // Show the appropriate banner (priority: blackout > circuit_breaker > dry_run)
+                if (s.in_blackout) {
+                    if (blackoutBanner.style.display !== 'block') blackoutBanner.style.display = 'block';
+                } else if (s.circuit_breaker_hit) {
                     if (cbBanner.style.display !== 'block') cbBanner.style.display = 'block';
-                    if (dryRunBanner.style.display !== 'none') dryRunBanner.style.display = 'none';
                 } else if (s.dry_run) {
-                    // Dry run mode
                     if (dryRunBanner.style.display !== 'block') dryRunBanner.style.display = 'block';
-                    if (cbBanner.style.display !== 'none') cbBanner.style.display = 'none';
-                } else {
-                    // Live trading
-                    if (dryRunBanner.style.display !== 'none') dryRunBanner.style.display = 'none';
-                    if (cbBanner.style.display !== 'none') cbBanner.style.display = 'none';
                 }
 
                 // Update realized PnL if available
