@@ -84,6 +84,7 @@ DASHBOARD_HTML = """
             --bg: #000000;
             --panel-bg: #0a0a0a;
             --border: #333333;
+            --status-active: #00ff00;
         }
 
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -161,8 +162,8 @@ DASHBOARD_HTML = """
             width: 8px;
             height: 8px;
             border-radius: 50%;
-            background: var(--green);
-            box-shadow: 0 0 6px var(--green);
+            background: var(--status-active);
+            box-shadow: 0 0 6px var(--status-active);
             animation: pulse 2s infinite;
         }
 
