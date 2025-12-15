@@ -1671,12 +1671,25 @@ class DashboardServer:
                     break
 
                 tick_count += 1
-                # Every 5 seconds, push current market data to this client
-                # This ensures UI stays updated even if WebSocket isn't providing real-time data
-                if tick_count >= 5 and active_markets:
+                # Every 1 second, push current market data to this client
+                # Recalculate seconds_remaining from end_time_utc for real-time countdown
+                if tick_count >= 1 and active_markets:
                     tick_count = 0
                     try:
-                        message = f"data: {json.dumps({'markets': active_markets, 'stats': stats})}\n\n"
+                        # Recalculate seconds_remaining for all markets
+                        now = datetime.utcnow()
+                        markets_with_updated_time = {}
+                        for mid, mdata in active_markets.items():
+                            updated = dict(mdata)  # Copy to avoid modifying original
+                            if mdata.get("end_time_utc"):
+                                try:
+                                    end_dt = datetime.fromisoformat(mdata["end_time_utc"])
+                                    updated["seconds_remaining"] = max(0, (end_dt - now).total_seconds())
+                                except (ValueError, TypeError):
+                                    pass  # Keep existing value if parse fails
+                            markets_with_updated_time[mid] = updated
+
+                        message = f"data: {json.dumps({'markets': markets_with_updated_time, 'stats': stats})}\n\n"
                         await response.write(message.encode())
                     except Exception:
                         break

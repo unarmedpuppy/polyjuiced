@@ -759,6 +759,7 @@ class GabagoolStrategy(BaseStrategy):
             markets_data[market.condition_id] = {
                 "asset": market.asset,
                 "end_time": market.end_time.strftime("%H:%M UTC") if market.end_time else "N/A",
+                "end_time_utc": market.end_time.isoformat() if market.end_time else None,  # For recalculating seconds_remaining
                 "seconds_remaining": market.seconds_remaining,
                 "up_price": up_price,
                 "down_price": down_price,
