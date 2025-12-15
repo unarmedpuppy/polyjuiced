@@ -524,7 +524,7 @@ DASHBOARD_HTML = """
             font-size: 1.5rem;
         }
 
-        .winloss-value.wins { color: var(--green); }
+        .winloss-value.wins { color: var(--status-active); }
         .winloss-value.losses { color: var(--red); }
         .winloss-value.pending { color: var(--amber); }
 
