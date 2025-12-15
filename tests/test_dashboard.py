@@ -4,9 +4,147 @@ Regression tests for:
 1. Dashboard using optimized market updates (cell-level updates vs innerHTML)
 2. Initial state loading using optimized function
    (Issue: Dashboard UI flickering due to full table replacement on every update)
+3. JavaScript syntax validation
+   (Issue: Duplicate variable declarations break entire dashboard)
 """
 
 import re
+import subprocess
+import tempfile
+
+
+class TestDashboardJavaScriptSyntax:
+    """Regression tests for JavaScript syntax validation.
+
+    Issue (Dec 2025): A duplicate 'const strategyId' declaration within the
+    same forEach callback caused a JavaScript syntax error that completely
+    broke the dashboard. The error was:
+        "Identifier 'strategyId' has already been declared"
+
+    The dashboard showed 0 balance, 0 uptime, and no data because the
+    entire <script> block failed to execute due to the syntax error.
+
+    These tests validate JavaScript syntax at build/test time to catch
+    such errors before deployment.
+    """
+
+    def test_dashboard_javascript_has_valid_syntax(self):
+        """Verify dashboard JavaScript passes syntax validation.
+
+        This is a CRITICAL regression test. If this fails, the dashboard
+        will not function at all - no data will load, no updates will work.
+
+        Uses Node.js to parse and validate the JavaScript.
+        """
+        from src.dashboard import DASHBOARD_HTML
+        import re
+
+        # Extract the script content
+        match = re.search(r'<script>([\s\S]*?)</script>', DASHBOARD_HTML)
+        assert match, "Dashboard must have a <script> block"
+
+        script_content = match.group(1)
+
+        # Write to temp file for Node validation
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.js', delete=False) as f:
+            # Wrap in a function to allow top-level statements
+            f.write(f"(function() {{\n{script_content}\n}})();")
+            temp_path = f.name
+
+        try:
+            # Use Node.js to check syntax (--check flag only parses, doesn't execute)
+            result = subprocess.run(
+                ['node', '--check', temp_path],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+
+            assert result.returncode == 0, (
+                f"Dashboard JavaScript has syntax errors:\n{result.stderr}\n\n"
+                "This will completely break the dashboard - no data will load!"
+            )
+        except FileNotFoundError:
+            # Node.js not available, try alternative validation
+            try:
+                # Try using Python's simple validation approach
+                # Just check for obvious duplicate declarations
+                self._check_for_duplicate_declarations(script_content)
+            except Exception as e:
+                raise AssertionError(f"JavaScript validation failed: {e}")
+        finally:
+            import os
+            os.unlink(temp_path)
+
+    def test_no_duplicate_const_declarations_in_same_scope(self):
+        """Check for duplicate const declarations that would cause syntax errors.
+
+        Regression test: The Dec 2025 bug was caused by declaring 'const strategyId'
+        twice within the same forEach callback.
+        """
+        from src.dashboard import DASHBOARD_HTML
+
+        self._check_for_duplicate_declarations(DASHBOARD_HTML)
+
+    def _check_for_duplicate_declarations(self, script_content: str):
+        """Helper to check for obvious duplicate const/let declarations.
+
+        This is a simplified check - the Node.js validation is more thorough,
+        but this catches the most common case of duplicate declarations.
+        """
+        import re
+
+        # Find all forEach/map/filter callbacks and check for duplicate const declarations
+        # Pattern: .forEach(... => { ... const X ... const X ... })
+        callback_pattern = r'\.(forEach|map|filter)\s*\(\s*(?:\([^)]*\)|[^=]+)\s*=>\s*\{([^}]+(?:\{[^}]*\}[^}]*)*)\}'
+
+        for match in re.finditer(callback_pattern, script_content, re.DOTALL):
+            callback_body = match.group(2)
+            callback_type = match.group(1)
+
+            # Find all const/let declarations in this callback
+            decl_pattern = r'\b(const|let)\s+(\w+)\s*='
+            declarations = re.findall(decl_pattern, callback_body)
+
+            # Check for duplicates
+            seen = {}
+            for decl_type, var_name in declarations:
+                if var_name in seen:
+                    raise AssertionError(
+                        f"Duplicate '{decl_type} {var_name}' declaration found in "
+                        f"{callback_type} callback. This will cause a JavaScript "
+                        f"syntax error and break the entire dashboard.\n"
+                        f"First declaration: {seen[var_name]}\n"
+                        f"Duplicate found in same scope."
+                    )
+                seen[var_name] = decl_type
+
+    def test_all_javascript_comments_are_valid(self):
+        """Verify JavaScript comments use valid syntax (// not /).
+
+        Regression test: A single-slash comment like '/ comment' instead of
+        '// comment' is a syntax error that breaks the entire script.
+        """
+        from src.dashboard import DASHBOARD_HTML
+        import re
+
+        # Find the script content
+        match = re.search(r'<script>([\s\S]*?)</script>', DASHBOARD_HTML)
+        assert match, "Dashboard must have a <script> block"
+
+        script_content = match.group(1)
+
+        # Look for lines that start with a single slash followed by a space
+        # (which would be an invalid comment)
+        lines = script_content.split('\n')
+        for i, line in enumerate(lines, 1):
+            stripped = line.strip()
+            # Check for "/ " at start (invalid) but not "// " (valid) or "/*" (valid)
+            if stripped.startswith('/ ') and not stripped.startswith('// ') and not stripped.startswith('/*'):
+                raise AssertionError(
+                    f"Invalid single-slash comment on line {i}: '{stripped[:50]}...'\n"
+                    f"Use '//' for comments, not '/'. This syntax error will break the dashboard."
+                )
 
 
 class TestDashboardOptimizedUpdates:
