@@ -263,17 +263,21 @@ class PolymarketWebSocket:
     async def _handle_message(self, data: Dict[str, Any]) -> None:
         """Handle a parsed WebSocket message.
 
-        Polymarket uses "event_type" field for message types:
-        - "book": Order book snapshot
-        - "price_change": Price level changes
-        - "last_trade_price": Trade execution
+        Polymarket WebSocket message formats:
+        1. With event_type field: {"event_type": "book", ...} or {"event_type": "price_change", ...}
+        2. Without event_type: {"market": "...", "price_changes": [...]} (must detect by key presence)
+        3. With type field: {"type": "last_trade_price", ...}
 
         Args:
             data: Parsed JSON message
         """
         msg_type = data.get("event_type", data.get("type"))
 
-        if msg_type == "book":
+        # Handle messages that have price_changes key but no event_type
+        # This is the most common format from Polymarket WebSocket
+        if "price_changes" in data:
+            await self._handle_price_change(data)
+        elif msg_type == "book":
             await self._handle_book_update(data)
         elif msg_type == "price_change":
             await self._handle_price_change(data)
@@ -285,6 +289,9 @@ class PolymarketWebSocket:
             log.info("WebSocket subscription confirmed", data=data)
         elif msg_type == "error":
             log.error("WebSocket error message", data=data)
+        # Handle order book snapshots (have bids/asks without explicit type)
+        elif "bids" in data or "asks" in data:
+            await self._handle_book_update(data)
         elif msg_type is None:
             # Log raw message for debugging unknown formats
             log.debug("WS message without type", keys=list(data.keys())[:10])
