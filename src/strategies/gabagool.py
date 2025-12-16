@@ -1185,10 +1185,6 @@ class GabagoolStrategy(BaseStrategy):
             )
             return (yes_amount, no_amount)
 
-        # Calculate intended share sizes
-        yes_shares = yes_amount / opportunity.yes_price if opportunity.yes_price > 0 else 0
-        no_shares = no_amount / opportunity.no_price if opportunity.no_price > 0 else 0
-
         # Get available liquidity at our price levels
         # For BUY orders, we look at ASK side (what's being sold)
         # Handle both dict and OrderBookSummary object from py-clob-client
@@ -1202,39 +1198,75 @@ class GabagoolStrategy(BaseStrategy):
         else:
             no_asks = no_book.get("asks", [])
 
-        # Calculate depth at or below our target price
-        yes_available = 0.0
+        # Find best ask prices from order books
         yes_best_ask = None
+        no_best_ask = None
+
+        for ask in yes_asks:
+            price = float(ask.get("price", 0) if isinstance(ask, dict) else getattr(ask, "price", 0))
+            if yes_best_ask is None or price < yes_best_ask:
+                yes_best_ask = price
+
+        for ask in no_asks:
+            price = float(ask.get("price", 0) if isinstance(ask, dict) else getattr(ask, "price", 0))
+            if no_best_ask is None or price < no_best_ask:
+                no_best_ask = price
+
+        # Use ACTUAL order book prices, not stale WebSocket prices
+        # This prevents the race condition where prices move between detection and execution
+        actual_yes_price = yes_best_ask if yes_best_ask is not None else opportunity.yes_price
+        actual_no_price = no_best_ask if no_best_ask is not None else opportunity.no_price
+
+        # Re-validate arbitrage opportunity at current order book prices
+        actual_spread = 1.0 - actual_yes_price - actual_no_price
+        min_spread = self.gabagool_config.min_spread_threshold
+
+        if actual_spread < min_spread:
+            log.info(
+                "Opportunity no longer profitable at current order book prices",
+                asset=market.asset,
+                ws_yes=f"${opportunity.yes_price:.3f}",
+                ws_no=f"${opportunity.no_price:.3f}",
+                ws_spread=f"{opportunity.spread_cents:.1f}¢",
+                book_yes=f"${actual_yes_price:.3f}",
+                book_no=f"${actual_no_price:.3f}",
+                book_spread=f"{actual_spread*100:.1f}¢",
+                min_spread=f"{min_spread*100:.1f}¢",
+            )
+            return (0.0, 0.0)
+
+        # Calculate available liquidity at current best ask prices
+        # We're willing to pay up to the best ask price (or slightly more with buffer)
+        yes_available = 0.0
         for ask in yes_asks:
             price = float(ask.get("price", 0) if isinstance(ask, dict) else getattr(ask, "price", 0))
             size = float(ask.get("size", 0) if isinstance(ask, dict) else getattr(ask, "size", 0))
-            if yes_best_ask is None or price < yes_best_ask:
-                yes_best_ask = price
-            if price <= opportunity.yes_price:
+            # Accept asks at or below best ask (i.e., at the best price)
+            if price <= actual_yes_price:
                 yes_available += size
 
         no_available = 0.0
-        no_best_ask = None
         for ask in no_asks:
             price = float(ask.get("price", 0) if isinstance(ask, dict) else getattr(ask, "price", 0))
             size = float(ask.get("size", 0) if isinstance(ask, dict) else getattr(ask, "size", 0))
-            if no_best_ask is None or price < no_best_ask:
-                no_best_ask = price
-            if price <= opportunity.no_price:
+            # Accept asks at or below best ask (i.e., at the best price)
+            if price <= actual_no_price:
                 no_available += size
 
         # Log the price comparison for debugging
         if yes_available == 0 or no_available == 0:
             log.warning(
-                "Order book price mismatch",
+                "No liquidity at best ask price",
                 asset=market.asset,
-                ws_yes_price=f"${opportunity.yes_price:.3f}",
-                ws_no_price=f"${opportunity.no_price:.3f}",
                 book_yes_best_ask=f"${yes_best_ask:.3f}" if yes_best_ask else "NO ASKS",
                 book_no_best_ask=f"${no_best_ask:.3f}" if no_best_ask else "NO ASKS",
                 yes_asks_count=len(yes_asks),
                 no_asks_count=len(no_asks),
             )
+
+        # Recalculate intended shares based on actual prices
+        yes_shares = yes_amount / actual_yes_price if actual_yes_price > 0 else 0
+        no_shares = no_amount / actual_no_price if actual_no_price > 0 else 0
 
         # Use max_liquidity_consumption_pct to avoid taking all available liquidity
         max_consumption = self.gabagool_config.max_liquidity_consumption_pct
