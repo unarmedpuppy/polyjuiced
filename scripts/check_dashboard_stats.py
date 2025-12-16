@@ -5,7 +5,7 @@ import json
 
 def main():
     try:
-        req = urllib.request.urlopen('http://localhost:8080/dashboard/stats')
+        req = urllib.request.urlopen('http://localhost:8080/dashboard/state')
         data = json.loads(req.read())
 
         print("=" * 50)
