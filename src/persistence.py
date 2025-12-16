@@ -1249,6 +1249,106 @@ class Database:
 
         return points
 
+    # ========== Realized P&L Ledger (Source of Truth) ==========
+
+    async def get_total_realized_pnl(self) -> float:
+        """Get total realized P&L from the ledger (source of truth).
+
+        This includes:
+        - historical_import: Manually imported historical trades
+        - resolution: P&L from market resolution
+        - settlement: P&L from claiming winning positions
+        - rebalance: P&L from rebalancing trades
+
+        Returns:
+            Total realized P&L across all types
+        """
+        async with self._conn.execute(
+            "SELECT COALESCE(SUM(pnl_amount), 0) as total FROM realized_pnl_ledger"
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row["total"] if row else 0.0
+
+    async def get_today_realized_pnl(self) -> float:
+        """Get today's realized P&L from the ledger.
+
+        Returns:
+            Today's realized P&L
+        """
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        async with self._conn.execute(
+            "SELECT COALESCE(SUM(pnl_amount), 0) as total FROM realized_pnl_ledger WHERE trade_date = ?",
+            (today,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row["total"] if row else 0.0
+
+    async def get_pnl_by_type(self) -> Dict[str, float]:
+        """Get P&L breakdown by type.
+
+        Returns:
+            Dict mapping pnl_type to total amount
+        """
+        async with self._conn.execute(
+            """
+            SELECT pnl_type, COALESCE(SUM(pnl_amount), 0) as total
+            FROM realized_pnl_ledger
+            GROUP BY pnl_type
+            """
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return {row["pnl_type"]: row["total"] for row in rows}
+
+    async def get_pnl_history_from_ledger(self, timeframe: str = "all") -> List[Dict[str, Any]]:
+        """Get P&L history from the ledger for charting.
+
+        This is the source-of-truth version of get_pnl_history().
+
+        Args:
+            timeframe: "24h", "7d", or "all"
+
+        Returns:
+            List of {timestamp, cumulative_pnl} points in chronological order
+        """
+        # Build time filter
+        if timeframe == "24h":
+            cutoff = (datetime.utcnow() - timedelta(hours=24)).strftime("%Y-%m-%d")
+        elif timeframe == "7d":
+            cutoff = (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d")
+        else:
+            cutoff = None
+
+        if cutoff:
+            query = """
+                SELECT created_at, pnl_amount
+                FROM realized_pnl_ledger
+                WHERE trade_date >= ?
+                ORDER BY created_at ASC
+            """
+            params = (cutoff,)
+        else:
+            query = """
+                SELECT created_at, pnl_amount
+                FROM realized_pnl_ledger
+                ORDER BY created_at ASC
+            """
+            params = ()
+
+        async with self._conn.execute(query, params) as cursor:
+            rows = await cursor.fetchall()
+
+        # Calculate cumulative P&L
+        points = []
+        cumulative = 0.0
+        for row in rows:
+            cumulative += row["pnl_amount"] or 0
+            points.append({
+                "timestamp": row["created_at"],
+                "cumulative_pnl": round(cumulative, 2),
+            })
+
+        return points
+
     async def reset_trade_history(self, preserve_liquidity_data: bool = True) -> Dict[str, int]:
         """Reset trade history data.
 

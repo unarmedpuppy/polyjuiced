@@ -2441,15 +2441,17 @@ async def init_persistence(db: "Database") -> None:
             if last_id.startswith("trade-"):
                 _trade_id_counter = int(last_id.split("-")[1])
 
-        # Load all-time stats (primary display)
+        # Load P&L from realized_pnl_ledger (SOURCE OF TRUTH)
+        # This includes historical imports, resolution P&L, settlement P&L, etc.
+        stats["all_time_pnl"] = await db.get_total_realized_pnl()
+        stats["daily_pnl"] = await db.get_today_realized_pnl()
+
+        # Load trade counts from trades table (for win/loss tracking)
         all_time = await db.get_all_time_stats()
         if all_time:
-            stats["all_time_pnl"] = all_time.get("total_pnl") or 0.0
             stats["all_time_trades"] = all_time.get("total_trades") or 0
             stats["all_time_wins"] = all_time.get("wins") or 0
             stats["all_time_losses"] = all_time.get("losses") or 0
-            # Use all-time stats for main display
-            stats["daily_pnl"] = stats["all_time_pnl"]
             stats["daily_trades"] = stats["all_time_trades"]
             stats["wins"] = stats["all_time_wins"]
             stats["losses"] = stats["all_time_losses"]
