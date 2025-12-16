@@ -159,7 +159,9 @@ class PolymarketWebSocket:
             "type": "market",
             "assets_ids": new_tokens,
         }
-        await self._ws.send(orjson.dumps(subscribe_msg).decode())
+        msg_bytes = orjson.dumps(subscribe_msg).decode()
+        log.info("Sending WebSocket subscription", message=msg_bytes[:200])
+        await self._ws.send(msg_bytes)
 
         for token_id in new_tokens:
             self._subscribed_tokens.add(token_id)
@@ -233,7 +235,12 @@ class PolymarketWebSocket:
 
     async def _process_messages(self) -> None:
         """Process incoming WebSocket messages."""
+        message_count = 0
         async for message in self._ws:
+            message_count += 1
+            # Log every 100th message to confirm we're receiving data
+            if message_count % 100 == 1:
+                log.info("WebSocket receiving messages", count=message_count, sample=str(message)[:100])
             try:
                 # Handle PONG/PING text messages (not JSON)
                 if message in ("PONG", "PING"):
