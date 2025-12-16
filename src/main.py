@@ -143,8 +143,11 @@ class GabagoolBot:
                 vol_happens_task = asyncio.create_task(self._vol_happens_strategy.start())
                 add_log("info", "Vol Happens strategy enabled")
 
+            # Start connection health monitor
+            health_monitor_task = asyncio.create_task(self._connection_health_monitor())
+
             # Wait for strategies (they run until stopped)
-            tasks = [gabagool_task]
+            tasks = [gabagool_task, health_monitor_task]
             if vol_happens_task:
                 tasks.append(vol_happens_task)
             await asyncio.gather(*tasks)
@@ -327,6 +330,93 @@ class GabagoolBot:
             log.warning(
                 "DRY RUN MODE - No real trades will be executed",
             )
+
+    async def _connection_health_monitor(self) -> None:
+        """Monitor connection health and trigger reconnections when needed.
+
+        This runs as a background task and periodically checks:
+        1. WebSocket connection health (is_healthy property)
+        2. Polymarket CLOB client connection (via test call)
+        3. Forces reconnection if connections are stale
+
+        This handles the case where network connectivity is lost and restored,
+        but the connections don't automatically recover.
+        """
+        health_check_interval = 30.0  # Check every 30 seconds
+        clob_check_interval = 60.0  # Check CLOB less frequently
+        last_clob_check = 0.0
+
+        log.info("Connection health monitor started", interval_seconds=health_check_interval)
+
+        while self._running:
+            try:
+                await asyncio.sleep(health_check_interval)
+
+                if not self._running:
+                    break
+
+                current_time = asyncio.get_event_loop().time()
+
+                # Check WebSocket health
+                if self._ws_client:
+                    if not self._ws_client.is_healthy:
+                        seconds_stale = self._ws_client.seconds_since_last_message
+                        log.warning(
+                            "WebSocket connection unhealthy - forcing reconnect",
+                            connected=self._ws_client.is_connected,
+                            seconds_since_last_message=f"{seconds_stale:.0f}s",
+                        )
+                        update_stats(websocket="RECONNECTING")
+                        add_log("warning", f"WebSocket stale ({seconds_stale:.0f}s), reconnecting...")
+                        await self._ws_client.force_reconnect()
+                    else:
+                        # Update status if healthy
+                        if self._ws_client.is_connected:
+                            update_stats(websocket="CONNECTED")
+
+                # Check CLOB client health (less frequently)
+                if current_time - last_clob_check > clob_check_interval:
+                    last_clob_check = current_time
+
+                    if self._client and self._client.is_connected:
+                        try:
+                            # Simple health check - get balance (lightweight)
+                            await asyncio.wait_for(
+                                asyncio.to_thread(self._client.get_balance),
+                                timeout=10.0,
+                            )
+                            update_stats(clob="CONNECTED")
+                        except Exception as e:
+                            log.warning(
+                                "CLOB client health check failed - reconnecting",
+                                error=str(e)[:100],
+                            )
+                            update_stats(clob="RECONNECTING")
+                            add_log("warning", f"CLOB health check failed, reconnecting: {str(e)[:50]}")
+
+                            # Attempt reconnection
+                            try:
+                                self._client._connected = False
+                                success = await self._client.connect()
+                                if success:
+                                    log.info("CLOB client reconnected successfully")
+                                    update_stats(clob="CONNECTED")
+                                    add_log("info", "CLOB client reconnected")
+                                else:
+                                    log.error("CLOB client reconnection failed")
+                                    update_stats(clob="DISCONNECTED")
+                            except Exception as reconn_err:
+                                log.error("CLOB reconnection error", error=str(reconn_err))
+
+            except asyncio.CancelledError:
+                log.info("Connection health monitor cancelled")
+                break
+            except Exception as e:
+                log.error("Connection health monitor error", error=str(e))
+                # Continue monitoring despite errors
+                await asyncio.sleep(5.0)
+
+        log.info("Connection health monitor stopped")
 
 
 async def run_bot() -> None:

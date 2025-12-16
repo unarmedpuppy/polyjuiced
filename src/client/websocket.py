@@ -66,6 +66,9 @@ class PolymarketWebSocket:
         self._connected = False
         self._running = False
         self._subscribed_tokens: Set[str] = set()
+        self._last_message_time: float = 0.0
+        self._health_check_interval: float = 30.0  # Check health every 30 seconds
+        self._message_timeout: float = 60.0  # Consider stale if no message for 60 seconds
 
         # Callbacks - use lists to support multiple handlers
         self._on_book_update_callbacks: List[Callable[[OrderBookUpdate], None]] = []
@@ -77,6 +80,29 @@ class PolymarketWebSocket:
     def is_connected(self) -> bool:
         """Check if WebSocket is connected."""
         return self._connected and self._ws is not None
+
+    @property
+    def is_healthy(self) -> bool:
+        """Check if WebSocket connection is healthy (connected and receiving messages).
+
+        Returns False if:
+        - Not connected
+        - No messages received in the last message_timeout seconds
+        """
+        if not self.is_connected:
+            return False
+        if self._last_message_time == 0:
+            return True  # Haven't started receiving yet
+        import time
+        return (time.time() - self._last_message_time) < self._message_timeout
+
+    @property
+    def seconds_since_last_message(self) -> float:
+        """Get seconds since the last message was received."""
+        if self._last_message_time == 0:
+            return 0.0
+        import time
+        return time.time() - self._last_message_time
 
     def on_book_update(self, callback: Callable[[OrderBookUpdate], None]) -> None:
         """Register callback for order book updates.
@@ -239,10 +265,41 @@ class PolymarketWebSocket:
                 log.error("WebSocket error", error=str(e))
                 self._connected = False
 
-    async def _process_messages(self) -> None:
-        """Process incoming WebSocket messages."""
-        async for message in self._ws:
+    async def force_reconnect(self) -> None:
+        """Force a reconnection by closing the current connection.
+
+        Call this when a stale connection is detected. The run() loop
+        will automatically reconnect.
+        """
+        log.warning("Forcing WebSocket reconnection")
+        self._connected = False
+        WEBSOCKET_CONNECTED.set(0)
+
+        if self._ws:
             try:
+                await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+
+        if self._on_disconnect:
+            self._on_disconnect()
+
+    async def _process_messages(self) -> None:
+        """Process incoming WebSocket messages with timeout detection."""
+        import time
+
+        while self._running and self.is_connected:
+            try:
+                # Use wait_for with timeout to detect stale connections
+                message = await asyncio.wait_for(
+                    self._ws.recv(),
+                    timeout=self._message_timeout,
+                )
+
+                # Track last message time for health checks
+                self._last_message_time = time.time()
+
                 # Handle PONG/PING text messages (not JSON)
                 if message in ("PONG", "PING"):
                     continue
@@ -256,8 +313,23 @@ class PolymarketWebSocket:
                             await self._handle_message(item)
                 else:
                     await self._handle_message(data)
+
+            except asyncio.TimeoutError:
+                # No message received within timeout - connection may be stale
+                log.warning(
+                    "WebSocket message timeout - connection may be stale",
+                    timeout_seconds=self._message_timeout,
+                )
+                # Break the loop to trigger reconnection
+                break
+
             except orjson.JSONDecodeError:
-                log.warning("Invalid JSON received", message=message[:100])
+                log.warning("Invalid JSON received", message=str(message)[:100])
+
+            except websockets.exceptions.ConnectionClosed:
+                log.warning("WebSocket connection closed during message processing")
+                break
+
             except Exception as e:
                 log.error("Error processing message", error=str(e))
 
