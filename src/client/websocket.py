@@ -362,6 +362,7 @@ class PolymarketWebSocket:
         # Price change events contain best_bid/best_ask - emit as OrderBookUpdate
         # so order_book tracker receives real-time updates
         if not self._on_book_update:
+            log.warning("No _on_book_update callback registered, skipping price change")
             return
 
         try:
