@@ -251,13 +251,6 @@ class OrderBookTracker:
         """
         token_id = update.token_id
 
-        # Debug: log incoming updates periodically
-        if not hasattr(self, '_update_count'):
-            self._update_count = 0
-        self._update_count += 1
-        if self._update_count % 500 == 1:
-            log.info("Processing book update", count=self._update_count, token_id=token_id[:30] if token_id else "None", best_bid=update.best_bid, best_ask=update.best_ask)
-
         # Find the market this token belongs to
         # The WebSocket may return full token IDs (77+ chars) while Gamma API
         # returns truncated ones (20 chars). Use prefix matching as fallback.
