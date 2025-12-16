@@ -67,9 +67,9 @@ class PolymarketWebSocket:
         self._running = False
         self._subscribed_tokens: Set[str] = set()
 
-        # Callbacks
-        self._on_book_update: Optional[Callable[[OrderBookUpdate], None]] = None
-        self._on_price_change: Optional[Callable[[PriceUpdate], None]] = None
+        # Callbacks - use lists to support multiple handlers
+        self._on_book_update_callbacks: List[Callable[[OrderBookUpdate], None]] = []
+        self._on_price_change_callbacks: List[Callable[[PriceUpdate], None]] = []
         self._on_connect: Optional[Callable[[], None]] = None
         self._on_disconnect: Optional[Callable[[], None]] = None
 
@@ -79,12 +79,20 @@ class PolymarketWebSocket:
         return self._connected and self._ws is not None
 
     def on_book_update(self, callback: Callable[[OrderBookUpdate], None]) -> None:
-        """Register callback for order book updates."""
-        self._on_book_update = callback
+        """Register callback for order book updates.
+
+        Multiple callbacks can be registered and all will be invoked.
+        """
+        if callback not in self._on_book_update_callbacks:
+            self._on_book_update_callbacks.append(callback)
 
     def on_price_change(self, callback: Callable[[PriceUpdate], None]) -> None:
-        """Register callback for price changes."""
-        self._on_price_change = callback
+        """Register callback for price changes.
+
+        Multiple callbacks can be registered and all will be invoked.
+        """
+        if callback not in self._on_price_change_callbacks:
+            self._on_price_change_callbacks.append(callback)
 
     def on_connect(self, callback: Callable[[], None]) -> None:
         """Register callback for connection events."""
@@ -298,7 +306,7 @@ class PolymarketWebSocket:
         raw_token = data.get("asset_id", data.get("token_id"))
         token_id = str(raw_token) if raw_token is not None else None
 
-        if not self._on_book_update:
+        if not self._on_book_update_callbacks:
             return
 
         try:
@@ -330,7 +338,12 @@ class PolymarketWebSocket:
                 midpoint=midpoint,
             )
 
-            self._on_book_update(update)
+            # Invoke all registered callbacks
+            for callback in self._on_book_update_callbacks:
+                try:
+                    callback(update)
+                except Exception as cb_err:
+                    log.error("Book update callback error", error=str(cb_err))
 
         except Exception as e:
             log.error("Error parsing book update", error=str(e))
@@ -354,7 +367,7 @@ class PolymarketWebSocket:
         """
         # Price change events contain best_bid/best_ask - emit as OrderBookUpdate
         # so order_book tracker receives real-time updates
-        if not self._on_book_update:
+        if not self._on_book_update_callbacks:
             return
 
         try:
@@ -382,7 +395,12 @@ class PolymarketWebSocket:
                     midpoint=midpoint,
                 )
 
-                self._on_book_update(update)
+                # Invoke all registered callbacks
+                for callback in self._on_book_update_callbacks:
+                    try:
+                        callback(update)
+                    except Exception as cb_err:
+                        log.error("Price change callback error", error=str(cb_err))
 
         except Exception as e:
             log.error("Error parsing price change", error=str(e))

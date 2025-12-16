@@ -336,6 +336,18 @@ class VolHappensStrategy(BaseStrategy):
         yes_price = state.yes_price
         no_price = state.no_price
 
+        # Log price evaluation periodically (every ~10 seconds per market)
+        # Only log if we have actual prices (not defaults)
+        if state.last_update and yes_price < 1.0 and no_price < 1.0:
+            log.debug(
+                "Vol Happens: Evaluating entry",
+                asset=market.asset,
+                yes_price=f"${yes_price:.2f}",
+                no_price=f"${no_price:.2f}",
+                entry_threshold=f"${config.entry_price_threshold:.2f}",
+                trend_filter=f"${config.trend_filter_threshold:.2f}",
+            )
+
         # Check if either side meets entry threshold
         # With trend filter: other side must be <= trend_filter_threshold
         entry_side = None
@@ -408,7 +420,7 @@ class VolHappensStrategy(BaseStrategy):
 
         # Execute real trade
         try:
-            token_id = market.yes_token if side == "YES" else market.no_token
+            token_id = market.yes_token_id if side == "YES" else market.no_token_id
             result = await self.client.execute_market_buy(
                 token_id=token_id,
                 amount_usd=cost,
@@ -555,7 +567,7 @@ class VolHappensStrategy(BaseStrategy):
         # Execute real trade
         try:
             market = position.market
-            token_id = market.yes_token if side == "YES" else market.no_token
+            token_id = market.yes_token_id if side == "YES" else market.no_token_id
             result = await self.client.execute_market_buy(
                 token_id=token_id,
                 amount_usd=cost,
@@ -655,7 +667,7 @@ class VolHappensStrategy(BaseStrategy):
 
         # Execute real exit
         try:
-            token_id = market.yes_token if position.first_leg_side == "YES" else market.no_token
+            token_id = market.yes_token_id if position.first_leg_side == "YES" else market.no_token_id
             result = await self.client.execute_market_sell(
                 token_id=token_id,
                 shares=position.first_leg_shares,
