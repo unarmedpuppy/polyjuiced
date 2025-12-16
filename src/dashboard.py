@@ -741,8 +741,12 @@ DASHBOARD_HTML = """
                 </div>
                 <div class="panel-body">
                     <div style="text-align: center;">
-                        <div id="daily-pnl" class="stat-value" style="font-size: 2.5rem;">$0.00</div>
-                        <div class="stat-label">TOTAL P&L</div>
+                        <div id="all-time-pnl" class="stat-value" style="font-size: 2.5rem;">$0.00</div>
+                        <div class="stat-label">ALL TIME</div>
+                        <div style="margin-top: 8px; font-size: 0.85rem; color: var(--dim-green);">
+                            <span>Today: </span>
+                            <span id="today-pnl" style="color: var(--green);">$0.00</span>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -1295,11 +1299,22 @@ DASHBOARD_HTML = """
                     if (el && el.className !== newClass) el.className = newClass;
                 }
 
-                const pnlEl = document.getElementById('daily-pnl');
-                const pnlText = '$' + s.daily_pnl.toFixed(2);
-                const pnlClass = 'stat-value ' + (s.daily_pnl >= 0 ? 'positive' : 'negative');
-                if (pnlEl.textContent !== pnlText) pnlEl.textContent = pnlText;
-                updateClass(pnlEl, pnlClass);
+                // Update all-time P&L (from realized_pnl_ledger)
+                const allTimePnl = s.all_time_pnl || 0;
+                const allTimePnlEl = document.getElementById('all-time-pnl');
+                const allTimePnlText = '$' + allTimePnl.toFixed(2);
+                const allTimePnlClass = 'stat-value ' + (allTimePnl >= 0 ? 'positive' : 'negative');
+                if (allTimePnlEl && allTimePnlEl.textContent !== allTimePnlText) allTimePnlEl.textContent = allTimePnlText;
+                updateClass(allTimePnlEl, allTimePnlClass);
+
+                // Update today's P&L
+                const todayPnl = s.daily_pnl || 0;
+                const todayPnlEl = document.getElementById('today-pnl');
+                if (todayPnlEl) {
+                    const todayPnlText = (todayPnl >= 0 ? '+' : '') + '$' + todayPnl.toFixed(2);
+                    if (todayPnlEl.textContent !== todayPnlText) todayPnlEl.textContent = todayPnlText;
+                    todayPnlEl.style.color = todayPnl >= 0 ? 'var(--green)' : 'var(--red)';
+                }
 
                 updateText('daily-exposure', '$' + s.daily_exposure.toFixed(2));
                 updateText('wins', String(s.wins || 0));
@@ -1373,12 +1388,13 @@ DASHBOARD_HTML = """
                     if (dryRunBanner.style.display !== 'block') dryRunBanner.style.display = 'block';
                 }
 
-                // Update realized PnL if available
+                // Update realized PnL if available (circuit breaker event)
                 if (s.realized_pnl !== undefined) {
-                    const pnlEl = document.getElementById('daily-pnl');
-                    if (pnlEl) {
-                        pnlEl.textContent = (s.realized_pnl >= 0 ? '+' : '') + '$' + s.realized_pnl.toFixed(2);
-                        pnlEl.className = s.realized_pnl >= 0 ? 'positive' : 'negative';
+                    // This is the circuit breaker's realized_pnl - update today's display
+                    const todayPnlEl = document.getElementById('today-pnl');
+                    if (todayPnlEl) {
+                        todayPnlEl.textContent = (s.realized_pnl >= 0 ? '+' : '') + '$' + s.realized_pnl.toFixed(2);
+                        todayPnlEl.style.color = s.realized_pnl >= 0 ? 'var(--green)' : 'var(--red)';
                     }
                 }
 
@@ -2105,17 +2121,25 @@ class DashboardServer:
         return response
 
     async def _handle_pnl_history(self, request: web.Request) -> web.Response:
-        """Get P&L history for charting."""
+        """Get P&L history for charting from realized_pnl_ledger (source of truth)."""
         timeframe = request.query.get("timeframe", "all")
         if timeframe not in ("24h", "7d", "all"):
             timeframe = "all"
 
         if _db:
-            points = await _db.get_pnl_history(timeframe)
+            # Use ledger as source of truth for P&L history
+            points = await _db.get_pnl_history_from_ledger(timeframe)
+            # Also get breakdown by type for detailed view
+            pnl_by_type = await _db.get_pnl_by_type()
         else:
             points = []
+            pnl_by_type = {}
 
-        return web.json_response({"points": points})
+        return web.json_response({
+            "points": points,
+            "by_type": pnl_by_type,
+            "total": sum(pnl_by_type.values()) if pnl_by_type else 0,
+        })
 
     async def _handle_positions(self, request: web.Request) -> web.Response:
         """Get historical positions from settlement queue."""
