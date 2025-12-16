@@ -5,11 +5,8 @@ This script fetches real order books and shows what's actually available,
 helping diagnose why liquidity checks are failing.
 """
 import os
-import sys
 import json
-
-# Add src to path
-sys.path.insert(0, '/app/src')
+import urllib.request
 
 def get_env_var(name):
     """Get environment variable."""
@@ -25,29 +22,22 @@ def get_env_var(name):
         pass
     return None
 
+def fetch_order_book(token_id):
+    """Fetch order book from CLOB API."""
+    url = f"https://clob.polymarket.com/book?token_id={token_id}"
+    req = urllib.request.Request(url)
+    req.add_header("User-Agent", "Mozilla/5.0")
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read())
+
 def main():
     print("=" * 70)
     print("ORDER BOOK LIQUIDITY DIAGNOSTIC")
     print("=" * 70)
 
-    # Import after setting path
-    try:
-        from client.polymarket import PolymarketClient
-    except ImportError as e:
-        print(f"Error importing client: {e}")
-        print("Running from outside container? This script must run inside the bot container.")
-        return
-
-    # Initialize client
-    try:
-        client = PolymarketClient()
-        print("✓ Client initialized\n")
-    except Exception as e:
-        print(f"✗ Failed to initialize client: {e}")
-        return
+    print("Using direct CLOB API calls...\n")
 
     # Get dashboard state for monitored markets
-    import urllib.request
     try:
         req = urllib.request.urlopen('http://127.0.0.1:8080/dashboard/state', timeout=5)
         data = json.loads(req.read())
@@ -79,8 +69,8 @@ def main():
 
         # Fetch order books
         try:
-            yes_book = client.get_order_book(yes_token)
-            no_book = client.get_order_book(no_token)
+            yes_book = fetch_order_book(yes_token)
+            no_book = fetch_order_book(no_token)
         except Exception as e:
             print(f"  ✗ Failed to fetch order book: {e}")
             continue
