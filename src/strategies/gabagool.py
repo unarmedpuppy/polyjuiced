@@ -1204,18 +1204,37 @@ class GabagoolStrategy(BaseStrategy):
 
         # Calculate depth at or below our target price
         yes_available = 0.0
+        yes_best_ask = None
         for ask in yes_asks:
             price = float(ask.get("price", 0) if isinstance(ask, dict) else getattr(ask, "price", 0))
             size = float(ask.get("size", 0) if isinstance(ask, dict) else getattr(ask, "size", 0))
+            if yes_best_ask is None or price < yes_best_ask:
+                yes_best_ask = price
             if price <= opportunity.yes_price:
                 yes_available += size
 
         no_available = 0.0
+        no_best_ask = None
         for ask in no_asks:
             price = float(ask.get("price", 0) if isinstance(ask, dict) else getattr(ask, "price", 0))
             size = float(ask.get("size", 0) if isinstance(ask, dict) else getattr(ask, "size", 0))
+            if no_best_ask is None or price < no_best_ask:
+                no_best_ask = price
             if price <= opportunity.no_price:
                 no_available += size
+
+        # Log the price comparison for debugging
+        if yes_available == 0 or no_available == 0:
+            log.warning(
+                "Order book price mismatch",
+                asset=market.asset,
+                ws_yes_price=f"${opportunity.yes_price:.3f}",
+                ws_no_price=f"${opportunity.no_price:.3f}",
+                book_yes_best_ask=f"${yes_best_ask:.3f}" if yes_best_ask else "NO ASKS",
+                book_no_best_ask=f"${no_best_ask:.3f}" if no_best_ask else "NO ASKS",
+                yes_asks_count=len(yes_asks),
+                no_asks_count=len(no_asks),
+            )
 
         # Use max_liquidity_consumption_pct to avoid taking all available liquidity
         max_consumption = self.gabagool_config.max_liquidity_consumption_pct
