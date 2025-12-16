@@ -257,3 +257,96 @@ class TestMessageTypeRouting:
 
         assert len(received_updates) == 1
         assert received_updates[0][0] == 'price'
+
+
+class TestPriceChangesWithoutEventType:
+    """Regression test for price_changes messages without event_type field.
+
+    Issue (Dec 2025): Polymarket WebSocket sends real-time price updates in format:
+    {"market": "0x...", "price_changes": [...]}
+
+    These messages do NOT have an event_type field, but were being silently ignored
+    because _handle_message only checked for event_type or type fields first.
+
+    This caused the dashboard to show stale 50/50 prices even though WebSocket
+    was receiving thousands of updates per minute.
+
+    Fix: Check for presence of 'price_changes' key BEFORE checking event_type/type.
+    """
+
+    @pytest.fixture
+    def ws_client(self):
+        """Create a WebSocket client instance."""
+        return PolymarketWebSocket()
+
+    @pytest.mark.asyncio
+    async def test_price_changes_without_event_type_is_processed(self, ws_client):
+        """CRITICAL: Messages with price_changes but no event_type must be handled.
+
+        This is the most common real-time message format from Polymarket WebSocket.
+        If this test fails, the dashboard will show stale prices.
+        """
+        received_updates = []
+        ws_client.on_book_update(lambda u: received_updates.append(u))
+
+        # Real format from Polymarket - NO event_type field!
+        await ws_client._handle_message({
+            "market": "0x1234567890abcdef",
+            "price_changes": [
+                {"asset_id": "12345", "best_bid": "0.45", "best_ask": "0.47"},
+            ]
+        })
+
+        assert len(received_updates) == 1
+        assert received_updates[0].token_id == "12345"
+        assert received_updates[0].best_bid == 0.45
+        assert received_updates[0].best_ask == 0.47
+
+    @pytest.mark.asyncio
+    async def test_price_changes_without_event_type_multiple_assets(self, ws_client):
+        """Verify all assets in a price_changes message without event_type are processed."""
+        received_updates = []
+        ws_client.on_book_update(lambda u: received_updates.append(u))
+
+        # Real format with multiple asset updates
+        await ws_client._handle_message({
+            "market": "0xabcdef123456",
+            "price_changes": [
+                {"asset_id": "111", "best_bid": "0.30", "best_ask": "0.32"},
+                {"asset_id": "222", "best_bid": "0.68", "best_ask": "0.70"},
+            ]
+        })
+
+        assert len(received_updates) == 2
+        token_ids = [u.token_id for u in received_updates]
+        assert "111" in token_ids
+        assert "222" in token_ids
+
+    @pytest.mark.asyncio
+    async def test_price_changes_key_takes_priority_over_missing_event_type(self, ws_client):
+        """Verify price_changes key is checked before event_type for routing.
+
+        Even if msg_type is None (no event_type/type field), the message should
+        still be processed if it has a price_changes key.
+        """
+        received_updates = []
+        ws_client.on_book_update(lambda u: received_updates.append(u))
+
+        # Message with only market and price_changes - no type indicators
+        message = {
+            "market": "0xdeadbeef",
+            "price_changes": [
+                {"asset_id": "999", "best_bid": "0.50", "best_ask": "0.52"},
+            ],
+            # Notably absent: event_type, type
+        }
+
+        # Verify no event_type or type field
+        assert "event_type" not in message
+        assert "type" not in message
+
+        await ws_client._handle_message(message)
+
+        # Message should still be processed via price_changes key detection
+        assert len(received_updates) == 1
+        assert received_updates[0].token_id == "999"
