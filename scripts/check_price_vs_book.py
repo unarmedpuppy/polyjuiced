@@ -20,19 +20,7 @@ def main():
     print("PRICE VS ORDER BOOK COMPARISON")
     print("=" * 70)
 
-    # Get dashboard state
-    try:
-        req = urllib.request.urlopen('http://127.0.0.1:8080/dashboard/state', timeout=5)
-        data = json.loads(req.read())
-        markets = data.get('markets', {})
-        print(f"Monitored markets: {len(markets)}\n")
-    except Exception as e:
-        print(f"Failed to get dashboard state: {e}")
-        return
-
-    # We need to get token IDs from somewhere
-    # Let's get them from logs or the market finder
-    # For now, let's look at the recent opportunity that failed
+    # Skip dashboard state, just check order books directly
 
     # From the logs, we know this token was used:
     # YES: 38293234940467616049200726120961180603341397123322595419005981538833107460192
