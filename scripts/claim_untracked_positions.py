@@ -196,7 +196,7 @@ async def main():
 
     # Initialize client
     client = PolymarketClient(config.polymarket)
-    client.connect()
+    await client.connect()
 
     # Get all positions
     print("Fetching wallet positions from Polymarket...")
