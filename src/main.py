@@ -268,6 +268,7 @@ class GabagoolBot:
             ws_client=self._ws_client,
             market_finder=self._market_finder,
             config=self.config,
+            db=self._db,
         )
 
         # Create Vol Happens strategy (runs alongside Gabagool)
