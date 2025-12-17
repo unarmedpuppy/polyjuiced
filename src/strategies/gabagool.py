@@ -2412,7 +2412,7 @@ class GabagoolStrategy(BaseStrategy):
         db_positions = []
         if self._db:
             try:
-                db_positions = await self._db.get_claimable_positions(wait_minutes=10)
+                db_positions = await self._db.get_claimable_positions(min_time_since_end_seconds=600)
                 if db_positions:
                     log.debug(
                         "Found claimable positions in database",
