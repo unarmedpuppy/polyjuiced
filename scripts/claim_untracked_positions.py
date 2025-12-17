@@ -24,11 +24,13 @@ from pathlib import Path
 
 import httpx
 
-# Add src to path
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+# Add src to path - must add parent for proper imports
+src_path = Path(__file__).parent.parent / "src"
+sys.path.insert(0, str(src_path.parent))  # Add apps/polymarket-bot
+sys.path.insert(0, str(src_path))          # Add apps/polymarket-bot/src
 
-from client.polymarket import PolymarketClient
-from config import load_config
+from src.client.polymarket import PolymarketClient
+from src.config import load_config
 import structlog
 
 log = structlog.get_logger()
