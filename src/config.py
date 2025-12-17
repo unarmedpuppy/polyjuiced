@@ -59,7 +59,7 @@ class GabagoolConfig:
     # Strategy settings
     enabled: bool = True
     markets: List[str] = field(default_factory=lambda: ["BTC", "ETH", "SOL"])
-    min_spread_threshold: float = 0.02  # 2 cents minimum to trade
+    min_spread_threshold: float = 0.015  # 1.5 cents minimum to trade (lowered from 2¢ for more opportunities)
 
     # Position sizing
     min_trade_size_usd: float = 3.0  # Minimum trade size per side (skip smaller trades)
@@ -97,6 +97,11 @@ class GabagoolConfig:
     max_liquidity_consumption_pct: float = 0.50  # Only consume 50% of displayed liquidity
     order_fill_check_interval_ms: float = 100.0  # Check fill status every 100ms
     parallel_fill_timeout_seconds: float = 5.0  # Timeout for both legs to fill in parallel mode
+
+    # Phase 4: Speed optimization (Dec 17, 2025)
+    # Skip REST API verification to reduce latency - trust WebSocket prices
+    skip_rest_verification: bool = True  # Skip REST API price verification (trust WebSocket)
+    order_price_buffer_cents: float = 1.0  # Add buffer to limit price for better fill rate (+1¢)
 
     # Mode
     dry_run: bool = True  # DRY RUN mode - no real trades until hedge enforcement is implemented

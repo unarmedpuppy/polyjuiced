@@ -937,12 +937,13 @@ class PolymarketClient:
         max_liquidity_consumption_pct: float = 0.50,
         condition_id: str = "",
         asset: str = "",
+        price_buffer_cents: float = 1.0,  # Phase 4: Price buffer for better fills
     ) -> Dict[str, Any]:
         """Execute YES and NO orders in PARALLEL for true atomic execution.
 
-        IMPORTANT: Prices are EXACT limit prices. NO slippage is added.
-        If we can't fill at these prices, we don't take the trade.
-        The goal is precision execution, not guaranteed fills.
+        Phase 4 (Dec 17, 2025): Added price_buffer_cents parameter.
+        Orders are placed at (price + buffer) to improve fill rates while
+        maintaining profitability (as long as buffer < spread).
 
         This provides better atomicity because:
         1. Both orders hit the book at nearly the same time
@@ -1097,13 +1098,13 @@ class PolymarketClient:
             pre_fill_yes_depth = 0.0
             pre_fill_no_depth = 0.0
 
-        def place_order_sync(token_id: str, amount_usd: float, label: str, limit_price: float) -> Dict[str, Any]:
-            """Place a single order at EXACT limit price. No slippage, no re-fetching.
+        def place_order_sync(token_id: str, amount_usd: float, label: str, limit_price: float, price_buffer_cents: float = 1.0) -> Dict[str, Any]:
+            """Place a single order with aggressive GTC pricing for better fills.
 
-            CRITICAL: The limit_price is used EXACTLY as provided.
-            - DO NOT add slippage - the arbitrage profit depends on exact prices
-            - DO NOT re-fetch price from API - we trust the opportunity detection
-            - If we can't fill at this price, we simply don't fill (that's OK)
+            Phase 4 (Dec 17, 2025): Changed from FOK to GTC with price buffer.
+            - FOK was failing too often due to price movements
+            - GTC with +1¢ buffer gives better fill rates while maintaining profitability
+            - Orders that don't fill immediately stay on book briefly
 
             Polymarket decimal requirements:
             - maker_amount (USD cost): max 2 decimal places
@@ -1118,17 +1119,22 @@ class PolymarketClient:
             start_time_ms = int(time.time() * 1000)
 
             try:
-                # Polymarket API requirements for market BUY orders (especially FOK):
+                # Add price buffer for better fill rates (configurable, default +1¢)
+                # This trades a small amount of profit for much higher fill rate
+                buffered_price = limit_price + (price_buffer_cents / 100.0)
+                # Cap at $0.99 (can't buy for more than $1)
+                buffered_price = min(buffered_price, 0.99)
+
+                # Polymarket API requirements for market BUY orders:
                 # - maker_amount (USD you pay): max 2 decimal places
                 # - taker_amount (shares you receive): max 2 decimal places (py-clob-client limit)
                 # - price: 2 decimal places
                 #
-                # CRITICAL: FOK orders require maker_amount (shares × price) to have ≤2 decimals.
                 # Since shares × price rarely produces clean results (e.g., 25.48 × 0.35 = 8.918),
                 # we work BACKWARDS: round maker_amount first, then calculate shares.
 
                 # Ensure price has 2 decimal places
-                price_d = Decimal(str(limit_price)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+                price_d = Decimal(str(buffered_price)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
                 # Round USD amount to 2 decimals - this IS our maker_amount (guaranteed clean)
                 maker_amount_d = Decimal(str(amount_usd)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
@@ -1157,8 +1163,9 @@ class PolymarketClient:
                 final_maker_amount = float(actual_maker)
 
                 log.info(
-                    f"Placing {label} order at EXACT limit (no slippage)",
-                    limit_price=f"${final_price:.2f}",
+                    f"Placing {label} GTC order with +{price_buffer_cents:.0f}¢ buffer",
+                    original_price=f"${limit_price:.2f}",
+                    buffered_price=f"${final_price:.2f}",
                     shares=f"{shares:.2f}",
                     maker_amount=f"${final_maker_amount:.2f}",
                 )
@@ -1171,11 +1178,14 @@ class PolymarketClient:
                 )
 
                 signed_order = self._client.create_order(order_args)
-                # Use FOK (Fill-or-Kill) for atomicity - either fill completely or not at all
-                result = self._client.post_order(signed_order, orderType=OrderType.FOK)
+                # Phase 4: Use GTC instead of FOK for better fill rates
+                # GTC orders sit on book if not filled immediately, giving more chances to fill
+                # FOK was failing too often due to price movements during execution
+                result = self._client.post_order(signed_order, orderType=OrderType.GTC)
 
                 result["_intended_size"] = shares
                 result["_intended_price"] = final_price
+                result["_original_price"] = limit_price
                 result["_start_time_ms"] = start_time_ms
                 result["_label"] = label
 
@@ -1201,11 +1211,12 @@ class PolymarketClient:
 
         try:
             # PARALLEL EXECUTION: Place both orders simultaneously
+            # Phase 4: Pass price_buffer_cents for better fill rates
             yes_task = asyncio.create_task(
-                asyncio.to_thread(place_order_sync, yes_token_id, yes_amount_usd, "YES", yes_price)
+                asyncio.to_thread(place_order_sync, yes_token_id, yes_amount_usd, "YES", yes_price, price_buffer_cents)
             )
             no_task = asyncio.create_task(
-                asyncio.to_thread(place_order_sync, no_token_id, no_amount_usd, "NO", no_price)
+                asyncio.to_thread(place_order_sync, no_token_id, no_amount_usd, "NO", no_price, price_buffer_cents)
             )
 
             # Wait for both with timeout

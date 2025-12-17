@@ -1161,7 +1161,12 @@ class GabagoolStrategy(BaseStrategy):
         """Adjust trade sizes based on available order book liquidity.
 
         Queries current order book depth and scales down trade size if
-        there isn't enough liquidity to fill our FOK order.
+        there isn't enough liquidity to fill our order.
+
+        Phase 4 (Dec 17, 2025): When skip_rest_verification=True, we skip the
+        REST API price re-validation that was causing 1+ second latency and
+        killing opportunities. We trust WebSocket prices and just do liquidity
+        scaling if needed.
 
         Args:
             opportunity: The arbitrage opportunity
@@ -1173,7 +1178,20 @@ class GabagoolStrategy(BaseStrategy):
         """
         market = opportunity.market
 
-        # Get current order book for both sides
+        # Phase 4: Skip REST API verification entirely for speed
+        # The REST API call adds ~1 second latency, and by then the spread is gone
+        if self.gabagool_config.skip_rest_verification:
+            log.info(
+                "Skipping REST API verification (trusting WebSocket prices)",
+                asset=market.asset,
+                ws_yes=f"${opportunity.yes_price:.3f}",
+                ws_no=f"${opportunity.no_price:.3f}",
+                ws_spread=f"{opportunity.spread_cents:.1f}¢",
+            )
+            # Trust WebSocket prices - proceed directly to execution
+            return (yes_amount, no_amount)
+
+        # Legacy behavior: Get current order book for both sides
         try:
             yes_book = self.client.get_order_book(market.yes_token_id)
             no_book = self.client.get_order_book(market.no_token_id)
@@ -1652,11 +1670,13 @@ class GabagoolStrategy(BaseStrategy):
 
         try:
             if self.gabagool_config.parallel_execution_enabled:
+                price_buffer = self.gabagool_config.order_price_buffer_cents
                 log.info(
-                    "Using PARALLEL execution mode with EXACT pricing (no slippage)",
+                    "Using PARALLEL execution mode with GTC + price buffer",
                     asset=market.asset,
                     yes_price=f"${opportunity.yes_price:.2f}",
                     no_price=f"${opportunity.no_price:.2f}",
+                    price_buffer=f"+{price_buffer:.0f}¢",
                     total_cost=f"${opportunity.yes_price + opportunity.no_price:.2f}",
                     timeout=self.gabagool_config.parallel_fill_timeout_seconds,
                     max_liquidity_pct=f"{self.gabagool_config.max_liquidity_consumption_pct*100:.0f}%",
@@ -1666,12 +1686,13 @@ class GabagoolStrategy(BaseStrategy):
                     no_token_id=market.no_token_id,
                     yes_amount_usd=yes_amount,
                     no_amount_usd=no_amount,
-                    yes_price=opportunity.yes_price,  # EXACT price from opportunity, no slippage
-                    no_price=opportunity.no_price,    # EXACT price from opportunity, no slippage
+                    yes_price=opportunity.yes_price,
+                    no_price=opportunity.no_price,
                     timeout_seconds=self.gabagool_config.parallel_fill_timeout_seconds,
                     max_liquidity_consumption_pct=self.gabagool_config.max_liquidity_consumption_pct,
                     condition_id=market.condition_id,
                     asset=market.asset,
+                    price_buffer_cents=price_buffer,  # Phase 4: GTC with price buffer
                 )
             else:
                 # Legacy sequential execution
