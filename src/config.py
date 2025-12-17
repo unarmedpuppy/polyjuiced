@@ -101,7 +101,7 @@ class GabagoolConfig:
     # Phase 4: Speed optimization (Dec 17, 2025)
     # Skip REST API verification to reduce latency - trust WebSocket prices
     skip_rest_verification: bool = True  # Skip REST API price verification (trust WebSocket)
-    order_price_buffer_cents: float = 2.0  # Add buffer to limit price for better fill rate (+2¢)
+    order_price_buffer_cents: float = 0.0  # NO buffer - use exact prices (buffer destroys arb profit!)
     live_order_wait_seconds: float = 2.0  # Wait time for LIVE orders before cancelling
 
     # Mode
