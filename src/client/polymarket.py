@@ -1281,20 +1281,91 @@ class PolymarketClient:
                     "pre_fill_no_depth": pre_fill_no_depth,
                 }
 
-            # Case 2: One or both didn't fill (went LIVE instead of MATCHED)
-            # Phase 4 Fix (2025-12-14): Proper handling of partial fills
+            # Case 2: One or both didn't fill immediately (went LIVE instead of MATCHED)
+            # Phase 4 Fix (2025-12-17): Wait for LIVE orders to fill before cancelling
             #
             # With GTC orders (we use GTC instead of FOK due to py-clob-client bugs):
             # - MATCHED = filled completely
-            # - LIVE = order sitting on book, not filled yet
+            # - LIVE = order sitting on book, may fill shortly
             #
+            # Strategy: If one order is MATCHED and the other is LIVE, wait up to 2 seconds
+            # for the LIVE order to fill. This handles cases where our order is at a good
+            # price but just needs time to match.
+
+            # First, check if we have a partial situation (one MATCHED, one LIVE)
+            yes_is_live = yes_status == "LIVE"
+            no_is_live = no_status == "LIVE"
+
+            # If either order is LIVE, wait briefly for it to fill
+            if yes_is_live or no_is_live:
+                log.info(
+                    "LIVE order(s) detected, waiting for fill...",
+                    yes_status=yes_status,
+                    no_status=no_status,
+                    wait_seconds=2.0,
+                )
+
+                # Wait and re-check status
+                await asyncio.sleep(2.0)
+
+                # Re-fetch order status
+                try:
+                    if yes_is_live and yes_order_id:
+                        # Check if YES order filled
+                        orders = self._client.get_orders()
+                        for order in orders:
+                            if order.get("id") == yes_order_id:
+                                new_status = order.get("status", "").upper()
+                                if new_status in ("MATCHED", "FILLED"):
+                                    yes_status = new_status
+                                    yes_filled = True
+                                    yes_result["status"] = new_status
+                                    log.info("YES order filled after wait", new_status=new_status)
+                                break
+
+                    if no_is_live and no_order_id:
+                        # Check if NO order filled
+                        orders = self._client.get_orders()
+                        for order in orders:
+                            if order.get("id") == no_order_id:
+                                new_status = order.get("status", "").upper()
+                                if new_status in ("MATCHED", "FILLED"):
+                                    no_status = new_status
+                                    no_filled = True
+                                    no_result["status"] = new_status
+                                    log.info("NO order filled after wait", new_status=new_status)
+                                break
+                except Exception as e:
+                    log.warning("Failed to re-check order status", error=str(e))
+
+                # If both now filled, return success
+                if yes_filled and no_filled:
+                    yes_size_matched = float(yes_result.get("size_matched", 0) or yes_result.get("matched_size", 0) or yes_result.get("_intended_size", 0))
+                    no_size_matched = float(no_result.get("size_matched", 0) or no_result.get("matched_size", 0) or no_result.get("_intended_size", 0))
+                    log.info(
+                        "Both legs filled after wait (parallel)",
+                        yes_size=yes_size_matched,
+                        no_size=no_size_matched,
+                    )
+                    return {
+                        "yes_order": yes_result,
+                        "no_order": no_result,
+                        "success": True,
+                        "partial_fill": False,
+                        "yes_filled_size": yes_size_matched,
+                        "no_filled_size": no_size_matched,
+                        "pre_fill_yes_depth": pre_fill_yes_depth,
+                        "pre_fill_no_depth": pre_fill_no_depth,
+                    }
+
+            # If we get here, one or both orders still didn't fill
             # CRITICAL: We do NOT attempt to "unwind" MATCHED positions because:
             # 1. Selling creates a NEW trade, not an unwind
             # 2. Selling at market creates additional losses (slippage)
             # 3. The strategy records partial fills properly (Phase 2)
             # 4. Better to hold the position than take guaranteed loss
             #
-            # Action: Cancel any LIVE orders and return accurate fill data for strategy.
+            # Action: Cancel any remaining LIVE orders and return accurate fill data.
 
             # Determine what actually filled
             yes_size_matched = float(yes_result.get("size_matched", 0) or yes_result.get("matched_size", 0) or 0)
