@@ -2350,6 +2350,14 @@ async def _on_trade_event(event_type: str, data: Dict[str, Any]) -> None:
             # Phase 2 fields
             "hedge_ratio": data.get("hedge_ratio"),
             "execution_status": data.get("execution_status"),
+            # Shares and order status (needed for dashboard display)
+            "yes_shares": data.get("yes_shares"),
+            "no_shares": data.get("no_shares"),
+            "yes_order_status": data.get("yes_order_status"),
+            "no_order_status": data.get("no_order_status"),
+            # Market reference
+            "condition_id": data.get("condition_id"),
+            "market_slug": data.get("market_slug"),
         }
         trade_history.append(trade)
 

@@ -1792,10 +1792,29 @@ class GabagoolStrategy(BaseStrategy):
 
                     # Phase 2: Record partial fills - these are CRITICAL to track!
                     # Extract what actually filled from the API result
+                    # Use fallbacks since API response field names can vary
                     yes_order = api_result.get("yes_order", {})
                     no_order = api_result.get("no_order", {})
-                    partial_yes = float(yes_order.get("size_matched", 0) or 0)
-                    partial_no = float(no_order.get("size_matched", 0) or 0)
+                    partial_yes = float(
+                        yes_order.get("size_matched", 0) or
+                        yes_order.get("matched_size", 0) or
+                        yes_order.get("original_size", 0) or  # Use original_size if matched
+                        0
+                    )
+                    partial_no = float(
+                        no_order.get("size_matched", 0) or
+                        no_order.get("matched_size", 0) or
+                        no_order.get("original_size", 0) or  # Use original_size if matched
+                        0
+                    )
+
+                    # If order status is MATCHED but size_matched is 0, use intended size
+                    yes_status = yes_order.get("status", "").upper()
+                    no_status = no_order.get("status", "").upper()
+                    if yes_status in ("MATCHED", "FILLED") and partial_yes == 0:
+                        partial_yes = float(yes_order.get("_intended_size", 0) or yes_shares)
+                    if no_status in ("MATCHED", "FILLED") and partial_no == 0:
+                        partial_no = float(no_order.get("_intended_size", 0) or no_shares)
 
                     # Generate a trade_id for this partial fill
                     partial_trade_id = f"partial-{uuid.uuid4().hex[:8]}"
