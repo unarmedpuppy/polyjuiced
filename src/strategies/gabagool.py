@@ -1713,27 +1713,69 @@ class GabagoolStrategy(BaseStrategy):
 
                 # Check for partial fill (critical issue!)
                 if api_result.get("partial_fill"):
-                    # Phase 5: Check if we exited the partial fill
-                    partial_exited = api_result.get("partial_fill_exited", False)
-                    exit_result = api_result.get("exit_result", {})
-                    exit_pnl = exit_result.get("pnl", 0) if exit_result else 0
+                    # Phase 5: Check if we rebalanced the partial fill
+                    partial_rebalanced = api_result.get("partial_fill_rebalanced", False)
+                    rebalance_result = api_result.get("rebalance_result", {})
+                    rebalance_action = api_result.get("rebalance_action", "unknown")
 
-                    if partial_exited:
+                    # Get P&L based on action type
+                    if rebalance_action == "hedge_completed":
+                        rebalance_pnl = rebalance_result.get("expected_profit", 0)
+                    elif rebalance_action == "exited":
+                        rebalance_pnl = rebalance_result.get("pnl", 0)
+                    else:
+                        rebalance_pnl = 0
+
+                    if partial_rebalanced and rebalance_action == "hedge_completed":
+                        # SUCCESS! We completed the hedge after partial fill
+                        add_log(
+                            "info",
+                            f"PARTIAL FILL HEDGE COMPLETED on {market.asset}! Bought missing leg. Expected profit: ${rebalance_pnl:.2f}",
+                            error=error_msg,
+                            rebalance_success=True,
+                        )
+                        add_decision(
+                            asset=market.asset,
+                            action="HEDGE_COMPLETED",
+                            reason=f"PARTIAL FILL - hedge completed (Expected: ${rebalance_pnl:.2f})",
+                            up_price=opportunity.yes_price,
+                            down_price=opportunity.no_price,
+                            spread=opportunity.spread_cents,
+                        )
+                    elif partial_rebalanced and rebalance_action == "exited":
+                        # We couldn't complete hedge, but exited successfully
                         add_log(
                             "warning",
-                            f"PARTIAL FILL EXITED on {market.asset}! Position sold immediately. P&L: ${exit_pnl:.2f}",
+                            f"PARTIAL FILL EXITED on {market.asset}! Could not complete hedge, sold position. P&L: ${rebalance_pnl:.2f}",
                             error=error_msg,
-                            exit_success=exit_result.get("success", False),
+                            rebalance_success=True,
                         )
                         add_decision(
                             asset=market.asset,
                             action="PARTIAL_EXITED",
-                            reason=f"PARTIAL FILL - exited immediately (P&L: ${exit_pnl:.2f})",
+                            reason=f"PARTIAL FILL - exited (P&L: ${rebalance_pnl:.2f})",
+                            up_price=opportunity.yes_price,
+                            down_price=opportunity.no_price,
+                            spread=opportunity.spread_cents,
+                        )
+                    elif partial_rebalanced:
+                        # Rebalance attempted but failed
+                        add_log(
+                            "error",
+                            f"PARTIAL FILL REBALANCE FAILED on {market.asset}! Action: {rebalance_action}. POSITION HELD (RISK!).",
+                            error=error_msg,
+                            rebalance_action=rebalance_action,
+                        )
+                        add_decision(
+                            asset=market.asset,
+                            action="REBALANCE_FAILED",
+                            reason=f"PARTIAL FILL - rebalance failed ({rebalance_action})",
                             up_price=opportunity.yes_price,
                             down_price=opportunity.no_price,
                             spread=opportunity.spread_cents,
                         )
                     else:
+                        # Legacy: no rebalance attempted
                         add_log(
                             "error",
                             f"PARTIAL FILL on {market.asset}! One leg filled, other didn't. POSITION HELD (RISK!).",
@@ -1758,12 +1800,23 @@ class GabagoolStrategy(BaseStrategy):
                     # Generate a trade_id for this partial fill
                     partial_trade_id = f"partial-{uuid.uuid4().hex[:8]}"
 
-                    # Phase 5: Determine execution status based on exit
-                    if partial_exited and exit_result.get("success"):
+                    # Phase 5: Determine execution status based on rebalance result
+                    if rebalance_action == "hedge_completed":
+                        exec_status = "partial_fill_hedged"  # We completed the hedge!
+                        expected_pnl = rebalance_pnl
+                        # Update shares to reflect both legs filled
+                        hedge_shares = rebalance_result.get("hedge_shares", 0)
+                        if partial_yes > 0:
+                            partial_no = hedge_shares  # YES filled first, then we bought NO
+                        else:
+                            partial_yes = hedge_shares  # NO filled first, then we bought YES
+                    elif rebalance_action == "exited":
                         exec_status = "partial_fill_exited"  # We exited successfully
-                        expected_pnl = exit_pnl  # Use actual exit P&L
-                    elif partial_exited:
-                        exec_status = "partial_fill_exit_failed"  # Exit failed, position held
+                        expected_pnl = rebalance_pnl
+                        partial_yes = 0  # No position held
+                        partial_no = 0
+                    elif partial_rebalanced:
+                        exec_status = "partial_fill_rebalance_failed"  # Rebalance failed, position held
                         expected_pnl = 0
                     else:
                         exec_status = "one_leg_only" if (partial_yes == 0 or partial_no == 0) else "partial_fill"
@@ -1775,13 +1828,13 @@ class GabagoolStrategy(BaseStrategy):
                         opportunity=opportunity,
                         yes_amount=partial_yes * opportunity.yes_price if partial_yes > 0 else 0,
                         no_amount=partial_no * opportunity.no_price if partial_no > 0 else 0,
-                        actual_yes_shares=partial_yes if not partial_exited else 0,  # If exited, shares are 0
-                        actual_no_shares=partial_no if not partial_exited else 0,
+                        actual_yes_shares=partial_yes,
+                        actual_no_shares=partial_no,
                         hedge_ratio=min(partial_yes, partial_no) / max(partial_yes, partial_no) if max(partial_yes, partial_no) > 0 else 0,
                         execution_status=exec_status,
                         yes_order_status=yes_order.get("status", "UNKNOWN"),
                         no_order_status=no_order.get("status", "UNKNOWN"),
-                        expected_profit=expected_pnl,  # Phase 5: Use exit P&L if exited
+                        expected_profit=expected_pnl,
                         dry_run=False,
                         # Phase 5: Pre-fill liquidity data
                         pre_fill_yes_depth=api_result.get("pre_fill_yes_depth"),
@@ -1849,19 +1902,39 @@ class GabagoolStrategy(BaseStrategy):
             yes_order = api_result.get("yes_order", {})
             no_order = api_result.get("no_order", {})
 
-            # Get actual filled sizes (may differ from intended due to partial fills)
-            actual_yes_shares = float(
-                yes_order.get("size_matched", 0) or
-                yes_order.get("matched_size", 0) or
-                yes_order.get("size", 0) or
-                yes_shares
-            )
-            actual_no_shares = float(
-                no_order.get("size_matched", 0) or
-                no_order.get("matched_size", 0) or
-                no_order.get("size", 0) or
-                no_shares
-            )
+            # Phase 5: Check if this was a partial fill that we rebalanced
+            rebalance_action = api_result.get("rebalance_action", "")
+            if rebalance_action == "hedge_completed":
+                # This was a partial fill that we successfully hedged
+                # Get the filled shares and hedge shares from rebalance result
+                rebalance_result = api_result.get("rebalance_result", {})
+                filled_shares = rebalance_result.get("filled_shares", 0)
+                hedge_shares = rebalance_result.get("hedge_shares", 0)
+                # Both sides should have equal shares now
+                actual_yes_shares = filled_shares if api_result.get("yes_filled_size", 0) > 0 else hedge_shares
+                actual_no_shares = hedge_shares if api_result.get("yes_filled_size", 0) > 0 else filled_shares
+
+                log.info(
+                    "PARTIAL FILL HEDGED - using rebalance shares for verification",
+                    filled_shares=filled_shares,
+                    hedge_shares=hedge_shares,
+                    actual_yes_shares=actual_yes_shares,
+                    actual_no_shares=actual_no_shares,
+                )
+            else:
+                # Get actual filled sizes (may differ from intended due to partial fills)
+                actual_yes_shares = float(
+                    yes_order.get("size_matched", 0) or
+                    yes_order.get("matched_size", 0) or
+                    yes_order.get("size", 0) or
+                    yes_shares
+                )
+                actual_no_shares = float(
+                    no_order.get("size_matched", 0) or
+                    no_order.get("matched_size", 0) or
+                    no_order.get("size", 0) or
+                    no_shares
+                )
 
             # Calculate actual hedge ratio
             min_shares = min(actual_yes_shares, actual_no_shares)

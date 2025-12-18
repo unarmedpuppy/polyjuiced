@@ -1419,38 +1419,47 @@ class PolymarketClient:
                 filled_shares = yes_size_matched if yes_filled else no_size_matched
                 filled_cost = yes_filled_cost if yes_filled else no_filled_cost
                 filled_token_id = yes_token_id if yes_filled else no_token_id
+                unfilled_token_id = no_token_id if yes_filled else yes_token_id
+                filled_price = yes_price if yes_filled else no_price
+                unfilled_price = no_price if yes_filled else yes_price
 
-                # Phase 5: Exit partial fill immediately to avoid 50/50 gamble
+                # Phase 5: Rebalance partial fill - try to complete hedge, then exit if needed
                 if partial_fill_exit_enabled and filled_shares > 0:
                     log.error(
-                        f"PARTIAL FILL: {filled_leg} filled, {unfilled_leg} did not - EXITING IMMEDIATELY",
+                        f"PARTIAL FILL: {filled_leg} filled, {unfilled_leg} did not - REBALANCING",
                         filled_leg=filled_leg,
                         filled_shares=filled_shares,
                         filled_cost=f"${filled_cost:.2f}",
                         unfilled_status=no_status if yes_filled else yes_status,
-                        exit_strategy="Selling filled position to avoid unhedged exposure",
+                        rebalance_strategy="1) Try to buy missing leg, 2) If fail, sell filled leg",
                     )
 
-                    # Exit the filled position immediately
-                    exit_result = await self.exit_partial_fill_position(
-                        token_id=filled_token_id,
-                        shares=filled_shares,
-                        entry_cost=filled_cost,
+                    # Rebalance: try to complete hedge first, then exit if needed
+                    rebalance_result = await self.rebalance_partial_fill(
+                        filled_token_id=filled_token_id,
+                        unfilled_token_id=unfilled_token_id,
+                        filled_shares=filled_shares,
+                        filled_price=filled_price,
+                        unfilled_price=unfilled_price,
                         max_slippage_cents=partial_fill_max_slippage_cents,
                     )
+
+                    action = rebalance_result.get("action", "unknown")
+                    pnl = rebalance_result.get("pnl", rebalance_result.get("expected_profit", 0))
 
                     return {
                         "yes_order": yes_result,
                         "no_order": no_result,
-                        "success": False,
+                        "success": action == "hedge_completed",  # Success if we completed the hedge!
                         "partial_fill": True,
-                        "partial_fill_exited": True,  # Phase 5: Mark that we exited
-                        "exit_result": exit_result,  # Phase 5: Include exit result
+                        "partial_fill_rebalanced": True,  # Phase 5: Mark that we rebalanced
+                        "rebalance_result": rebalance_result,  # Phase 5: Include rebalance result
+                        "rebalance_action": action,  # hedge_completed, exited, or exit_failed
                         "yes_filled_size": yes_size_matched if yes_filled else 0.0,
                         "no_filled_size": no_size_matched if no_filled else 0.0,
                         "yes_filled_cost": yes_filled_cost,
                         "no_filled_cost": no_filled_cost,
-                        "error": f"PARTIAL FILL EXITED: {filled_leg} filled, sold immediately. P&L: ${exit_result.get('pnl', 0):.2f}",
+                        "error": f"PARTIAL FILL {action.upper()}: {filled_leg} filled. Action: {action}. P&L: ${pnl:.2f}",
                         "pre_fill_yes_depth": pre_fill_yes_depth,
                         "pre_fill_no_depth": pre_fill_no_depth,
                     }
@@ -1461,7 +1470,7 @@ class PolymarketClient:
                         filled_leg=filled_leg,
                         filled_shares=filled_shares,
                         unfilled_status=no_status if yes_filled else yes_status,
-                        note="Exit disabled or no shares - position held until resolution (RISK!).",
+                        note="Rebalance disabled or no shares - position held until resolution (RISK!).",
                     )
 
             return {
@@ -1770,88 +1779,227 @@ class PolymarketClient:
             log.error("Failed to claim position", error=str(e))
             return {"success": False, "proceeds": 0.0, "error": str(e)}
 
-    async def exit_partial_fill_position(
+    async def rebalance_partial_fill(
         self,
-        token_id: str,
-        shares: float,
-        entry_cost: float,
+        filled_token_id: str,
+        unfilled_token_id: str,
+        filled_shares: float,
+        filled_price: float,
+        unfilled_price: float,
         max_slippage_cents: float = 2.0,
         timeout_seconds: float = 10.0,
     ) -> Dict[str, Any]:
-        """Exit a partial fill position immediately at market.
+        """Rebalance a partial fill by completing the hedge or exiting.
 
-        When one leg of an arbitrage fills but the other doesn't, we're left with
-        unhedged directional exposure. This is a 50/50 gamble on market resolution.
-        Better to exit immediately and take a small spread loss than risk 50% loss.
+        When one leg of an arbitrage fills but the other doesn't, we try to:
+        1. FIRST: Buy the missing leg to complete the hedge (capture arb profit)
+        2. FALLBACK: If that fails, sell the filled leg to exit (small spread loss)
 
-        Phase 5 Fix (Dec 17, 2025): Immediate exit on partial fill.
+        Phase 5 Fix (Dec 17, 2025): Rebalance partial fills to avoid unhedged exposure.
 
         Args:
-            token_id: The token ID to sell (the filled side)
-            shares: Number of shares to sell
-            entry_cost: What we paid for these shares (for P&L calculation)
-            max_slippage_cents: Max slippage below best bid to accept (default 2¢)
+            filled_token_id: Token ID that filled (e.g., YES)
+            unfilled_token_id: Token ID that didn't fill (e.g., NO)
+            filled_shares: Number of shares that filled
+            filled_price: Price we paid for filled shares
+            unfilled_price: Original target price for unfilled side
+            max_slippage_cents: Max slippage to accept (default 2¢)
             timeout_seconds: Timeout for order execution
 
         Returns:
-            Dict with 'success', 'exit_proceeds', 'entry_cost', 'pnl', 'error' keys
+            Dict with 'success', 'action', 'shares_bought', 'shares_sold', 'pnl', etc.
         """
         from decimal import Decimal, ROUND_DOWN
 
+        filled_cost = filled_shares * filled_price
+
         log.info(
-            "PARTIAL FILL EXIT: Exiting filled position immediately",
-            token_id=token_id[:20] + "...",
-            shares=shares,
-            entry_cost=f"${entry_cost:.2f}",
-            max_slippage_cents=max_slippage_cents,
+            "PARTIAL FILL REBALANCE: Attempting to complete hedge",
+            filled_token=filled_token_id[:20] + "...",
+            unfilled_token=unfilled_token_id[:20] + "...",
+            filled_shares=filled_shares,
+            filled_price=f"${filled_price:.2f}",
+            filled_cost=f"${filled_cost:.2f}",
         )
 
         try:
-            # Step 1: Get current best bid (what we can sell at)
-            order_book = self.get_order_book(token_id)
-            bids = order_book.get("bids", [])
+            # ============================================================
+            # STEP 1: Try to buy the missing leg to complete the hedge
+            # ============================================================
+            unfilled_book = self.get_order_book(unfilled_token_id)
 
-            if not bids:
+            # Handle both dict and OrderBookSummary object
+            if hasattr(unfilled_book, "asks"):
+                unfilled_asks = unfilled_book.asks or []
+            else:
+                unfilled_asks = unfilled_book.get("asks", [])
+
+            if unfilled_asks:
+                # Get best ask price
+                def get_price(level):
+                    if hasattr(level, "price"):
+                        return float(level.price or 0)
+                    return float(level.get("price", 0))
+
+                def get_size(level):
+                    if hasattr(level, "size"):
+                        return float(level.size or 0)
+                    return float(level.get("size", 0))
+
+                best_ask = get_price(unfilled_asks[0])
+                ask_size = get_size(unfilled_asks[0])
+
+                # Add slippage buffer to improve fill rate
+                slippage = max_slippage_cents / 100.0
+                buy_price = min(best_ask + slippage, 0.99)
+
+                # Check if buying at this price still makes sense for arbitrage
+                # Total cost = filled_price + buy_price should be < 1.00
+                total_cost_if_hedged = filled_price + buy_price
+                potential_profit = 1.0 - total_cost_if_hedged
+
+                log.info(
+                    "Checking if hedge completion is profitable",
+                    best_ask=f"${best_ask:.4f}",
+                    buy_price_with_slippage=f"${buy_price:.4f}",
+                    total_cost_if_hedged=f"${total_cost_if_hedged:.4f}",
+                    potential_profit_per_share=f"${potential_profit:.4f}",
+                    ask_size_available=ask_size,
+                )
+
+                # Only try to complete hedge if it's still profitable (or at least break-even)
+                if potential_profit >= -0.02 and ask_size >= filled_shares * 0.5:  # Allow 2¢ loss, need 50% liquidity
+                    log.info(
+                        "ATTEMPTING HEDGE COMPLETION: Buying missing leg",
+                        shares_to_buy=filled_shares,
+                        buy_price=f"${buy_price:.2f}",
+                    )
+
+                    # Calculate order parameters
+                    shares_d = Decimal(str(filled_shares)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+                    buy_price_d = Decimal(str(buy_price)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+                    order_args = OrderArgs(
+                        token_id=unfilled_token_id,
+                        price=float(buy_price_d),
+                        size=float(shares_d),
+                        side="BUY",
+                    )
+
+                    signed_order = self._client.create_order(order_args)
+                    result = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            lambda: self._client.post_order(signed_order, orderType=OrderType.GTC)
+                        ),
+                        timeout=timeout_seconds,
+                    )
+
+                    status = result.get("status", "").upper()
+
+                    if status in ("MATCHED", "FILLED"):
+                        # SUCCESS! We completed the hedge
+                        buy_cost = float(shares_d * buy_price_d)
+                        total_cost = filled_cost + buy_cost
+                        expected_profit = (float(shares_d) * 1.0) - total_cost  # $1 payout - total cost
+
+                        log.info(
+                            "HEDGE COMPLETED SUCCESSFULLY!",
+                            filled_shares=filled_shares,
+                            filled_cost=f"${filled_cost:.2f}",
+                            hedge_shares=float(shares_d),
+                            hedge_cost=f"${buy_cost:.2f}",
+                            total_cost=f"${total_cost:.2f}",
+                            expected_profit=f"${expected_profit:.2f}",
+                        )
+
+                        return {
+                            "success": True,
+                            "action": "hedge_completed",
+                            "filled_shares": filled_shares,
+                            "hedge_shares": float(shares_d),
+                            "filled_cost": filled_cost,
+                            "hedge_cost": buy_cost,
+                            "total_cost": total_cost,
+                            "expected_profit": expected_profit,
+                            "hedge_order": result,
+                        }
+
+                    elif status == "LIVE":
+                        # Order went live, wait briefly
+                        log.info("Hedge order went LIVE, waiting 2s...")
+                        await asyncio.sleep(2.0)
+
+                        order_id = result.get("id") or result.get("order_id")
+                        if order_id:
+                            try:
+                                self._client.cancel(order_id)
+                                log.info("Cancelled unfilled hedge order")
+                            except Exception:
+                                pass
+
+                        log.warning("Hedge order did not fill, falling back to exit")
+                    else:
+                        log.warning("Hedge order rejected", status=status)
+                else:
+                    log.info(
+                        "Hedge completion not viable",
+                        reason="unprofitable or insufficient liquidity",
+                        potential_profit=f"${potential_profit:.4f}",
+                        ask_size=ask_size,
+                        needed=filled_shares,
+                    )
+            else:
+                log.warning("No asks available on unfilled side - cannot complete hedge")
+
+            # ============================================================
+            # STEP 2: FALLBACK - Sell the filled leg to exit
+            # ============================================================
+            log.info(
+                "FALLBACK: Exiting filled position by selling",
+                shares_to_sell=filled_shares,
+            )
+
+            filled_book = self.get_order_book(filled_token_id)
+
+            # Handle both dict and OrderBookSummary object
+            if hasattr(filled_book, "bids"):
+                filled_bids = filled_book.bids or []
+            else:
+                filled_bids = filled_book.get("bids", [])
+
+            if not filled_bids:
                 log.error("No bids available - cannot exit position")
                 return {
                     "success": False,
-                    "exit_proceeds": 0.0,
-                    "entry_cost": entry_cost,
-                    "pnl": -entry_cost,
-                    "error": "No bids in order book",
+                    "action": "exit_failed",
+                    "error": "No bids in order book for filled side",
+                    "filled_shares": filled_shares,
+                    "filled_cost": filled_cost,
                 }
 
-            best_bid = float(bids[0].get("price", 0))
-            bid_size = float(bids[0].get("size", 0))
+            def get_price(level):
+                if hasattr(level, "price"):
+                    return float(level.price or 0)
+                return float(level.get("price", 0))
 
-            log.info(
-                "Order book for exit",
-                best_bid=f"${best_bid:.4f}",
-                bid_size=bid_size,
-                our_shares=shares,
-            )
-
-            # Step 2: Calculate sell price with slippage tolerance
-            # Sell at best_bid - slippage to ensure fill
+            best_bid = get_price(filled_bids[0])
             slippage = max_slippage_cents / 100.0
-            sell_price_d = Decimal(str(max(best_bid - slippage, 0.01))).quantize(
-                Decimal("0.01"), rounding=ROUND_DOWN
-            )
-
-            # Step 3: Place sell order
-            shares_d = Decimal(str(shares)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-            shares_float = float(shares_d)
+            sell_price = max(best_bid - slippage, 0.01)
 
             log.info(
                 "Placing exit sell order",
-                sell_price=f"${float(sell_price_d):.2f}",
-                shares=shares_float,
+                best_bid=f"${best_bid:.4f}",
+                sell_price=f"${sell_price:.2f}",
+                shares=filled_shares,
             )
 
+            shares_d = Decimal(str(filled_shares)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            sell_price_d = Decimal(str(sell_price)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
             order_args = OrderArgs(
-                token_id=token_id,
+                token_id=filled_token_id,
                 price=float(sell_price_d),
-                size=shares_float,
+                size=float(shares_d),
                 side="SELL",
             )
 
@@ -1865,89 +2013,72 @@ class PolymarketClient:
 
             status = result.get("status", "").upper()
 
-            # Check if order was placed (MATCHED = filled, LIVE = on book)
             if status in ("MATCHED", "FILLED"):
-                # Order filled immediately
                 exit_proceeds = float(shares_d * sell_price_d)
-                pnl = exit_proceeds - entry_cost
+                pnl = exit_proceeds - filled_cost
 
                 log.info(
-                    "PARTIAL FILL EXIT SUCCESS: Position exited",
+                    "EXIT SUCCESSFUL: Position sold",
                     exit_proceeds=f"${exit_proceeds:.2f}",
-                    entry_cost=f"${entry_cost:.2f}",
+                    filled_cost=f"${filled_cost:.2f}",
                     pnl=f"${pnl:.2f}",
-                    status=status,
                 )
 
                 return {
                     "success": True,
+                    "action": "exited",
+                    "filled_shares": filled_shares,
+                    "exit_shares": float(shares_d),
+                    "filled_cost": filled_cost,
                     "exit_proceeds": exit_proceeds,
-                    "entry_cost": entry_cost,
                     "pnl": pnl,
-                    "order": result,
+                    "exit_order": result,
                 }
 
             elif status == "LIVE":
-                # Order is on the book, not filled yet
-                # For safety, we'll wait a bit and then cancel if not filled
-                log.warning(
-                    "Exit order went LIVE (not filled immediately)",
-                    status=status,
-                    will_wait="2 seconds then cancel",
-                )
-
-                # Wait for fill
+                log.warning("Exit order went LIVE, waiting 2s...")
                 await asyncio.sleep(2.0)
 
-                # Check order status
                 order_id = result.get("id") or result.get("order_id")
                 if order_id:
                     try:
-                        # Cancel if still live
                         self._client.cancel(order_id)
-                        log.info("Cancelled unfilled exit order", order_id=order_id[:20] + "...")
-                    except Exception as cancel_err:
-                        log.warning("Could not cancel exit order", error=str(cancel_err))
+                        log.info("Cancelled unfilled exit order")
+                    except Exception:
+                        pass
 
-                # We tried to exit but couldn't - position still held
                 return {
                     "success": False,
-                    "exit_proceeds": 0.0,
-                    "entry_cost": entry_cost,
-                    "pnl": 0.0,
-                    "error": f"Exit order went LIVE, cancelled. Position still held.",
-                    "order": result,
+                    "action": "exit_failed",
+                    "error": "Exit order went LIVE, cancelled. Position still held.",
+                    "filled_shares": filled_shares,
+                    "filled_cost": filled_cost,
                 }
 
             else:
-                log.warning(
-                    "Exit order not filled",
-                    status=status,
-                    result=result,
-                )
                 return {
                     "success": False,
-                    "exit_proceeds": 0.0,
-                    "entry_cost": entry_cost,
-                    "pnl": 0.0,
-                    "error": f"Order status: {status}",
+                    "action": "exit_failed",
+                    "error": f"Exit order status: {status}",
+                    "filled_shares": filled_shares,
+                    "filled_cost": filled_cost,
                 }
 
         except asyncio.TimeoutError:
-            log.error("Exit order timed out")
+            log.error("Rebalance operation timed out")
             return {
                 "success": False,
-                "exit_proceeds": 0.0,
-                "entry_cost": entry_cost,
-                "pnl": 0.0,
-                "error": "timeout",
+                "action": "timeout",
+                "error": "Rebalance timed out",
+                "filled_shares": filled_shares,
+                "filled_cost": filled_cost,
             }
         except Exception as e:
-            log.error("Failed to exit partial fill position", error=str(e))
+            log.error("Failed to rebalance partial fill", error=str(e))
             return {
                 "success": False,
-                "exit_proceeds": 0.0,
-                "entry_cost": entry_cost,
-                "pnl": 0.0,
+                "action": "error",
                 "error": str(e),
+                "filled_shares": filled_shares,
+                "filled_cost": filled_cost,
             }
