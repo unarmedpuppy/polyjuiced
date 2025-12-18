@@ -104,6 +104,12 @@ class GabagoolConfig:
     order_price_buffer_cents: float = 0.0  # NO buffer - use exact prices (buffer destroys arb profit!)
     live_order_wait_seconds: float = 2.0  # Wait time for LIVE orders before cancelling
 
+    # Phase 5: Partial fill exit (Dec 17, 2025)
+    # When one leg fills but the other doesn't, immediately exit the filled position
+    # to avoid unhedged directional exposure (which is a 50/50 gamble on resolution)
+    partial_fill_exit_enabled: bool = True  # Exit partial fills immediately
+    partial_fill_max_slippage_cents: float = 2.0  # Max slippage to accept on exit (will sell at best_bid - this)
+
     # Mode
     dry_run: bool = True  # DRY RUN mode - no real trades until hedge enforcement is implemented
 
@@ -165,6 +171,9 @@ class GabagoolConfig:
             max_liquidity_consumption_pct=float(os.getenv("GABAGOOL_MAX_LIQUIDITY_CONSUMPTION", "0.50")),
             order_fill_check_interval_ms=float(os.getenv("GABAGOOL_FILL_CHECK_INTERVAL_MS", "100.0")),
             parallel_fill_timeout_seconds=float(os.getenv("GABAGOOL_PARALLEL_FILL_TIMEOUT", "5.0")),
+            # Phase 5: Partial fill exit
+            partial_fill_exit_enabled=os.getenv("GABAGOOL_PARTIAL_FILL_EXIT_ENABLED", "true").lower() == "true",
+            partial_fill_max_slippage_cents=float(os.getenv("GABAGOOL_PARTIAL_FILL_MAX_SLIPPAGE", "2.0")),
             dry_run=os.getenv("GABAGOOL_DRY_RUN", "true").lower() == "true",  # Default TRUE until hedge enforcement complete
             # Directional trading
             directional_enabled=os.getenv("GABAGOOL_DIRECTIONAL_ENABLED", "false").lower() == "true",

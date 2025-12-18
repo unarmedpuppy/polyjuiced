@@ -1693,6 +1693,8 @@ class GabagoolStrategy(BaseStrategy):
                     condition_id=market.condition_id,
                     asset=market.asset,
                     price_buffer_cents=price_buffer,  # Phase 4: GTC with price buffer
+                    partial_fill_exit_enabled=self.gabagool_config.partial_fill_exit_enabled,  # Phase 5: Exit partial fills
+                    partial_fill_max_slippage_cents=self.gabagool_config.partial_fill_max_slippage_cents,  # Phase 5
                 )
             else:
                 # Legacy sequential execution
@@ -1711,19 +1713,40 @@ class GabagoolStrategy(BaseStrategy):
 
                 # Check for partial fill (critical issue!)
                 if api_result.get("partial_fill"):
-                    add_log(
-                        "error",
-                        f"PARTIAL FILL on {market.asset}! One leg filled, other didn't.",
-                        error=error_msg,
-                    )
-                    add_decision(
-                        asset=market.asset,
-                        action="PARTIAL",
-                        reason=f"PARTIAL FILL - manual intervention needed!",
-                        up_price=opportunity.yes_price,
-                        down_price=opportunity.no_price,
-                        spread=opportunity.spread_cents,
-                    )
+                    # Phase 5: Check if we exited the partial fill
+                    partial_exited = api_result.get("partial_fill_exited", False)
+                    exit_result = api_result.get("exit_result", {})
+                    exit_pnl = exit_result.get("pnl", 0) if exit_result else 0
+
+                    if partial_exited:
+                        add_log(
+                            "warning",
+                            f"PARTIAL FILL EXITED on {market.asset}! Position sold immediately. P&L: ${exit_pnl:.2f}",
+                            error=error_msg,
+                            exit_success=exit_result.get("success", False),
+                        )
+                        add_decision(
+                            asset=market.asset,
+                            action="PARTIAL_EXITED",
+                            reason=f"PARTIAL FILL - exited immediately (P&L: ${exit_pnl:.2f})",
+                            up_price=opportunity.yes_price,
+                            down_price=opportunity.no_price,
+                            spread=opportunity.spread_cents,
+                        )
+                    else:
+                        add_log(
+                            "error",
+                            f"PARTIAL FILL on {market.asset}! One leg filled, other didn't. POSITION HELD (RISK!).",
+                            error=error_msg,
+                        )
+                        add_decision(
+                            asset=market.asset,
+                            action="PARTIAL",
+                            reason=f"PARTIAL FILL - position held until resolution (RISK!)",
+                            up_price=opportunity.yes_price,
+                            down_price=opportunity.no_price,
+                            spread=opportunity.spread_cents,
+                        )
 
                     # Phase 2: Record partial fills - these are CRITICAL to track!
                     # Extract what actually filled from the API result
@@ -1735,19 +1758,30 @@ class GabagoolStrategy(BaseStrategy):
                     # Generate a trade_id for this partial fill
                     partial_trade_id = f"partial-{uuid.uuid4().hex[:8]}"
 
+                    # Phase 5: Determine execution status based on exit
+                    if partial_exited and exit_result.get("success"):
+                        exec_status = "partial_fill_exited"  # We exited successfully
+                        expected_pnl = exit_pnl  # Use actual exit P&L
+                    elif partial_exited:
+                        exec_status = "partial_fill_exit_failed"  # Exit failed, position held
+                        expected_pnl = 0
+                    else:
+                        exec_status = "one_leg_only" if (partial_yes == 0 or partial_no == 0) else "partial_fill"
+                        expected_pnl = 0
+
                     await self._record_trade(
                         trade_id=partial_trade_id,
                         market=market,
                         opportunity=opportunity,
                         yes_amount=partial_yes * opportunity.yes_price if partial_yes > 0 else 0,
                         no_amount=partial_no * opportunity.no_price if partial_no > 0 else 0,
-                        actual_yes_shares=partial_yes,
-                        actual_no_shares=partial_no,
+                        actual_yes_shares=partial_yes if not partial_exited else 0,  # If exited, shares are 0
+                        actual_no_shares=partial_no if not partial_exited else 0,
                         hedge_ratio=min(partial_yes, partial_no) / max(partial_yes, partial_no) if max(partial_yes, partial_no) > 0 else 0,
-                        execution_status="one_leg_only" if (partial_yes == 0 or partial_no == 0) else "partial_fill",
+                        execution_status=exec_status,
                         yes_order_status=yes_order.get("status", "UNKNOWN"),
                         no_order_status=no_order.get("status", "UNKNOWN"),
-                        expected_profit=0,  # No expected profit on partial fill
+                        expected_profit=expected_pnl,  # Phase 5: Use exit P&L if exited
                         dry_run=False,
                         # Phase 5: Pre-fill liquidity data
                         pre_fill_yes_depth=api_result.get("pre_fill_yes_depth"),

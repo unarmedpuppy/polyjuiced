@@ -938,12 +938,20 @@ class PolymarketClient:
         condition_id: str = "",
         asset: str = "",
         price_buffer_cents: float = 1.0,  # Phase 4: Price buffer for better fills
+        partial_fill_exit_enabled: bool = False,  # Phase 5: Exit partial fills immediately
+        partial_fill_max_slippage_cents: float = 2.0,  # Phase 5: Max slippage on exit
     ) -> Dict[str, Any]:
         """Execute YES and NO orders in PARALLEL for true atomic execution.
 
         Phase 4 (Dec 17, 2025): Added price_buffer_cents parameter.
         Orders are placed at (price + buffer) to improve fill rates while
         maintaining profitability (as long as buffer < spread).
+
+        Phase 5 (Dec 17, 2025): Added partial_fill_exit_enabled parameter.
+        When one leg fills but the other doesn't, we now IMMEDIATELY exit
+        the filled position to avoid unhedged directional exposure. This
+        converts a 50/50 gamble on market resolution into a small, predictable
+        spread loss.
 
         This provides better atomicity because:
         1. Both orders hit the book at nearly the same time
@@ -1404,24 +1412,64 @@ class PolymarketClient:
                 except Exception as e:
                     log.warning("Failed to cancel LIVE NO order", error=str(e))
 
-            # Log partial fill for monitoring (but don't try to unwind!)
+            # Log partial fill for monitoring
             if partial_fill:
                 filled_leg = "YES" if yes_filled else "NO"
                 unfilled_leg = "NO" if yes_filled else "YES"
                 filled_shares = yes_size_matched if yes_filled else no_size_matched
-                log.error(
-                    f"PARTIAL FILL: {filled_leg} filled, {unfilled_leg} did not",
-                    filled_leg=filled_leg,
-                    filled_shares=filled_shares,
-                    unfilled_status=no_status if yes_filled else yes_status,
-                    note="Strategy will record partial fill. Position will be held until resolution.",
-                )
+                filled_cost = yes_filled_cost if yes_filled else no_filled_cost
+                filled_token_id = yes_token_id if yes_filled else no_token_id
+
+                # Phase 5: Exit partial fill immediately to avoid 50/50 gamble
+                if partial_fill_exit_enabled and filled_shares > 0:
+                    log.error(
+                        f"PARTIAL FILL: {filled_leg} filled, {unfilled_leg} did not - EXITING IMMEDIATELY",
+                        filled_leg=filled_leg,
+                        filled_shares=filled_shares,
+                        filled_cost=f"${filled_cost:.2f}",
+                        unfilled_status=no_status if yes_filled else yes_status,
+                        exit_strategy="Selling filled position to avoid unhedged exposure",
+                    )
+
+                    # Exit the filled position immediately
+                    exit_result = await self.exit_partial_fill_position(
+                        token_id=filled_token_id,
+                        shares=filled_shares,
+                        entry_cost=filled_cost,
+                        max_slippage_cents=partial_fill_max_slippage_cents,
+                    )
+
+                    return {
+                        "yes_order": yes_result,
+                        "no_order": no_result,
+                        "success": False,
+                        "partial_fill": True,
+                        "partial_fill_exited": True,  # Phase 5: Mark that we exited
+                        "exit_result": exit_result,  # Phase 5: Include exit result
+                        "yes_filled_size": yes_size_matched if yes_filled else 0.0,
+                        "no_filled_size": no_size_matched if no_filled else 0.0,
+                        "yes_filled_cost": yes_filled_cost,
+                        "no_filled_cost": no_filled_cost,
+                        "error": f"PARTIAL FILL EXITED: {filled_leg} filled, sold immediately. P&L: ${exit_result.get('pnl', 0):.2f}",
+                        "pre_fill_yes_depth": pre_fill_yes_depth,
+                        "pre_fill_no_depth": pre_fill_no_depth,
+                    }
+                else:
+                    # Legacy behavior: Hold position until resolution (50/50 gamble)
+                    log.error(
+                        f"PARTIAL FILL: {filled_leg} filled, {unfilled_leg} did not",
+                        filled_leg=filled_leg,
+                        filled_shares=filled_shares,
+                        unfilled_status=no_status if yes_filled else yes_status,
+                        note="Exit disabled or no shares - position held until resolution (RISK!).",
+                    )
 
             return {
                 "yes_order": yes_result,
                 "no_order": no_result,
                 "success": False,
                 "partial_fill": partial_fill,
+                "partial_fill_exited": False,  # Phase 5: Not exited
                 "yes_filled_size": yes_size_matched if yes_filled else 0.0,
                 "no_filled_size": no_size_matched if no_filled else 0.0,
                 "yes_filled_cost": yes_filled_cost,
@@ -1721,3 +1769,185 @@ class PolymarketClient:
         except Exception as e:
             log.error("Failed to claim position", error=str(e))
             return {"success": False, "proceeds": 0.0, "error": str(e)}
+
+    async def exit_partial_fill_position(
+        self,
+        token_id: str,
+        shares: float,
+        entry_cost: float,
+        max_slippage_cents: float = 2.0,
+        timeout_seconds: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Exit a partial fill position immediately at market.
+
+        When one leg of an arbitrage fills but the other doesn't, we're left with
+        unhedged directional exposure. This is a 50/50 gamble on market resolution.
+        Better to exit immediately and take a small spread loss than risk 50% loss.
+
+        Phase 5 Fix (Dec 17, 2025): Immediate exit on partial fill.
+
+        Args:
+            token_id: The token ID to sell (the filled side)
+            shares: Number of shares to sell
+            entry_cost: What we paid for these shares (for P&L calculation)
+            max_slippage_cents: Max slippage below best bid to accept (default 2¢)
+            timeout_seconds: Timeout for order execution
+
+        Returns:
+            Dict with 'success', 'exit_proceeds', 'entry_cost', 'pnl', 'error' keys
+        """
+        from decimal import Decimal, ROUND_DOWN
+
+        log.info(
+            "PARTIAL FILL EXIT: Exiting filled position immediately",
+            token_id=token_id[:20] + "...",
+            shares=shares,
+            entry_cost=f"${entry_cost:.2f}",
+            max_slippage_cents=max_slippage_cents,
+        )
+
+        try:
+            # Step 1: Get current best bid (what we can sell at)
+            order_book = self.get_order_book(token_id)
+            bids = order_book.get("bids", [])
+
+            if not bids:
+                log.error("No bids available - cannot exit position")
+                return {
+                    "success": False,
+                    "exit_proceeds": 0.0,
+                    "entry_cost": entry_cost,
+                    "pnl": -entry_cost,
+                    "error": "No bids in order book",
+                }
+
+            best_bid = float(bids[0].get("price", 0))
+            bid_size = float(bids[0].get("size", 0))
+
+            log.info(
+                "Order book for exit",
+                best_bid=f"${best_bid:.4f}",
+                bid_size=bid_size,
+                our_shares=shares,
+            )
+
+            # Step 2: Calculate sell price with slippage tolerance
+            # Sell at best_bid - slippage to ensure fill
+            slippage = max_slippage_cents / 100.0
+            sell_price_d = Decimal(str(max(best_bid - slippage, 0.01))).quantize(
+                Decimal("0.01"), rounding=ROUND_DOWN
+            )
+
+            # Step 3: Place sell order
+            shares_d = Decimal(str(shares)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            shares_float = float(shares_d)
+
+            log.info(
+                "Placing exit sell order",
+                sell_price=f"${float(sell_price_d):.2f}",
+                shares=shares_float,
+            )
+
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=float(sell_price_d),
+                size=shares_float,
+                side="SELL",
+            )
+
+            signed_order = self._client.create_order(order_args)
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    lambda: self._client.post_order(signed_order, orderType=OrderType.GTC)
+                ),
+                timeout=timeout_seconds,
+            )
+
+            status = result.get("status", "").upper()
+
+            # Check if order was placed (MATCHED = filled, LIVE = on book)
+            if status in ("MATCHED", "FILLED"):
+                # Order filled immediately
+                exit_proceeds = float(shares_d * sell_price_d)
+                pnl = exit_proceeds - entry_cost
+
+                log.info(
+                    "PARTIAL FILL EXIT SUCCESS: Position exited",
+                    exit_proceeds=f"${exit_proceeds:.2f}",
+                    entry_cost=f"${entry_cost:.2f}",
+                    pnl=f"${pnl:.2f}",
+                    status=status,
+                )
+
+                return {
+                    "success": True,
+                    "exit_proceeds": exit_proceeds,
+                    "entry_cost": entry_cost,
+                    "pnl": pnl,
+                    "order": result,
+                }
+
+            elif status == "LIVE":
+                # Order is on the book, not filled yet
+                # For safety, we'll wait a bit and then cancel if not filled
+                log.warning(
+                    "Exit order went LIVE (not filled immediately)",
+                    status=status,
+                    will_wait="2 seconds then cancel",
+                )
+
+                # Wait for fill
+                await asyncio.sleep(2.0)
+
+                # Check order status
+                order_id = result.get("id") or result.get("order_id")
+                if order_id:
+                    try:
+                        # Cancel if still live
+                        self._client.cancel(order_id)
+                        log.info("Cancelled unfilled exit order", order_id=order_id[:20] + "...")
+                    except Exception as cancel_err:
+                        log.warning("Could not cancel exit order", error=str(cancel_err))
+
+                # We tried to exit but couldn't - position still held
+                return {
+                    "success": False,
+                    "exit_proceeds": 0.0,
+                    "entry_cost": entry_cost,
+                    "pnl": 0.0,
+                    "error": f"Exit order went LIVE, cancelled. Position still held.",
+                    "order": result,
+                }
+
+            else:
+                log.warning(
+                    "Exit order not filled",
+                    status=status,
+                    result=result,
+                )
+                return {
+                    "success": False,
+                    "exit_proceeds": 0.0,
+                    "entry_cost": entry_cost,
+                    "pnl": 0.0,
+                    "error": f"Order status: {status}",
+                }
+
+        except asyncio.TimeoutError:
+            log.error("Exit order timed out")
+            return {
+                "success": False,
+                "exit_proceeds": 0.0,
+                "entry_cost": entry_cost,
+                "pnl": 0.0,
+                "error": "timeout",
+            }
+        except Exception as e:
+            log.error("Failed to exit partial fill position", error=str(e))
+            return {
+                "success": False,
+                "exit_proceeds": 0.0,
+                "entry_cost": entry_cost,
+                "pnl": 0.0,
+                "error": str(e),
+            }
