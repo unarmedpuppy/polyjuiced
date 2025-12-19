@@ -18,7 +18,7 @@ async def main():
     await client.connect()
 
     # Get USDC balance
-    balance = await client.get_usdc_balance()
+    balance = await client.get_balance()
     print(f"\nUSDC Balance: ${balance:.2f}")
 
     # Get open orders
