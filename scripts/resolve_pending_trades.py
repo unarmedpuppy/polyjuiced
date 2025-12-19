@@ -62,7 +62,8 @@ def main():
     if has_value:
         print("\n  Trades with value (showing first 5):")
         for t in has_value[:5]:
-            print(f"    {t['market_id'][:40]}...")
+            market_name = t['market_slug'] or t['condition_id'] or 'unknown'
+            print(f"    {market_name[:50]}...")
             print(f"      YES: {t['yes_shares']} shares @ ${t['yes_cost']}")
             print(f"      NO:  {t['no_shares']} shares @ ${t['no_cost']}")
             print(f"      exec_status: {t['execution_status']}")
@@ -76,8 +77,7 @@ def main():
             if not args.dry_run:
                 cursor.execute("""
                     UPDATE trades
-                    SET status = 'resolved_stale',
-                        notes = 'Resolved by cleanup script - zero value artifact from partial fill bug'
+                    SET status = 'resolved_stale'
                     WHERE status = 'pending'
                     AND (yes_cost IS NULL OR yes_cost = 0)
                     AND (no_cost IS NULL OR no_cost = 0)
@@ -92,8 +92,7 @@ def main():
             if not args.dry_run:
                 cursor.execute("""
                     UPDATE trades
-                    SET status = 'needs_review',
-                        notes = 'Marked for review - has non-zero values'
+                    SET status = 'needs_review'
                     WHERE status = 'pending'
                     AND NOT (
                         (yes_cost IS NULL OR yes_cost = 0)
