@@ -43,19 +43,26 @@ for r in rows:
 
 print()
 
-# Check what statuses count as wins/losses
+# Check what statuses count as wins/losses (using NEW logic)
 cursor.execute('''
     SELECT
-        SUM(CASE WHEN status = 'win' THEN 1 ELSE 0 END) as wins,
-        SUM(CASE WHEN status = 'loss' THEN 1 ELSE 0 END) as losses
+        SUM(CASE
+            WHEN status = 'win' THEN 1
+            WHEN status = 'resolved' AND actual_profit > 0 THEN 1
+            ELSE 0
+        END) as wins,
+        SUM(CASE
+            WHEN status = 'loss' THEN 1
+            WHEN status = 'resolved' AND actual_profit < 0 THEN 1
+            ELSE 0
+        END) as losses
     FROM trades WHERE dry_run = 0
 ''')
 r = cursor.fetchone()
-print(f"Trades with status='win': {r['wins']}")
-print(f"Trades with status='loss': {r['losses']}")
+print(f"Wins (resolved w/ positive profit): {r['wins']}")
+print(f"Losses (resolved w/ negative profit): {r['losses']}")
 
 print()
-print("NOTE: The dashboard counts trades with status='win' or 'loss'")
-print("If trades have other statuses like 'resolved', they won't count as wins/losses")
+print("NOTE: Wins/losses are counted from 'resolved' trades based on actual_profit")
 
 conn.close()
