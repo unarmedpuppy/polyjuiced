@@ -8,11 +8,13 @@ import sys
 sys.path.insert(0, '/app')
 
 from src.client.polymarket import PolymarketClient
+from src.config import PolymarketSettings
 
 
 async def main():
     print("=== POLYMARKET API BALANCE ===")
-    client = PolymarketClient(dry_run=True)  # dry_run doesn't matter for balance check
+    settings = PolymarketSettings()
+    client = PolymarketClient(settings)
     await client.connect()
 
     # Get USDC balance
