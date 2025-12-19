@@ -42,26 +42,31 @@ def main():
 
     # Analyze pending trades
     zero_value = []
-    has_value = []
+    full_fills = []
+    partial_fills = []
 
     for t in pending:
         yes_cost = float(t['yes_cost'] or 0)
         no_cost = float(t['no_cost'] or 0)
         yes_shares = float(t['yes_shares'] or 0)
         no_shares = float(t['no_shares'] or 0)
+        exec_status = t['execution_status'] or ''
 
         if yes_cost == 0 and no_cost == 0 and yes_shares == 0 and no_shares == 0:
             zero_value.append(t)
+        elif exec_status == 'full_fill':
+            full_fills.append(t)
         else:
-            has_value.append(t)
+            partial_fills.append(t)
 
     print(f"\n  Zero-value (bug artifacts): {len(zero_value)}")
-    print(f"  Has value (may need attention): {len(has_value)}")
+    print(f"  Full fills (complete trades): {len(full_fills)}")
+    print(f"  Partial fills (need review): {len(partial_fills)}")
 
     # Show samples
-    if has_value:
-        print("\n  Trades with value (showing first 5):")
-        for t in has_value[:5]:
+    if partial_fills:
+        print("\n  Partial fills (showing first 5):")
+        for t in partial_fills[:5]:
             market_name = t['market_slug'] or t['condition_id'] or 'unknown'
             print(f"    {market_name[:50]}...")
             print(f"      YES: {t['yes_shares']} shares @ ${t['yes_cost']}")
@@ -86,14 +91,27 @@ def main():
                 """)
                 print(f"  Updated {cursor.rowcount} rows")
 
-        # Mark trades with value for manual review
-        if has_value:
-            print(f"\n{action} {len(has_value)} trades with value as 'needs_review'...")
+        # Mark full fill trades as resolved
+        if full_fills:
+            print(f"\n{action} {len(full_fills)} full fill trades as 'resolved'...")
+            if not args.dry_run:
+                cursor.execute("""
+                    UPDATE trades
+                    SET status = 'resolved'
+                    WHERE status = 'pending'
+                    AND execution_status = 'full_fill'
+                """)
+                print(f"  Updated {cursor.rowcount} rows")
+
+        # Mark partial fills for manual review
+        if partial_fills:
+            print(f"\n{action} {len(partial_fills)} partial fill trades as 'needs_review'...")
             if not args.dry_run:
                 cursor.execute("""
                     UPDATE trades
                     SET status = 'needs_review'
                     WHERE status = 'pending'
+                    AND execution_status != 'full_fill'
                     AND NOT (
                         (yes_cost IS NULL OR yes_cost = 0)
                         AND (no_cost IS NULL OR no_cost = 0)
