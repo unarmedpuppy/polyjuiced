@@ -62,16 +62,18 @@ def main():
             print(f"  Updated {cursor.rowcount} rows")
 
             # Also record the cleanup in the ledger
+            today = datetime.utcnow().strftime('%Y-%m-%d')
             for row in unclaimed:
                 cost = float(row['entry_cost'] or 0)
                 cursor.execute("""
-                    INSERT INTO realized_pnl_ledger (trade_id, change, reason, created_at)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO realized_pnl_ledger (trade_id, trade_date, pnl_amount, pnl_type, notes)
+                    VALUES (?, ?, ?, ?, ?)
                 """, (
                     f"cleanup_{row['condition_id'][:16]}",
+                    today,
                     -cost,  # Record as loss
-                    f"Stale position cleanup: {row['side']} {row['shares']} shares (market closed)",
-                    datetime.utcnow().isoformat()
+                    "stale_cleanup",
+                    f"Stale position cleanup: {row['side']} {row['shares']} shares (market closed)"
                 ))
 
             conn.commit()
