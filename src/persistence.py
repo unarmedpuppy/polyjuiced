@@ -1153,13 +1153,25 @@ class Database:
     # ========== Summary Statistics ==========
 
     async def get_all_time_stats(self) -> Dict[str, Any]:
-        """Get all-time trading statistics (excludes dry runs)."""
+        """Get all-time trading statistics (excludes dry runs).
+
+        Wins/losses are counted based on actual_profit, not just status field.
+        A 'resolved' trade with positive profit is a win, negative is a loss.
+        """
         async with self._conn.execute(
             """
             SELECT
                 COUNT(*) as total_trades,
-                SUM(CASE WHEN status = 'win' THEN 1 ELSE 0 END) as wins,
-                SUM(CASE WHEN status = 'loss' THEN 1 ELSE 0 END) as losses,
+                SUM(CASE
+                    WHEN status = 'win' THEN 1
+                    WHEN status = 'resolved' AND actual_profit > 0 THEN 1
+                    ELSE 0
+                END) as wins,
+                SUM(CASE
+                    WHEN status = 'loss' THEN 1
+                    WHEN status = 'resolved' AND actual_profit < 0 THEN 1
+                    ELSE 0
+                END) as losses,
                 SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
                 SUM(CASE WHEN actual_profit IS NOT NULL THEN actual_profit ELSE 0 END) as total_pnl,
                 AVG(CASE WHEN actual_profit IS NOT NULL THEN actual_profit END) as avg_profit,
@@ -1174,15 +1186,27 @@ class Database:
             return dict(row) if row else {}
 
     async def get_today_stats(self) -> Dict[str, Any]:
-        """Get today's trading statistics (excludes dry runs)."""
+        """Get today's trading statistics (excludes dry runs).
+
+        Wins/losses are counted based on actual_profit, not just status field.
+        A 'resolved' trade with positive profit is a win, negative is a loss.
+        """
         today = datetime.utcnow().strftime("%Y-%m-%d")
 
         async with self._conn.execute(
             """
             SELECT
                 COUNT(*) as trades,
-                SUM(CASE WHEN status = 'win' THEN 1 ELSE 0 END) as wins,
-                SUM(CASE WHEN status = 'loss' THEN 1 ELSE 0 END) as losses,
+                SUM(CASE
+                    WHEN status = 'win' THEN 1
+                    WHEN status = 'resolved' AND actual_profit > 0 THEN 1
+                    ELSE 0
+                END) as wins,
+                SUM(CASE
+                    WHEN status = 'loss' THEN 1
+                    WHEN status = 'resolved' AND actual_profit < 0 THEN 1
+                    ELSE 0
+                END) as losses,
                 SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
                 SUM(CASE WHEN actual_profit IS NOT NULL THEN actual_profit ELSE 0 END) as pnl,
                 SUM(yes_cost + no_cost) as exposure
