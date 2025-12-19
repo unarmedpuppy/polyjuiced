@@ -1,95 +1,44 @@
 #!/usr/bin/env python3
-"""Check portfolio from Polymarket data API."""
-import os
-import json
-import urllib.request
+"""Check full portfolio value."""
+import sqlite3
 
-# Get wallet from environment
-wallet = os.getenv("POLYMARKET_PROXY_WALLET")
+conn = sqlite3.connect("/app/data/gabagool.db")
+c = conn.cursor()
 
-if not wallet:
-    # Try .env file
-    try:
-        with open("/app/.env") as f:
-            for line in f:
-                if line.startswith("POLYMARKET_PROXY_WALLET="):
-                    wallet = line.split("=", 1)[1].strip().strip('"').strip("'")
-                    break
-    except:
-        pass
+print("=== SETTLEMENT QUEUE (open positions) ===")
+c.execute("SELECT condition_id, side, shares, entry_price, entry_cost FROM settlement_queue WHERE claimed = 0")
+total_cost = 0
+for r in c.fetchall():
+    cid, side, shares, price, cost = r
+    shares = float(shares or 0)
+    price = float(price or 0)
+    cost = float(cost or 0)
+    print(f"{side}: {shares:.1f} shares @ ${price:.3f} (cost: ${cost:.2f})")
+    total_cost += cost
 
-if not wallet:
-    print("ERROR: POLYMARKET_PROXY_WALLET not set")
-    exit(1)
+print(f"\nTotal position cost: ${total_cost:.2f}")
+print(f"Liquid USDC: ~$1.29")
+print(f"Estimated total: ${total_cost + 1.29:.2f}")
 
-print("=" * 60)
-print("PORTFOLIO CHECK")
-print(f"Wallet: {wallet[:10]}...{wallet[-6:]}")
-print("=" * 60)
+print("\n=== RECENT REAL TRADES (last 10) ===")
+c.execute("""
+    SELECT created_at, market_slug, execution_status, yes_shares, no_shares, yes_cost, no_cost, actual_profit
+    FROM trades
+    WHERE dry_run = 0
+    ORDER BY created_at DESC
+    LIMIT 10
+""")
+for r in c.fetchall():
+    created, market, exec_status, yes_s, no_s, yes_c, no_c, profit = r
+    market = (market or "unknown")[:30]
+    yes_s = float(yes_s or 0)
+    no_s = float(no_s or 0)
+    yes_c = float(yes_c or 0)
+    no_c = float(no_c or 0)
+    total = yes_c + no_c
+    print(f"{created}: {market}...")
+    print(f"  {exec_status}: YES {yes_s:.1f}/${yes_c:.2f}, NO {no_s:.1f}/${no_c:.2f} = ${total:.2f}")
+    if profit is not None:
+        print(f"  Profit: ${profit:.2f}")
 
-# Check positions from data API
-try:
-    url = f"https://data-api.polymarket.com/positions?user={wallet}"
-    req = urllib.request.Request(url)
-    req.add_header("User-Agent", "Mozilla/5.0")
-    with urllib.request.urlopen(req) as resp:
-        positions = json.loads(resp.read())
-
-    print(f"\nOpen Positions: {len(positions)}")
-
-    if positions:
-        total_value = 0.0
-        print("\nPositions:")
-        print("-" * 60)
-
-        for i, pos in enumerate(positions[:20]):
-            outcome = pos.get("outcome", "?")
-            size = float(pos.get("size", 0))
-            avg_price = float(pos.get("avgPrice", 0))
-            market_value = float(pos.get("value", 0)) or (size * avg_price)
-            question = pos.get("title", pos.get("question", "?"))[:50]
-
-            total_value += market_value
-            print(f"{i+1}. {outcome} | {size:.2f} shares @ ${avg_price:.2f} = ${market_value:.2f}")
-            print(f"   {question}")
-
-        if len(positions) > 20:
-            print(f"\n... and {len(positions) - 20} more positions")
-            for pos in positions[20:]:
-                total_value += float(pos.get("value", 0)) or (float(pos.get("size", 0)) * float(pos.get("avgPrice", 0)))
-
-        print("\n" + "=" * 60)
-        print(f"TOTAL POSITION VALUE: ${total_value:.2f}")
-    else:
-        print("\nNo open positions found.")
-
-except Exception as e:
-    print(f"Error fetching positions: {e}")
-    import traceback
-    traceback.print_exc()
-
-# Check recent trades
-print("\n" + "=" * 60)
-print("RECENT TRADES (last 7 days)")
-print("=" * 60)
-
-try:
-    from datetime import datetime, timedelta
-    cutoff = int((datetime.now() - timedelta(days=7)).timestamp())
-    url = f"https://data-api.polymarket.com/trades?user={wallet}&limit=20"
-    req = urllib.request.Request(url)
-    req.add_header("User-Agent", "Mozilla/5.0")
-    with urllib.request.urlopen(req) as resp:
-        trades = json.loads(resp.read())
-
-    print(f"\nRecent trades: {len(trades)}")
-    for t in trades[:10]:
-        side = t.get("side", "?")
-        outcome = t.get("outcome", "?")
-        size = float(t.get("size", 0))
-        price = float(t.get("price", 0))
-        ts = t.get("timestamp")
-        print(f"  {side} {size:.2f} {outcome} @ ${price:.2f} (ts: {ts})")
-
-except Exception as e:
-    print(f"Error fetching trades: {e}")
+conn.close()
