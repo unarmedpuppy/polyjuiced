@@ -1791,49 +1791,75 @@ class GabagoolStrategy(BaseStrategy):
                         )
 
                     # Phase 2: Record partial fills - these are CRITICAL to track!
-                    # Extract what actually filled from the API result
-                    # Use fallbacks since API response field names can vary
-                    yes_order = api_result.get("yes_order", {})
-                    no_order = api_result.get("no_order", {})
-                    partial_yes = float(
-                        yes_order.get("size_matched", 0) or
-                        yes_order.get("matched_size", 0) or
-                        yes_order.get("original_size", 0) or  # Use original_size if matched
-                        0
-                    )
-                    partial_no = float(
-                        no_order.get("size_matched", 0) or
-                        no_order.get("matched_size", 0) or
-                        no_order.get("original_size", 0) or  # Use original_size if matched
-                        0
-                    )
+                    # BUG FIX (Dec 18, 2025): Use top-level fields from api_result, not nested order dicts
+                    # The API returns yes_filled_size/no_filled_size at the top level
+                    yes_order = api_result.get("yes_order") or {}
+                    no_order = api_result.get("no_order") or {}
 
-                    # If order status is MATCHED but size_matched is 0, use intended size
-                    yes_status = yes_order.get("status", "").upper()
-                    no_status = no_order.get("status", "").upper()
+                    # PRIMARY: Use top-level filled_size fields (these are authoritative)
+                    partial_yes = float(api_result.get("yes_filled_size", 0) or 0)
+                    partial_no = float(api_result.get("no_filled_size", 0) or 0)
+
+                    # FALLBACK: If top-level fields are 0, try nested order fields
+                    if partial_yes == 0 and yes_order:
+                        partial_yes = float(
+                            yes_order.get("size_matched", 0) or
+                            yes_order.get("matched_size", 0) or
+                            yes_order.get("_intended_size", 0) or
+                            0
+                        )
+                    if partial_no == 0 and no_order:
+                        partial_no = float(
+                            no_order.get("size_matched", 0) or
+                            no_order.get("matched_size", 0) or
+                            no_order.get("_intended_size", 0) or
+                            0
+                        )
+
+                    # LAST RESORT: If order status is MATCHED but size is still 0, use intended size
+                    yes_status = (yes_order.get("status", "") if yes_order else "").upper()
+                    no_status = (no_order.get("status", "") if no_order else "").upper()
                     if yes_status in ("MATCHED", "FILLED") and partial_yes == 0:
                         partial_yes = float(yes_order.get("_intended_size", 0) or yes_shares)
                     if no_status in ("MATCHED", "FILLED") and partial_no == 0:
                         partial_no = float(no_order.get("_intended_size", 0) or no_shares)
 
+                    # Log what we extracted for debugging
+                    log.info(
+                        "Partial fill data extracted",
+                        partial_yes_shares=partial_yes,
+                        partial_no_shares=partial_no,
+                        yes_status=yes_status,
+                        no_status=no_status,
+                        api_yes_filled_size=api_result.get("yes_filled_size"),
+                        api_no_filled_size=api_result.get("no_filled_size"),
+                    )
+
                     # Generate a trade_id for this partial fill
                     partial_trade_id = f"partial-{uuid.uuid4().hex[:8]}"
+
+                    # BUG FIX: Store ORIGINAL filled amounts before any modifications
+                    # These represent what ACTUALLY filled, regardless of rebalance outcome
+                    original_yes_filled = partial_yes
+                    original_no_filled = partial_no
 
                     # Phase 5: Determine execution status based on rebalance result
                     if rebalance_action == "hedge_completed":
                         exec_status = "partial_fill_hedged"  # We completed the hedge!
                         expected_pnl = rebalance_pnl
-                        # Update shares to reflect both legs filled
-                        hedge_shares = rebalance_result.get("hedge_shares", 0)
-                        if partial_yes > 0:
+                        # Update shares to reflect both legs filled after hedge
+                        hedge_shares = float(rebalance_result.get("hedge_shares", 0) or 0)
+                        if original_yes_filled > 0:
                             partial_no = hedge_shares  # YES filled first, then we bought NO
                         else:
                             partial_yes = hedge_shares  # NO filled first, then we bought YES
                     elif rebalance_action == "exited":
                         exec_status = "partial_fill_exited"  # We exited successfully
                         expected_pnl = rebalance_pnl
-                        partial_yes = 0  # No position held
-                        partial_no = 0
+                        # BUG FIX: Do NOT set to 0! Record what originally filled.
+                        # The exit P&L already accounts for the sale.
+                        # Keep partial_yes/partial_no as the original filled amounts
+                        # so we have a record of what was traded
                     elif partial_rebalanced:
                         exec_status = "partial_fill_rebalance_failed"  # Rebalance failed, position held
                         expected_pnl = 0
