@@ -754,17 +754,19 @@ DASHBOARD_HTML = """
             <!-- Win/Loss Record -->
             <div class="panel">
                 <div class="panel-header">
-                    <span class="panel-title">[ RECORD ]</span>
+                    <span class="panel-title">[ TODAY'S RECORD ]</span>
                 </div>
                 <div class="panel-body">
                     <div class="winloss">
                         <div class="winloss-item">
                             <div id="wins" class="winloss-value wins">0</div>
                             <div class="winloss-label">WINS</div>
+                            <div id="all-time-wins" class="stat-sublabel" style="font-size: 0.7rem; color: var(--dim-green);">(0 all-time)</div>
                         </div>
                         <div class="winloss-item">
                             <div id="losses" class="winloss-value losses">0</div>
                             <div class="winloss-label">LOSSES</div>
+                            <div id="all-time-losses" class="stat-sublabel" style="font-size: 0.7rem; color: var(--dim-green);">(0 all-time)</div>
                         </div>
                         <div class="winloss-item">
                             <div id="pending" class="winloss-value pending">0</div>
@@ -1320,6 +1322,10 @@ DASHBOARD_HTML = """
                 updateText('wins', String(s.wins || 0));
                 updateText('losses', String(s.losses || 0));
                 updateText('pending', String(s.pending || 0));
+
+                // Update all-time stats sublabels
+                updateText('all-time-wins', '(' + (s.all_time_wins || 0) + ' all-time)');
+                updateText('all-time-losses', '(' + (s.all_time_losses || 0) + ' all-time)');
 
                 const wsEl = document.getElementById('ws-status');
                 updateClass(wsEl, 'status-dot ' + (s.websocket === 'CONNECTED' ? '' : 'error'));
@@ -2484,15 +2490,25 @@ async def init_persistence(db: "Database") -> None:
             stats["all_time_trades"] = all_time.get("total_trades") or 0
             stats["all_time_wins"] = all_time.get("wins") or 0
             stats["all_time_losses"] = all_time.get("losses") or 0
-            stats["daily_trades"] = stats["all_time_trades"]
-            stats["wins"] = stats["all_time_wins"]
-            stats["losses"] = stats["all_time_losses"]
             stats["pending"] = all_time.get("pending") or 0
 
-        # Load today's stats for daily exposure tracking
+        # Load today's stats for daily metrics (IMPORTANT: use TODAY's counts, not all-time)
         today_stats = await db.get_today_stats()
         if today_stats:
+            stats["daily_trades"] = today_stats.get("trades") or 0
+            stats["daily_wins"] = today_stats.get("wins") or 0
+            stats["daily_losses"] = today_stats.get("losses") or 0
             stats["daily_exposure"] = today_stats.get("exposure") or 0.0
+        else:
+            stats["daily_trades"] = 0
+            stats["daily_wins"] = 0
+            stats["daily_losses"] = 0
+            stats["daily_exposure"] = 0.0
+
+        # For backward compatibility, also set wins/losses (used by some widgets)
+        # These now correctly show TODAY's values, not all-time
+        stats["wins"] = stats["daily_wins"]
+        stats["losses"] = stats["daily_losses"]
 
         # Phase 8: Load execution metrics for today
         exec_latency_stats = await db.get_execution_latency_stats(lookback_hours=24)
