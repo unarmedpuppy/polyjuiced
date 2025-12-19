@@ -18,11 +18,14 @@ async def main():
     await client.connect()
 
     # Get USDC balance
-    balance = await client.get_balance()
+    balance_info = client.get_balance()
+    balance = float(balance_info.get('balance', 0))
+    allowance = float(balance_info.get('allowance', 0))
     print(f"\nUSDC Balance: ${balance:.2f}")
+    print(f"USDC Allowance: ${allowance:.2f}")
 
     # Get open orders
-    orders = await client.get_open_orders()
+    orders = client.get_open_orders()
     print(f"\nOpen Orders: {len(orders)}")
     for order in orders[:10]:  # Show first 10
         print(f"  {order.get('side', 'N/A')}: {order.get('original_size', 'N/A')} @ ${order.get('price', 'N/A')}")
