@@ -30,7 +30,6 @@ async def main():
     for order in orders[:10]:  # Show first 10
         print(f"  {order.get('side', 'N/A')}: {order.get('original_size', 'N/A')} @ ${order.get('price', 'N/A')}")
 
-    await client.close()
     print("\nDone!")
 
 

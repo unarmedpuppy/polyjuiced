@@ -1,6 +1,23 @@
 #!/usr/bin/env python3
 """Check full portfolio value."""
 import sqlite3
+import sys
+sys.path.insert(0, '/app')
+
+from src.client.polymarket import PolymarketClient
+from src.config import PolymarketSettings
+
+# Get real balance from Polymarket API
+import asyncio
+
+async def get_real_balance():
+    settings = PolymarketSettings()
+    client = PolymarketClient(settings)
+    await client.connect()
+    balance_info = client.get_balance()
+    return float(balance_info.get('balance', 0))
+
+liquid_usdc = asyncio.run(get_real_balance())
 
 conn = sqlite3.connect("/app/data/gabagool.db")
 c = conn.cursor()
@@ -17,8 +34,8 @@ for r in c.fetchall():
     total_cost += cost
 
 print(f"\nTotal position cost: ${total_cost:.2f}")
-print(f"Liquid USDC: ~$1.29")
-print(f"Estimated total: ${total_cost + 1.29:.2f}")
+print(f"Liquid USDC: ${liquid_usdc:.2f}")
+print(f"Estimated total: ${total_cost + liquid_usdc:.2f}")
 
 print("\n=== RECENT REAL TRADES (last 10) ===")
 c.execute("""
