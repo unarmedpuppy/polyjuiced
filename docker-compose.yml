@@ -12,8 +12,8 @@ services:
       # Standard proxy env vars for httpx/requests libraries (required for py-clob-client)
       - HTTP_PROXY=http://media-download-gluetun:8888
       - HTTPS_PROXY=http://media-download-gluetun:8888
-      # Strategy settings - LIVE MODE (re-enabled 2025-12-18 after bug fixes)
-      - GABAGOOL_DRY_RUN=false
+      # Strategy settings - DRY RUN MODE (paused 2025-12-19 due to one-sided position losses)
+      - GABAGOOL_DRY_RUN=true
       - GABAGOOL_MAX_DAILY_LOSS=10.0
       - GABAGOOL_DIRECTIONAL_ENABLED=false
       - GABAGOOL_NEAR_RESOLUTION_ENABLED=false
