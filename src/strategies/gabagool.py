@@ -1706,6 +1706,8 @@ class GabagoolStrategy(BaseStrategy):
                     timeout_seconds=self.gabagool_config.order_timeout_seconds,
                     condition_id=market.condition_id,
                     asset=market.asset,
+                    partial_fill_exit_enabled=self.gabagool_config.partial_fill_exit_enabled,  # Phase 5: Exit partial fills
+                    partial_fill_max_slippage_cents=self.gabagool_config.partial_fill_max_slippage_cents,  # Phase 5
                 )
 
             if not api_result.get("success"):

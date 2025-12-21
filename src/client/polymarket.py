@@ -476,6 +476,8 @@ class PolymarketClient:
         timeout_seconds: float = 2.0,
         condition_id: str = "",
         asset: str = "",
+        partial_fill_exit_enabled: bool = False,  # Phase 5: Exit partial fills immediately
+        partial_fill_max_slippage_cents: float = 2.0,  # Phase 5: Max slippage on exit
     ) -> Dict[str, Any]:
         """Execute YES and NO orders for arbitrage with fill-or-kill semantics.
 
@@ -802,16 +804,9 @@ class PolymarketClient:
             if no_status == "LIVE" or not no_filled:
                 # CRITICAL: YES filled but NO didn't - we have a partial fill!
                 #
-                # Phase 4 Fix (2025-12-14): DO NOT attempt to "unwind"
-                # Unwinding by selling creates a NEW trade and guarantees loss.
-                # Strategy will record the partial fill (Phase 2) and hold position.
-                log.error(
-                    "PARTIAL FILL: YES filled but NO did not",
-                    yes_status=yes_status,
-                    no_status=no_status,
-                    no_result=no_result,
-                    note="Strategy will record partial fill. Position held until resolution.",
-                )
+                # Phase 5: Rebalance partial fill - try to complete hedge, then exit if needed
+                yes_filled = yes_size_matched or float(yes_result.get("_intended_size", 0))
+                yes_filled_cost = yes_filled * yes_price
 
                 # Cancel any LIVE NO order (shouldn't happen with FOK, but defensive)
                 no_order_id = no_result.get("id") or no_result.get("order_id")
@@ -822,23 +817,72 @@ class PolymarketClient:
                     except Exception as cancel_err:
                         log.warning("Failed to cancel LIVE NO order", error=str(cancel_err))
 
-                # Return partial fill data for strategy to record
-                # Note: We do NOT try to unwind - that creates more problems
-                yes_filled = yes_size_matched or float(yes_result.get("_intended_size", 0))
-                return {
-                    "yes_order": yes_result,
-                    "no_order": no_result,
-                    "success": False,
-                    "partial_fill": True,
-                    "yes_filled_size": yes_filled,
-                    "no_filled_size": 0.0,
-                    "yes_filled_cost": yes_filled * yes_price,
-                    "no_filled_cost": 0.0,
-                    "error": f"PARTIAL FILL: YES filled ({yes_status}), NO rejected ({no_status}). Position held.",
-                    # Phase 5: Liquidity data captured before execution
-                    "pre_fill_yes_depth": pre_fill_yes_depth,
-                    "pre_fill_no_depth": pre_fill_no_depth,
-                }
+                # Phase 5: Rebalance partial fill - try to complete hedge, then exit if needed
+                if partial_fill_exit_enabled and yes_filled > 0:
+                    log.error(
+                        "PARTIAL FILL: YES filled, NO did not - REBALANCING",
+                        filled_leg="YES",
+                        filled_shares=yes_filled,
+                        filled_cost=f"${yes_filled_cost:.2f}",
+                        unfilled_status=no_status,
+                        rebalance_strategy="1) Try to buy missing leg, 2) If fail, sell filled leg",
+                    )
+
+                    # Rebalance: try to complete hedge first, then exit if needed
+                    rebalance_result = await self.rebalance_partial_fill(
+                        filled_token_id=yes_token_id,
+                        unfilled_token_id=no_token_id,
+                        filled_shares=yes_filled,
+                        filled_price=yes_price,
+                        unfilled_price=no_price,
+                        max_slippage_cents=partial_fill_max_slippage_cents,
+                    )
+
+                    action = rebalance_result.get("action", "unknown")
+                    pnl = rebalance_result.get("pnl", rebalance_result.get("expected_profit", 0))
+
+                    return {
+                        "yes_order": yes_result,
+                        "no_order": no_result,
+                        "success": action == "hedge_completed",  # Success if we completed the hedge!
+                        "partial_fill": True,
+                        "partial_fill_rebalanced": True,  # Phase 5: Mark that we rebalanced
+                        "rebalance_result": rebalance_result,  # Phase 5: Include rebalance result
+                        "rebalance_action": action,  # hedge_completed, exited, or exit_failed
+                        "yes_filled_size": yes_filled,
+                        "no_filled_size": 0.0,
+                        "yes_filled_cost": yes_filled_cost,
+                        "no_filled_cost": 0.0,
+                        "error": f"PARTIAL FILL {action.upper()}: YES filled. Action: {action}. P&L: ${pnl:.2f}",
+                        # Phase 5: Liquidity data captured before execution
+                        "pre_fill_yes_depth": pre_fill_yes_depth,
+                        "pre_fill_no_depth": pre_fill_no_depth,
+                    }
+                else:
+                    # Legacy behavior: Hold position until resolution (50/50 gamble)
+                    log.error(
+                        "PARTIAL FILL: YES filled but NO did not",
+                        yes_status=yes_status,
+                        no_status=no_status,
+                        no_result=no_result,
+                        note="Rebalance disabled or no shares - position held until resolution (RISK!).",
+                    )
+
+                    # Return partial fill data for strategy to record
+                    return {
+                        "yes_order": yes_result,
+                        "no_order": no_result,
+                        "success": False,
+                        "partial_fill": True,
+                        "yes_filled_size": yes_filled,
+                        "no_filled_size": 0.0,
+                        "yes_filled_cost": yes_filled_cost,
+                        "no_filled_cost": 0.0,
+                        "error": f"PARTIAL FILL: YES filled ({yes_status}), NO rejected ({no_status}). Position held.",
+                        # Phase 5: Liquidity data captured before execution
+                        "pre_fill_yes_depth": pre_fill_yes_depth,
+                        "pre_fill_no_depth": pre_fill_no_depth,
+                    }
 
             # Both legs filled successfully!
             log.info(
