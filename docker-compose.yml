@@ -1,74 +1,9 @@
+# Local development docker-compose
+# For production deployment, see the home-server repo
+
 services:
   polymarket-bot:
     build: .
     container_name: polymarket-bot
-    restart: unless-stopped
-    env_file:
-      - .env
-    environment:
-      - TZ=UTC
-      # Route HTTP traffic through VPN (gluetun proxy in Switzerland)
-      - POLYMARKET_HTTP_PROXY=http://media-download-gluetun:8888
-      # Standard proxy env vars for httpx/requests libraries (required for py-clob-client)
-      - HTTP_PROXY=http://media-download-gluetun:8888
-      - HTTPS_PROXY=http://media-download-gluetun:8888
-      # Strategy settings - DRY RUN MODE (paused 2025-12-19 due to one-sided position losses)
-      - GABAGOOL_DRY_RUN=true
-      - GABAGOOL_MAX_DAILY_LOSS=10.0
-      - GABAGOOL_DIRECTIONAL_ENABLED=false
-      - GABAGOOL_NEAR_RESOLUTION_ENABLED=false
     ports:
-      - "8500:8000"  # Prometheus metrics
-      - "8501:8080"  # Dashboard UI
-    volumes:
-      - polymarket-data:/app/data
-    networks:
-      - my-network
-    labels:
-      # Traefik - Dashboard
-      - "traefik.enable=true"
-      # HTTP to HTTPS redirect
-      - "traefik.http.routers.polymarket-http.rule=Host(`polymarket.server.unarmedpuppy.com`)"
-      - "traefik.http.routers.polymarket-http.entrypoints=web"
-      - "traefik.http.routers.polymarket-http.middlewares=redirect-to-https"
-      # Local network access (no auth) - highest priority
-      - "traefik.http.routers.polymarket-local.rule=Host(`polymarket.server.unarmedpuppy.com`) && ClientIP(`192.168.86.0/24`)"
-      - "traefik.http.routers.polymarket-local.priority=100"
-      - "traefik.http.routers.polymarket-local.entrypoints=websecure"
-      - "traefik.http.routers.polymarket-local.tls.certresolver=myresolver"
-      - "traefik.http.routers.polymarket-local.service=polymarket"
-      # External access (requires auth) - lowest priority
-      - "traefik.http.routers.polymarket.rule=Host(`polymarket.server.unarmedpuppy.com`)"
-      - "traefik.http.routers.polymarket.priority=1"
-      - "traefik.http.routers.polymarket.entrypoints=websecure"
-      - "traefik.http.routers.polymarket.tls.certresolver=myresolver"
-      - "traefik.http.routers.polymarket.tls=true"
-      - "traefik.http.routers.polymarket.middlewares=polymarket-auth"
-      - "traefik.http.routers.polymarket.service=polymarket"
-      # Disable response buffering for SSE (Server-Sent Events)
-      - "traefik.http.services.polymarket.loadbalancer.responseforwarding.flushinterval=100ms"
-      # Service and auth middleware
-      - "traefik.http.services.polymarket.loadbalancer.server.port=8080"
-      - "traefik.http.services.polymarket-metrics.loadbalancer.server.port=8000"
-      - "traefik.http.middlewares.polymarket-auth.basicauth.users=unarmedpuppy:$$apr1$$yE.A6vVX$$p7.fpGKw5Unp0UW6H/2c.0"
-      - "traefik.http.middlewares.polymarket-auth.basicauth.realm=polymarket"
-      # Metrics endpoint (path-based routing) - highest priority for path match
-      - "traefik.http.routers.polymarket-metrics.rule=Host(`polymarket.server.unarmedpuppy.com`) && PathPrefix(`/metrics`)"
-      - "traefik.http.routers.polymarket-metrics.priority=200"
-      - "traefik.http.routers.polymarket-metrics.entrypoints=websecure"
-      - "traefik.http.routers.polymarket-metrics.tls.certresolver=myresolver"
-      - "traefik.http.routers.polymarket-metrics.service=polymarket-metrics"
-      # Homepage integration
-      - "homepage.group=Finance & Trading"
-      - "homepage.name=Polymarket Bot"
-      - "homepage.icon=si-ethereum"
-      - "homepage.href=https://polymarket.server.unarmedpuppy.com/dashboard"
-      - "homepage.description=Gabagool arbitrage strategy dashboard"
-
-volumes:
-  polymarket-data:
-    # Named volume for database persistence (avoids host permission issues)
-
-networks:
-  my-network:
-    external: true
+      - "8080:80"
