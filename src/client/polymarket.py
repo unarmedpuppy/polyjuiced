@@ -10,7 +10,12 @@ from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds, MarketOrderArgs, OrderArgs, OrderType
 from tenacity import retry, stop_after_attempt, wait_exponential
 from web3 import Web3
-from web3.middleware import geth_poa_middleware
+
+# web3.py v7+ renamed geth_poa_middleware to ExtraDataToPOAMiddleware
+try:
+    from web3.middleware import ExtraDataToPOAMiddleware as poa_middleware
+except ImportError:
+    from web3.middleware import geth_poa_middleware as poa_middleware
 
 from ..config import PolymarketSettings
 
@@ -1850,7 +1855,7 @@ class PolymarketClient:
         if self._w3 is None:
             rpc_url = self.settings.polygon_rpc_url
             self._w3 = Web3(Web3.HTTPProvider(rpc_url))
-            self._w3.middleware_onion.inject(geth_poa_middleware, layer=0)
+            self._w3.middleware_onion.inject(poa_middleware, layer=0)
             
             ctf_address = Web3.to_checksum_address(CTF_ADDRESS)
             self._ctf_contract = self._w3.eth.contract(
