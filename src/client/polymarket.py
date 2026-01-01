@@ -9,8 +9,33 @@ import structlog
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds, MarketOrderArgs, OrderArgs, OrderType
 from tenacity import retry, stop_after_attempt, wait_exponential
+from web3 import Web3
+from web3.middleware import geth_poa_middleware
 
 from ..config import PolymarketSettings
+
+# Conditional Tokens Framework contract ABI (redeemPositions function only)
+# See: https://github.com/Polymarket/conditional-token-examples-py
+CTF_REDEEM_ABI = [
+    {
+        "constant": False,
+        "inputs": [
+            {"name": "collateralToken", "type": "address"},
+            {"name": "parentCollectionId", "type": "bytes32"},
+            {"name": "conditionId", "type": "bytes32"},
+            {"name": "indexSets", "type": "uint256[]"},
+        ],
+        "name": "redeemPositions",
+        "outputs": [],
+        "payable": False,
+        "stateMutability": "nonpayable",
+        "type": "function",
+    }
+]
+
+# Polygon mainnet contract addresses
+CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"  # Conditional Tokens Framework
+USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  # USDC on Polygon
 
 if TYPE_CHECKING:
     from ..liquidity.collector import LiquidityCollector
@@ -22,15 +47,12 @@ class PolymarketClient:
     """Wrapper around py-clob-client with async support and error handling."""
 
     def __init__(self, settings: PolymarketSettings):
-        """Initialize the Polymarket client.
-
-        Args:
-            settings: Polymarket configuration settings
-        """
         self.settings = settings
         self._client: Optional[ClobClient] = None
         self._connected = False
         self._liquidity_collector: Optional["LiquidityCollector"] = None
+        self._w3: Optional[Web3] = None
+        self._ctf_contract = None
 
     def set_liquidity_collector(self, collector: "LiquidityCollector") -> None:
         """Set the liquidity collector for fill logging.
@@ -1822,6 +1844,107 @@ class PolymarketClient:
         except Exception as e:
             log.error("Failed to claim position", error=str(e))
             return {"success": False, "proceeds": 0.0, "error": str(e)}
+
+    def _get_web3(self) -> Web3:
+        """Get or create web3 connection for direct contract calls."""
+        if self._w3 is None:
+            rpc_url = self.settings.polygon_rpc_url
+            self._w3 = Web3(Web3.HTTPProvider(rpc_url))
+            self._w3.middleware_onion.inject(geth_poa_middleware, layer=0)
+            
+            ctf_address = Web3.to_checksum_address(CTF_ADDRESS)
+            self._ctf_contract = self._w3.eth.contract(
+                address=ctf_address, 
+                abi=CTF_REDEEM_ABI
+            )
+            log.info("Web3 connection established for redemptions", rpc=rpc_url)
+        return self._w3
+
+    async def redeem_positions_direct(
+        self,
+        condition_id: str,
+        timeout_seconds: float = 60.0,
+    ) -> Dict[str, Any]:
+        """Redeem winning positions directly via CTF smart contract.
+        
+        This calls redeemPositions() on the Conditional Tokens Framework contract
+        to convert winning outcome tokens back to USDC. This is the proper way to
+        claim winnings - much more reliable than trying to sell at 0.99.
+        
+        See: https://github.com/Polymarket/conditional-token-examples-py
+        
+        Args:
+            condition_id: The market's condition ID (bytes32 hex string)
+            timeout_seconds: Timeout for transaction confirmation
+            
+        Returns:
+            Dict with 'success', 'tx_hash', 'error' keys
+        """
+        log.info("Redeeming position via direct contract call", condition_id=condition_id[:20] + "...")
+        
+        try:
+            w3 = self._get_web3()
+            
+            account = w3.eth.account.from_key(self.settings.private_key)
+            usdc_address = Web3.to_checksum_address(USDC_ADDRESS)
+            
+            parent_collection_id = bytes(32)
+            condition_bytes = Web3.to_bytes(hexstr=condition_id)
+            index_sets = [1, 2]
+            
+            nonce = w3.eth.get_transaction_count(account.address)
+            gas_price = w3.eth.gas_price
+            
+            txn = self._ctf_contract.functions.redeemPositions(
+                usdc_address,
+                parent_collection_id,
+                condition_bytes,
+                index_sets,
+            ).build_transaction({
+                'from': account.address,
+                'nonce': nonce,
+                'gas': 300000,
+                'gasPrice': int(gas_price * 1.2),
+            })
+            
+            signed_txn = w3.eth.account.sign_transaction(txn, self.settings.private_key)
+            tx_hash = w3.eth.send_raw_transaction(signed_txn.raw_transaction)
+            tx_hash_hex = tx_hash.hex()
+            
+            log.info("Redemption transaction sent", tx_hash=tx_hash_hex)
+            
+            receipt = await asyncio.wait_for(
+                asyncio.to_thread(
+                    lambda: w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout_seconds)
+                ),
+                timeout=timeout_seconds + 5,
+            )
+            
+            if receipt['status'] == 1:
+                log.info(
+                    "Position redeemed successfully",
+                    tx_hash=tx_hash_hex,
+                    gas_used=receipt['gasUsed'],
+                )
+                return {
+                    "success": True,
+                    "tx_hash": tx_hash_hex,
+                    "gas_used": receipt['gasUsed'],
+                }
+            else:
+                log.error("Redemption transaction failed", tx_hash=tx_hash_hex)
+                return {
+                    "success": False,
+                    "tx_hash": tx_hash_hex,
+                    "error": "Transaction reverted",
+                }
+                
+        except asyncio.TimeoutError:
+            log.error("Redemption transaction timed out")
+            return {"success": False, "tx_hash": None, "error": "timeout"}
+        except Exception as e:
+            log.error("Failed to redeem position", error=str(e))
+            return {"success": False, "tx_hash": None, "error": str(e)}
 
     async def rebalance_partial_fill(
         self,
