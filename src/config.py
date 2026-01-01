@@ -225,6 +225,52 @@ class CopyTradingConfig:
 
 
 @dataclass
+class NearResolutionConfig:
+    """Near-resolution strategy configuration.
+
+    A high-confidence strategy that bets on outcomes in the final minute of a market.
+    When one side has price between min_price and max_price (e.g., 94-97.5 cents),
+    we bet on that side to win at resolution.
+
+    WARNING: This creates one-sided (unhedged) positions. Use with caution.
+    """
+
+    # Strategy enable/disable
+    enabled: bool = False  # Disabled by default - creates unhedged positions
+    markets: List[str] = field(default_factory=lambda: ["BTC", "ETH", "SOL"])
+
+    # Entry thresholds
+    time_threshold_seconds: float = 60.0  # Max seconds remaining (60s = 1 min)
+    min_price: float = 0.94  # Min price to bet (94 cents)
+    max_price: float = 0.975  # Max price to bet (97.5 cents)
+
+    # Position sizing
+    trade_size_usd: float = 10.0  # Fixed trade size for near-resolution
+
+    # Risk limits
+    max_daily_exposure_usd: float = 50.0  # Max daily exposure
+    max_daily_loss_usd: float = 20.0  # Daily loss circuit breaker
+
+    # Mode
+    dry_run: bool = True  # Start in dry run mode
+
+    @classmethod
+    def from_env(cls) -> "NearResolutionConfig":
+        """Load configuration from environment variables."""
+        return cls(
+            enabled=os.getenv("NEAR_RESOLUTION_ENABLED", "false").lower() == "true",
+            markets=os.getenv("NEAR_RESOLUTION_MARKETS", "BTC,ETH,SOL").split(","),
+            time_threshold_seconds=float(os.getenv("NEAR_RESOLUTION_TIME_THRESHOLD", "60.0")),
+            min_price=float(os.getenv("NEAR_RESOLUTION_MIN_PRICE", "0.94")),
+            max_price=float(os.getenv("NEAR_RESOLUTION_MAX_PRICE", "0.975")),
+            trade_size_usd=float(os.getenv("NEAR_RESOLUTION_TRADE_SIZE", "10.0")),
+            max_daily_exposure_usd=float(os.getenv("NEAR_RESOLUTION_MAX_DAILY_EXPOSURE", "50.0")),
+            max_daily_loss_usd=float(os.getenv("NEAR_RESOLUTION_MAX_DAILY_LOSS", "20.0")),
+            dry_run=os.getenv("NEAR_RESOLUTION_DRY_RUN", "true").lower() == "true",
+        )
+
+
+@dataclass
 class VolHappensConfig:
     """Vol Happens strategy configuration.
 
@@ -291,6 +337,7 @@ class AppConfig:
     gabagool: GabagoolConfig
     copy_trading: CopyTradingConfig
     vol_happens: VolHappensConfig
+    near_resolution: NearResolutionConfig
 
     @classmethod
     def load(cls) -> "AppConfig":
@@ -303,6 +350,7 @@ class AppConfig:
             gabagool=GabagoolConfig.from_env(),
             copy_trading=CopyTradingConfig.from_env(),
             vol_happens=VolHappensConfig.from_env(),
+            near_resolution=NearResolutionConfig.from_env(),
         )
 
 

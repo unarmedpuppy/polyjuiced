@@ -23,6 +23,7 @@ from .monitoring.market_finder import MarketFinder
 from .persistence import get_database, close_database, Database
 from .risk import CircuitBreaker, PositionSizer
 from .strategies.gabagool import GabagoolStrategy
+from .strategies.near_resolution import NearResolutionStrategy
 from .strategies.vol_happens import VolHappensStrategy
 
 # Configure stdlib logging level (required for structlog filter_by_level)
@@ -77,6 +78,7 @@ class GabagoolBot:
         self._position_sizer: Optional[PositionSizer] = None
         self._strategy: Optional[GabagoolStrategy] = None
         self._vol_happens_strategy: Optional[VolHappensStrategy] = None
+        self._near_resolution_strategy: Optional[NearResolutionStrategy] = None
         self._metrics_server: Optional[MetricsServer] = None
         self._dashboard: Optional[DashboardServer] = None
         self._db: Optional[Database] = None
@@ -92,11 +94,14 @@ class GabagoolBot:
 
         self._running = True
 
-        # Initialize database for persistence
         self._db = await get_database()
         log.info("Database initialized", path=str(self._db.db_path))
 
-        # Initialize metrics
+        cleanup_stats = await self._db.run_data_retention_cleanup()
+        if sum(cleanup_stats.values()) > 0:
+            log.info("Startup cleanup completed", deleted=cleanup_stats)
+
+        init_metrics(version="0.1.0", dry_run=self.config.gabagool.dry_run)
         init_metrics(version="0.1.0", dry_run=self.config.gabagool.dry_run)
 
         # Start metrics server
@@ -120,6 +125,8 @@ class GabagoolBot:
             gabagool_dry_run=self.config.gabagool.dry_run,
             vol_happens_enabled=self.config.vol_happens.enabled,
             vol_happens_dry_run=self.config.vol_happens.dry_run,
+            near_resolution_enabled=self.config.near_resolution.enabled,
+            near_resolution_dry_run=self.config.near_resolution.dry_run,
         )
         add_log("info", "Dashboard started", url="http://localhost:8080/dashboard")
 
@@ -143,6 +150,12 @@ class GabagoolBot:
                 vol_happens_task = asyncio.create_task(self._vol_happens_strategy.start())
                 add_log("info", "Vol Happens strategy enabled")
 
+            # Start Near Resolution (optional secondary strategy)
+            near_resolution_task = None
+            if self.config.near_resolution.enabled:
+                near_resolution_task = asyncio.create_task(self._near_resolution_strategy.start())
+                add_log("info", "Near Resolution strategy enabled")
+
             # Start connection health monitor
             health_monitor_task = asyncio.create_task(self._connection_health_monitor())
 
@@ -150,6 +163,8 @@ class GabagoolBot:
             tasks = [gabagool_task, health_monitor_task]
             if vol_happens_task:
                 tasks.append(vol_happens_task)
+            if near_resolution_task:
+                tasks.append(near_resolution_task)
             await asyncio.gather(*tasks)
         except Exception as e:
             log.error("Strategy crashed", error=str(e))
@@ -172,6 +187,9 @@ class GabagoolBot:
 
         if self._vol_happens_strategy:
             await self._vol_happens_strategy.stop()
+
+        if self._near_resolution_strategy:
+            await self._near_resolution_strategy.stop()
 
         # Stop liquidity collector
         if self._liquidity_collector:
@@ -273,6 +291,15 @@ class GabagoolBot:
 
         # Create Vol Happens strategy (runs alongside Gabagool)
         self._vol_happens_strategy = VolHappensStrategy(
+            client=self._client,
+            ws_client=self._ws_client,
+            market_finder=self._market_finder,
+            config=self.config,
+            db=self._db,
+        )
+
+        # Create Near Resolution strategy (runs alongside Gabagool)
+        self._near_resolution_strategy = NearResolutionStrategy(
             client=self._client,
             ws_client=self._ws_client,
             market_finder=self._market_finder,

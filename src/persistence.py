@@ -2089,6 +2089,147 @@ class Database:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
 
+    # ========== Data Retention / Cleanup Operations ==========
+
+    async def run_data_retention_cleanup(
+        self,
+        log_retention_days: int = 7,
+        snapshot_retention_days: int = 3,
+        fill_retention_days: int = 30,
+        market_retention_days: int = 30,
+        telemetry_retention_days: int = 14,
+        claimed_position_retention_days: int = 30,
+    ) -> Dict[str, int]:
+        """Run comprehensive data retention cleanup.
+
+        This should be called on bot startup and/or periodically to prevent
+        unbounded database growth. Preserves valuable modeling data (fill_records)
+        while aggressively pruning operational logs and snapshots.
+
+        Retention Defaults:
+        - logs: 7 days (operational, high volume)
+        - liquidity_snapshots: 3 days (high volume, ~2880/day per token)
+        - fill_records: 30 days (valuable for slippage modeling)
+        - markets: 30 days (historical market data)
+        - trade_telemetry: 14 days (execution timing data)
+        - claimed positions: 30 days (settled positions)
+
+        Args:
+            log_retention_days: Days to keep logs (default 7)
+            snapshot_retention_days: Days to keep liquidity snapshots (default 3)
+            fill_retention_days: Days to keep fill records (default 30)
+            market_retention_days: Days to keep expired markets (default 30)
+            telemetry_retention_days: Days to keep trade telemetry (default 14)
+            claimed_position_retention_days: Days to keep claimed positions (default 30)
+
+        Returns:
+            Dict with count of deleted records per category
+        """
+        deleted = {}
+
+        # 1. Cleanup logs (highest volume, shortest retention)
+        deleted["logs"] = await self.cleanup_old_logs(days=log_retention_days)
+
+        # 2. Cleanup liquidity snapshots (very high volume)
+        snapshot_cutoff = (datetime.utcnow() - timedelta(days=snapshot_retention_days)).isoformat()
+        async with self._lock:
+            cursor = await self._conn.execute(
+                "DELETE FROM liquidity_snapshots WHERE timestamp < ?",
+                (snapshot_cutoff,),
+            )
+            deleted["liquidity_snapshots"] = cursor.rowcount
+            await self._conn.commit()
+
+        # 3. Cleanup fill records (moderate volume, valuable for modeling)
+        fill_cutoff = (datetime.utcnow() - timedelta(days=fill_retention_days)).isoformat()
+        async with self._lock:
+            cursor = await self._conn.execute(
+                "DELETE FROM fill_records WHERE timestamp < ?",
+                (fill_cutoff,),
+            )
+            deleted["fill_records"] = cursor.rowcount
+            await self._conn.commit()
+
+        # 4. Cleanup old expired markets (keep active/recent markets)
+        market_cutoff = (datetime.utcnow() - timedelta(days=market_retention_days)).isoformat()
+        async with self._lock:
+            cursor = await self._conn.execute(
+                "DELETE FROM markets WHERE end_time < ? AND was_traded = 0",
+                (market_cutoff,),
+            )
+            deleted["markets"] = cursor.rowcount
+            await self._conn.commit()
+
+        # 5. Cleanup old trade telemetry
+        telemetry_cutoff = (datetime.utcnow() - timedelta(days=telemetry_retention_days)).isoformat()
+        async with self._lock:
+            cursor = await self._conn.execute(
+                "DELETE FROM trade_telemetry WHERE opportunity_detected_at < ?",
+                (telemetry_cutoff,),
+            )
+            deleted["trade_telemetry"] = cursor.rowcount
+            await self._conn.commit()
+
+        # 6. Cleanup old rebalance trades
+        async with self._lock:
+            cursor = await self._conn.execute(
+                "DELETE FROM rebalance_trades WHERE attempted_at < ?",
+                (telemetry_cutoff,),
+            )
+            deleted["rebalance_trades"] = cursor.rowcount
+            await self._conn.commit()
+
+        # 7. Cleanup old claimed positions
+        deleted["claimed_positions"] = await self.cleanup_old_claimed_positions(
+            days=claimed_position_retention_days
+        )
+
+        # Log summary
+        total_deleted = sum(deleted.values())
+        if total_deleted > 0:
+            log.info(
+                "Data retention cleanup completed",
+                total_deleted=total_deleted,
+                breakdown=deleted,
+            )
+        else:
+            log.debug("Data retention cleanup: nothing to delete")
+
+        return deleted
+
+    async def get_database_stats(self) -> Dict[str, Any]:
+        """Get database table sizes and row counts for monitoring.
+
+        Returns:
+            Dict with table names and their row counts
+        """
+        tables = [
+            "trades", "markets", "logs", "daily_stats",
+            "fill_records", "liquidity_snapshots",
+            "trade_telemetry", "rebalance_trades",
+            "settlement_queue", "circuit_breaker_state",
+            "realized_pnl_ledger",
+        ]
+
+        stats = {}
+        for table in tables:
+            try:
+                async with self._conn.execute(
+                    f"SELECT COUNT(*) as count FROM {table}"
+                ) as cursor:
+                    row = await cursor.fetchone()
+                    stats[table] = row["count"] if row else 0
+            except Exception:
+                stats[table] = -1  # Table doesn't exist
+
+        # Get database file size
+        try:
+            stats["db_size_mb"] = round(self.db_path.stat().st_size / (1024 * 1024), 2)
+        except Exception:
+            stats["db_size_mb"] = -1
+
+        return stats
+
 
 # Global database instance
 _db: Optional[Database] = None
