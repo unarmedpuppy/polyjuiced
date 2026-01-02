@@ -388,11 +388,20 @@ class GabagoolBot:
                 # Check WebSocket health
                 if self._ws_client:
                     if not self._ws_client.is_healthy:
+                        # Check if there are active subscriptions
+                        # If no tokens subscribed, WebSocket may be idle legitimately
+                        # (e.g., no markets in near-resolution window)
+                        if not self._ws_client._subscribed_tokens:
+                            # No subscriptions - don't force reconnect for idle connection
+                            update_stats(websocket="IDLE")
+                            continue
+                        
                         seconds_stale = self._ws_client.seconds_since_last_message
                         log.warning(
                             "WebSocket connection unhealthy - forcing reconnect",
                             connected=self._ws_client.is_connected,
                             seconds_since_last_message=f"{seconds_stale:.0f}s",
+                            active_subscriptions=len(self._ws_client._subscribed_tokens),
                         )
                         update_stats(websocket="RECONNECTING")
                         add_log("warning", f"WebSocket stale ({seconds_stale:.0f}s), reconnecting...")
