@@ -1,0 +1,15 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    uses: homelab/workflows/.gitea/workflows/docker-build.yml@main
+    with:
+      image_name: library/polymarket-bot
+      app_path: apps/polymarket-bot
+    secrets: inherit
