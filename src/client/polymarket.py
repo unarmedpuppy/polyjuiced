@@ -7,7 +7,8 @@ from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
 import structlog
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds, MarketOrderArgs, OrderArgs, OrderType
+from py_clob_client.clob_types import ApiCreds, MarketOrderArgs, OrderArgs, OrderType, PostOrdersArgs
+import concurrent.futures
 from tenacity import retry, stop_after_attempt, wait_exponential
 from web3 import Web3
 
@@ -1177,21 +1178,12 @@ class PolymarketClient:
             pre_fill_yes_depth = 0.0
             pre_fill_no_depth = 0.0
 
-        def place_order_sync(token_id: str, amount_usd: float, label: str, limit_price: float, price_buffer_cents: float = 1.0) -> Dict[str, Any]:
-            """Place a single order with aggressive GTC pricing for better fills.
+        def prepare_order_args(token_id: str, amount_usd: float, label: str, limit_price: float, price_buffer_cents: float = 1.0) -> Dict[str, Any]:
+            """Prepare order arguments with price calculations.
 
-            Phase 4 (Dec 17, 2025): Changed from FOK to GTC with price buffer.
-            - FOK was failing too often due to price movements
-            - GTC with +1¢ buffer gives better fill rates while maintaining profitability
-            - Orders that don't fill immediately stay on book briefly
+            Phase 6 (Jan 2, 2026): Separated from signing for parallel execution.
 
-            Polymarket decimal requirements:
-            - maker_amount (USD cost): max 2 decimal places
-            - taker_amount (shares): max 4 decimal places
-            - price: 2 decimal places
-
-            Returns dict with order info, or error info if order fails.
-            NEVER raises - always returns a dict so parallel execution can detect partial fills.
+            Returns dict with order_args, metadata, or error info.
             """
             from decimal import Decimal, ROUND_DOWN
 
@@ -1199,55 +1191,31 @@ class PolymarketClient:
 
             try:
                 # Add price buffer for better fill rates (configurable, default +1¢)
-                # This trades a small amount of profit for much higher fill rate
                 buffered_price = limit_price + (price_buffer_cents / 100.0)
-                # Cap at $0.99 (can't buy for more than $1)
-                buffered_price = min(buffered_price, 0.99)
-
-                # Polymarket API requirements for market BUY orders:
-                # - maker_amount (USD you pay): max 2 decimal places
-                # - taker_amount (shares you receive): max 2 decimal places (py-clob-client limit)
-                # - price: 2 decimal places
-                #
-                # Since shares × price rarely produces clean results (e.g., 25.48 × 0.35 = 8.918),
-                # we work BACKWARDS: round maker_amount first, then calculate shares.
+                buffered_price = min(buffered_price, 0.99)  # Cap at $0.99
 
                 # Ensure price has 2 decimal places
                 price_d = Decimal(str(buffered_price)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
-                # Round USD amount to 2 decimals - this IS our maker_amount (guaranteed clean)
+                # Round USD amount to 2 decimals
                 maker_amount_d = Decimal(str(amount_usd)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
                 # Calculate shares from clean maker_amount
-                # Round to 2 decimals (py-clob-client limit) with ROUND_DOWN
                 shares_d = (maker_amount_d / price_d).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
-                # Recalculate actual maker_amount from rounded shares (this is what API sees)
-                actual_maker = shares_d * price_d
-
-                # If the actual maker has more than 2 decimals, reduce shares until clean
-                # Worst case is ~100 iterations for pathological prices like 0.97
+                # Ensure shares × price produces clean maker_amount
                 for _ in range(200):
                     actual_maker = shares_d * price_d
                     actual_maker_rounded = actual_maker.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
                     if actual_maker == actual_maker_rounded:
-                        break  # Clean!
+                        break
                     shares_d = shares_d - Decimal("0.01")
                     if shares_d <= 0:
-                        shares_d = Decimal("0.01")  # Minimum viable shares
+                        shares_d = Decimal("0.01")
                         break
 
                 final_price = float(price_d)
                 shares = float(shares_d)
-                final_maker_amount = float(actual_maker)
-
-                log.info(
-                    f"Placing {label} GTC order with +{price_buffer_cents:.0f}¢ buffer",
-                    original_price=f"${limit_price:.2f}",
-                    buffered_price=f"${final_price:.2f}",
-                    shares=f"{shares:.2f}",
-                    maker_amount=f"${final_maker_amount:.2f}",
-                )
 
                 order_args = OrderArgs(
                     token_id=token_id,
@@ -1256,60 +1224,115 @@ class PolymarketClient:
                     side="BUY",
                 )
 
-                signed_order = self._client.create_order(order_args)
-                # Phase 4: Use GTC instead of FOK for better fill rates
-                # GTC orders sit on book if not filled immediately, giving more chances to fill
-                # FOK was failing too often due to price movements during execution
-                result = self._client.post_order(signed_order, orderType=OrderType.GTC)
-
-                result["_intended_size"] = shares
-                result["_intended_price"] = final_price
-                result["_original_price"] = limit_price
-                result["_start_time_ms"] = start_time_ms
-                result["_label"] = label
-
-                return result
-
-            except Exception as e:
-                # CRITICAL: Return error dict instead of raising, so parallel execution
-                # can detect partial fills (when one order succeeds and one fails)
-                log.warning(
-                    f"{label} order failed with exception",
-                    error=str(e),
-                    token_id=token_id[:20] + "...",
-                )
                 return {
-                    "status": "EXCEPTION",
-                    "error": str(e),
-                    "_intended_size": locals().get("shares", 0),
-                    "_intended_price": locals().get("final_price", limit_price),
-                    "_start_time_ms": start_time_ms,
-                    "_label": label,
-                    "size_matched": 0,
+                    "success": True,
+                    "order_args": order_args,
+                    "label": label,
+                    "shares": shares,
+                    "final_price": final_price,
+                    "original_price": limit_price,
+                    "start_time_ms": start_time_ms,
+                    "token_id": token_id,
                 }
 
+            except Exception as e:
+                return {
+                    "success": False,
+                    "error": str(e),
+                    "label": label,
+                    "start_time_ms": start_time_ms,
+                }
+
+        def sign_order(order_args: OrderArgs) -> Any:
+            """Sign a single order (CPU-bound, runs in thread)."""
+            return self._client.create_order(order_args)
+
         try:
-            # PARALLEL EXECUTION: Place both orders simultaneously
-            # Phase 4: Pass price_buffer_cents for better fill rates
-            yes_task = asyncio.create_task(
-                asyncio.to_thread(place_order_sync, yes_token_id, yes_amount_usd, "YES", yes_price, price_buffer_cents)
-            )
-            no_task = asyncio.create_task(
-                asyncio.to_thread(place_order_sync, no_token_id, no_amount_usd, "NO", no_price, price_buffer_cents)
+            # Phase 6: OPTIMIZED EXECUTION with parallel signing + batch posting
+            # 1. Prepare order arguments (fast, no crypto)
+            # 2. Sign both orders in parallel (CPU-bound crypto operations)
+            # 3. Submit both orders in single HTTP call (batch API)
+
+            execution_start_ms = int(time.time() * 1000)
+
+            # Step 1: Prepare order arguments
+            yes_prep = prepare_order_args(yes_token_id, yes_amount_usd, "YES", yes_price, price_buffer_cents)
+            no_prep = prepare_order_args(no_token_id, no_amount_usd, "NO", no_price, price_buffer_cents)
+
+            if not yes_prep["success"] or not no_prep["success"]:
+                error = yes_prep.get("error") or no_prep.get("error") or "Order preparation failed"
+                log.error("Order preparation failed", error=error)
+                return {
+                    "yes_order": None,
+                    "no_order": None,
+                    "success": False,
+                    "partial_fill": False,
+                    "error": f"Order preparation failed: {error}",
+                    "pre_fill_yes_depth": pre_fill_yes_depth,
+                    "pre_fill_no_depth": pre_fill_no_depth,
+                }
+
+            log.info(
+                "Prepared dual-leg orders, signing in parallel",
+                yes_shares=f"{yes_prep['shares']:.2f}",
+                yes_price=f"${yes_prep['final_price']:.2f}",
+                no_shares=f"{no_prep['shares']:.2f}",
+                no_price=f"${no_prep['final_price']:.2f}",
             )
 
-            # Wait for both with timeout
+            # Step 2: Sign both orders in PARALLEL using ThreadPoolExecutor
+            # This overlaps the CPU-bound cryptographic signing operations
+            sign_start_ms = int(time.time() * 1000)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                yes_sign_future = executor.submit(sign_order, yes_prep["order_args"])
+                no_sign_future = executor.submit(sign_order, no_prep["order_args"])
+
+                try:
+                    signed_yes = yes_sign_future.result(timeout=2.0)
+                    signed_no = no_sign_future.result(timeout=2.0)
+                except concurrent.futures.TimeoutError:
+                    log.error("Order signing timed out")
+                    return {
+                        "yes_order": None,
+                        "no_order": None,
+                        "success": False,
+                        "partial_fill": False,
+                        "error": "Order signing timed out",
+                        "pre_fill_yes_depth": pre_fill_yes_depth,
+                        "pre_fill_no_depth": pre_fill_no_depth,
+                    }
+                except Exception as e:
+                    log.error("Order signing failed", error=str(e))
+                    return {
+                        "yes_order": None,
+                        "no_order": None,
+                        "success": False,
+                        "partial_fill": False,
+                        "error": f"Order signing failed: {str(e)}",
+                        "pre_fill_yes_depth": pre_fill_yes_depth,
+                        "pre_fill_no_depth": pre_fill_no_depth,
+                    }
+
+            sign_duration_ms = int(time.time() * 1000) - sign_start_ms
+            log.info(f"Parallel signing completed in {sign_duration_ms}ms")
+
+            # Step 3: Submit BOTH orders in a SINGLE HTTP call using batch API
+            # This eliminates one round-trip latency (~100-250ms savings)
+            post_start_ms = int(time.time() * 1000)
+
             try:
-                yes_result, no_result = await asyncio.wait_for(
-                    asyncio.gather(yes_task, no_task),
+                batch_result = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self._client.post_orders,
+                        [
+                            PostOrdersArgs(order=signed_yes, orderType=OrderType.GTC),
+                            PostOrdersArgs(order=signed_no, orderType=OrderType.GTC),
+                        ]
+                    ),
                     timeout=timeout_seconds,
                 )
             except asyncio.TimeoutError:
-                log.error("Parallel order placement timed out")
-                # Cancel any pending tasks
-                yes_task.cancel()
-                no_task.cancel()
-                # Try to cancel any orders that might have been placed
+                log.error("Batch order posting timed out")
                 try:
                     self.cancel_all_orders()
                 except Exception:
@@ -1319,8 +1342,61 @@ class PolymarketClient:
                     "no_order": None,
                     "success": False,
                     "partial_fill": False,
-                    "error": "Parallel order placement timed out",
+                    "error": "Batch order posting timed out",
+                    "pre_fill_yes_depth": pre_fill_yes_depth,
+                    "pre_fill_no_depth": pre_fill_no_depth,
                 }
+
+            post_duration_ms = int(time.time() * 1000) - post_start_ms
+            total_execution_ms = int(time.time() * 1000) - execution_start_ms
+
+            log.info(
+                "Batch order execution completed",
+                sign_ms=sign_duration_ms,
+                post_ms=post_duration_ms,
+                total_ms=total_execution_ms,
+            )
+
+            # Parse batch result - it returns a list of order results
+            # Handle both list response and dict response formats
+            if isinstance(batch_result, list):
+                if len(batch_result) >= 2:
+                    yes_result = batch_result[0]
+                    no_result = batch_result[1]
+                elif len(batch_result) == 1:
+                    # Only one order returned - partial success
+                    yes_result = batch_result[0]
+                    no_result = {"status": "MISSING", "error": "Order not returned in batch"}
+                else:
+                    yes_result = {"status": "EMPTY", "error": "Empty batch response"}
+                    no_result = {"status": "EMPTY", "error": "Empty batch response"}
+            elif isinstance(batch_result, dict):
+                # Single dict response - might be an error or single order
+                if "error" in batch_result:
+                    yes_result = batch_result
+                    no_result = batch_result
+                else:
+                    # Assume it's a single order result
+                    yes_result = batch_result
+                    no_result = {"status": "MISSING", "error": "Only one order in response"}
+            else:
+                yes_result = {"status": "UNKNOWN", "error": f"Unexpected response type: {type(batch_result)}"}
+                no_result = {"status": "UNKNOWN", "error": f"Unexpected response type: {type(batch_result)}"}
+
+            # Add metadata to results
+            yes_result["_intended_size"] = yes_prep["shares"]
+            yes_result["_intended_price"] = yes_prep["final_price"]
+            yes_result["_original_price"] = yes_prep["original_price"]
+            yes_result["_start_time_ms"] = yes_prep["start_time_ms"]
+            yes_result["_label"] = "YES"
+            yes_result["_execution_ms"] = total_execution_ms
+
+            no_result["_intended_size"] = no_prep["shares"]
+            no_result["_intended_price"] = no_prep["final_price"]
+            no_result["_original_price"] = no_prep["original_price"]
+            no_result["_start_time_ms"] = no_prep["start_time_ms"]
+            no_result["_label"] = "NO"
+            no_result["_execution_ms"] = total_execution_ms
 
             # Check fill status for both orders
             yes_status = yes_result.get("status", "").upper()

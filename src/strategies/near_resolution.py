@@ -25,7 +25,7 @@ from ..config import AppConfig, NearResolutionConfig
 from ..persistence import Database
 from ..monitoring.market_finder import Market15Min, MarketFinder
 from ..monitoring.order_book import MarketState, MultiMarketTracker
-from ..dashboard import add_log, add_trade, add_decision, update_stats
+from ..dashboard import add_log, add_trade, add_decision, update_stats, update_markets
 from .base import BaseStrategy
 
 if TYPE_CHECKING:
@@ -203,11 +203,64 @@ class NearResolutionStrategy(BaseStrategy):
             if all_tokens:
                 await self.ws.subscribe(all_tokens)
 
+        # Update dashboard with market data
+        self._update_dashboard_markets()
+
+    def _update_dashboard_markets(self) -> None:
+        """Update dashboard with current market data."""
+        try:
+            if not self._active_markets:
+                log.debug("No active markets for dashboard update")
+                update_stats(active_markets=0)
+                update_markets({})
+                return
+
+            # Build market data dict for dashboard
+            markets_data = {}
+            for condition_id, market in self._active_markets.items():
+                # Get current prices from tracker if available
+                up_price = None
+                down_price = None
+                if self._tracker:
+                    market_state = self._tracker.get_market_state(condition_id)
+                    if market_state and not market_state.is_stale:
+                        up_price = market_state.yes_price
+                        down_price = market_state.no_price
+
+                markets_data[condition_id] = {
+                    "asset": market.asset,
+                    "end_time": market.end_time.strftime("%H:%M UTC") if market.end_time else "N/A",
+                    "end_time_utc": market.end_time.isoformat() if market.end_time else None,
+                    "seconds_remaining": market.seconds_remaining,
+                    "up_price": up_price,
+                    "down_price": down_price,
+                    "is_tradeable": market.is_tradeable,
+                    "question": market.question[:60] + "..." if len(market.question) > 60 else market.question,
+                    "slug": market.slug,
+                }
+
+            log.info(
+                "Updating dashboard with near-resolution markets",
+                market_count=len(markets_data),
+            )
+            update_stats(active_markets=len(self._active_markets))
+            update_markets(markets_data)
+        except Exception as e:
+            log.error("Failed to update dashboard markets", error=str(e))
+
     async def _monitor_loop(self) -> None:
+        update_counter = 0
         while self._running:
             try:
                 self._check_daily_reset()
                 await self._check_opportunities()
+                
+                # Update dashboard every 2 seconds (every 4 iterations)
+                update_counter += 1
+                if update_counter >= 4:
+                    self._update_dashboard_markets()
+                    update_counter = 0
+                
                 await asyncio.sleep(0.5)
             except asyncio.CancelledError:
                 break
