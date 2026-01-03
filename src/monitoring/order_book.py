@@ -174,9 +174,8 @@ class OrderBookTracker:
         self._token_side[market.yes_token_id] = "yes"
         self._token_side[market.no_token_id] = "no"
 
-        # Register handler and subscribe
+        # Register handler (subscription is handled separately to allow batching)
         self.ws.on_book_update(self._handle_book_update)
-        await self.ws.subscribe([market.yes_token_id, market.no_token_id])
 
         log.info(
             "Tracking market",

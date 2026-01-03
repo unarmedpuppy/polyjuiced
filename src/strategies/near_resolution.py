@@ -191,8 +191,17 @@ class NearResolutionStrategy(BaseStrategy):
                 min_spread_cents=2.0,
             )
 
+            # Collect all tokens first to batch the subscription
+            # (Polymarket WebSocket only accepts ONE subscription message)
+            all_tokens = []
             for market in filtered_markets:
+                all_tokens.extend([market.yes_token_id, market.no_token_id])
+                # Add market to tracker (no longer subscribes individually)
                 await self._tracker.add_market(market)
+            
+            # Subscribe to all tokens in a single message
+            if all_tokens:
+                await self.ws.subscribe(all_tokens)
 
     async def _monitor_loop(self) -> None:
         while self._running:
