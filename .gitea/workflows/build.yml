@@ -8,7 +8,7 @@ on:
 
 jobs:
   build:
-    uses: homelab/workflows/.gitea/workflows/docker-build.yml@main
+    uses: unarmedpuppy/workflows/.gitea/workflows/docker-build.yml@main
     with:
       image_name: library/polymarket-bot
       app_path: apps/polymarket-bot
