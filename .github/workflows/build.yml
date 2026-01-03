@@ -12,8 +12,8 @@ on:
         default: 'latest'
 
 env:
-  REGISTRY: registry.server.unarmedpuppy.com
-  IMAGE_NAME: polymarket-bot
+  REGISTRY: harbor.server.unarmedpuppy.com
+  IMAGE_NAME: library/polyjuiced
 
 jobs:
   build:
