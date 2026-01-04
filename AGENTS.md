@@ -50,10 +50,14 @@ polymarket-bot/
 │   ├── persistence.py       # Trade & settlement DB
 │   ├── events.py            # Event system
 │   └── metrics.py           # Prometheus metrics
-├── scripts/                 # Utility scripts
-├── tests/                   # Test suite
+├── scripts/                 # Utility scripts (diagnostics, reconciliation, testing)
+├── tests/                   # Test suite (pytest-asyncio)
 ├── docs/
-│   └── STRATEGY_ARCHITECTURE.md  # Detailed implementation docs
+│   ├── STRATEGY_ARCHITECTURE.md  # Core strategy implementation
+│   ├── REBALANCING_STRATEGY.md   # Position rebalancing logic
+│   ├── LIQUIDITY_SIZING.md       # Liquidity-aware sizing
+│   ├── strategy-rules.md         # Trading rules reference
+│   └── *.md                      # Post-mortems, trade analysis, implementation plans
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -164,6 +168,20 @@ pytest tests/strategies/test_gabagool.py -v
 # With coverage
 pytest tests/ --cov=src --cov-report=html
 ```
+
+## Definition of Done
+
+A task is complete when:
+- [ ] All tests pass (`pytest tests/ -v`)
+- [ ] No new type errors (existing codebase uses runtime validation via Pydantic)
+- [ ] Changes tested with `DRY_RUN=true` before any live testing
+- [ ] If touching risk/order logic: manual review of edge cases
+- [ ] If adding new config: `.env.template` updated
+
+For strategy changes specifically:
+- [ ] Backtested or paper-traded before live deployment
+- [ ] Circuit breaker behavior verified
+- [ ] Position sizing limits respected
 
 ## Boundaries
 
