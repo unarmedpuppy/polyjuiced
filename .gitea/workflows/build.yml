@@ -10,6 +10,6 @@ jobs:
   build:
     uses: unarmedpuppy/workflows/.gitea/workflows/docker-build.yml@main
     with:
-      image_name: library/polymarket-bot
-      app_path: apps/polymarket-bot
+      image_name: library/polyjuiced
+      app_path: apps/polyjuiced
     secrets: inherit
