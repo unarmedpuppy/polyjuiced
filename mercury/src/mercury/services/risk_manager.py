@@ -719,6 +719,34 @@ class RiskManager(BaseComponent):
         except Exception as e:
             self._log.error("failed_to_publish_daily_stats_event", error=str(e))
 
+    async def _publish_exposure_update_event(self, fill: Fill, is_hedged: bool) -> None:
+        """Publish risk.exposure.updated event after a fill is processed.
+
+        Args:
+            fill: The fill that triggered the update.
+            is_hedged: Whether this was a hedged (arbitrage) trade.
+        """
+        try:
+            await self._event_bus.publish(
+                "risk.exposure.updated",
+                {
+                    "event_type": "fill",
+                    "fill_id": fill.fill_id,
+                    "order_id": fill.order_id,
+                    "market_id": fill.market_id,
+                    "fill_cost": str(fill.cost),
+                    "is_hedged": is_hedged,
+                    "current_exposure": str(self._current_exposure),
+                    "unhedged_exposure": str(self._unhedged_exposure),
+                    "market_exposure": str(self._market_exposures.get(fill.market_id, Decimal("0"))),
+                    "daily_volume": str(self._daily_volume),
+                    "daily_trades": self._daily_trades,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+        except Exception as e:
+            self._log.error("failed_to_publish_exposure_event", error=str(e))
+
     async def _daily_reset_scheduler(self) -> None:
         """Background task that schedules daily resets at configured time.
 
@@ -877,6 +905,11 @@ class RiskManager(BaseComponent):
         return self._current_exposure
 
     @property
+    def unhedged_exposure(self) -> Decimal:
+        """Get current unhedged (directional) exposure."""
+        return self._unhedged_exposure
+
+    @property
     def daily_pnl(self) -> Decimal:
         """Get current daily P&L."""
         return self._daily_pnl
@@ -956,31 +989,160 @@ class RiskManager(BaseComponent):
             self._log.error("signal_processing_error", error=str(e), data=data)
 
     async def _on_order_filled(self, data: dict) -> None:
-        """Handle order filled event from event bus."""
+        """Handle order filled event from event bus.
+
+        Updates:
+        - Daily trade count, volume, and exposure via record_fill()
+        - Unhedged exposure based on signal type (arbitrage vs directional)
+        - Per-market exposure tracking
+        - Publishes risk.exposure.updated event
+
+        Expected event data:
+        - fill_id: Optional fill identifier
+        - order_id: Order identifier
+        - market_id: Market identifier
+        - token_id: Token identifier
+        - side: BUY or SELL
+        - outcome: YES or NO
+        - size: Fill size in shares
+        - price: Fill price
+        - fee: Optional fee amount
+        - signal_type: Optional - ARBITRAGE means hedged, else unhedged
+        - cost: Optional - pre-computed cost, else computed from size * price + fee
+        """
         try:
-            from mercury.domain.order import Fill, OrderSide
             import uuid
 
+            # Build fill from event data
             fill = Fill(
                 fill_id=data.get("fill_id", str(uuid.uuid4())),
                 order_id=data.get("order_id", ""),
                 market_id=data.get("market_id", ""),
                 token_id=data.get("token_id", ""),
-                side=OrderSide(data.get("side", "BUY")),
+                side=data.get("side", "BUY"),
                 outcome=data.get("outcome", "YES"),
                 size=Decimal(str(data.get("size", 0))),
                 price=Decimal(str(data.get("price", 0))),
                 fee=Decimal(str(data.get("fee", 0))),
+                cost=Decimal(str(data["cost"])) if "cost" in data else None,
             )
 
+            # Record the fill (updates daily stats and per-market exposure)
             self.record_fill(fill)
+
+            # Update unhedged exposure based on signal type
+            # Arbitrage trades are hedged (both YES and NO), so no unhedged exposure change
+            # Directional trades add to unhedged exposure
+            signal_type = data.get("signal_type", "").upper()
+            is_hedged = signal_type == "ARBITRAGE"
+
+            if not is_hedged:
+                # Directional trade - add to unhedged exposure
+                self._unhedged_exposure += fill.cost
+                self._log.debug(
+                    "unhedged_exposure_updated",
+                    market_id=fill.market_id,
+                    fill_cost=str(fill.cost),
+                    unhedged_exposure=str(self._unhedged_exposure),
+                    is_buy=data.get("side", "BUY").upper() == "BUY",
+                )
+
+            # Publish exposure update event for observability
+            await self._publish_exposure_update_event(fill, is_hedged=is_hedged)
+
         except Exception as e:
             self._log.error("fill_processing_error", error=str(e), data=data)
 
     async def _on_position_closed(self, data: dict) -> None:
-        """Handle position closed event from event bus."""
+        """Handle position closed event from event bus.
+
+        Updates:
+        - Realized P&L via record_pnl()
+        - Reduces current exposure by position cost basis
+        - Reduces per-market exposure
+        - Reduces unhedged exposure for non-arbitrage positions
+        - Publishes risk.exposure.updated event
+
+        Expected event data:
+        - market_id: Market identifier
+        - position_id: Position identifier
+        - realized_pnl: P&L from closing the position
+        - cost_basis: Optional - original cost of the position
+        - is_hedged: Optional - whether this was an arbitrage (hedged) position
+        - size: Optional - position size that was closed
+        - entry_price: Optional - entry price (to compute cost_basis if not provided)
+        """
         try:
+            market_id = data.get("market_id", "")
+            position_id = data.get("position_id", "")
+
+            # Record the realized P&L
             pnl = Decimal(str(data.get("realized_pnl", 0)))
             self.record_pnl(pnl)
+
+            # Calculate cost basis for exposure reduction
+            # Try cost_basis directly, or compute from size * entry_price
+            if "cost_basis" in data:
+                cost_basis = Decimal(str(data["cost_basis"]))
+            elif "size" in data and "entry_price" in data:
+                size = Decimal(str(data["size"]))
+                entry_price = Decimal(str(data["entry_price"]))
+                cost_basis = size * entry_price
+            else:
+                # Cannot determine cost basis - skip exposure update
+                self._log.warning(
+                    "position_closed_missing_cost_basis",
+                    position_id=position_id,
+                    market_id=market_id,
+                )
+                return
+
+            # Reduce current total exposure
+            self._current_exposure = max(Decimal("0"), self._current_exposure - cost_basis)
+
+            # Reduce per-market exposure
+            if market_id and market_id in self._market_exposures:
+                current_market_exposure = self._market_exposures[market_id]
+                new_market_exposure = max(Decimal("0"), current_market_exposure - cost_basis)
+                if new_market_exposure == Decimal("0"):
+                    del self._market_exposures[market_id]
+                else:
+                    self._market_exposures[market_id] = new_market_exposure
+
+            # Reduce unhedged exposure for non-arbitrage positions
+            is_hedged = data.get("is_hedged", False)
+            if not is_hedged:
+                self._unhedged_exposure = max(Decimal("0"), self._unhedged_exposure - cost_basis)
+
+            self._log.info(
+                "position_closed_exposure_updated",
+                position_id=position_id,
+                market_id=market_id,
+                realized_pnl=str(pnl),
+                cost_basis=str(cost_basis),
+                is_hedged=is_hedged,
+                current_exposure=str(self._current_exposure),
+                unhedged_exposure=str(self._unhedged_exposure),
+            )
+
+            # Publish exposure update event
+            await self._event_bus.publish(
+                "risk.exposure.updated",
+                {
+                    "event_type": "position_closed",
+                    "position_id": position_id,
+                    "market_id": market_id,
+                    "cost_basis_removed": str(cost_basis),
+                    "realized_pnl": str(pnl),
+                    "current_exposure": str(self._current_exposure),
+                    "unhedged_exposure": str(self._unhedged_exposure),
+                    "market_exposure": str(self._market_exposures.get(market_id, Decimal("0"))),
+                    "is_hedged": is_hedged,
+                    "daily_pnl": str(self._daily_pnl),
+                    "daily_trades": self._daily_trades,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+
         except Exception as e:
             self._log.error("position_closed_processing_error", error=str(e), data=data)

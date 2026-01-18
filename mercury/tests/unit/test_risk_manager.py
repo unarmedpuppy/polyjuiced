@@ -1733,3 +1733,441 @@ class TestSignalValidationFlow:
 
         rejected_ids = [c[0][1]["signal_id"] for c in rejected_calls]
         assert "multi-2" in rejected_ids
+
+
+class TestExposureTrackingFromFills:
+    """Test exposure tracking from order.filled events."""
+
+    @pytest.mark.asyncio
+    async def test_on_order_filled_updates_exposure(self, risk_manager, mock_event_bus):
+        """_on_order_filled should update exposure tracking."""
+        await risk_manager.start()
+
+        fill_data = {
+            "fill_id": "fill-1",
+            "order_id": "order-1",
+            "market_id": "test-market",
+            "token_id": "token-1",
+            "side": "BUY",
+            "outcome": "YES",
+            "size": "10.0",
+            "price": "0.50",
+            "fee": "0",
+        }
+
+        await risk_manager._on_order_filled(fill_data)
+
+        # Check exposure was updated
+        assert risk_manager.current_exposure == Decimal("5.0")
+        assert risk_manager.daily_trades == 1
+        assert risk_manager.daily_volume == Decimal("5.0")
+
+        await risk_manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_on_order_filled_updates_per_market_exposure(self, risk_manager, mock_event_bus):
+        """_on_order_filled should track per-market exposure."""
+        await risk_manager.start()
+
+        fill_data = {
+            "order_id": "order-1",
+            "market_id": "market-a",
+            "side": "BUY",
+            "size": "20.0",
+            "price": "0.50",
+        }
+
+        await risk_manager._on_order_filled(fill_data)
+
+        assert "market-a" in risk_manager.market_exposures
+        assert risk_manager.market_exposures["market-a"] == Decimal("10.0")
+
+        await risk_manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_on_order_filled_arbitrage_does_not_update_unhedged(
+        self, risk_manager, mock_event_bus
+    ):
+        """Arbitrage fills should not add to unhedged exposure."""
+        await risk_manager.start()
+
+        fill_data = {
+            "order_id": "order-1",
+            "market_id": "test-market",
+            "side": "BUY",
+            "size": "10.0",
+            "price": "0.50",
+            "signal_type": "ARBITRAGE",  # Hedged trade
+        }
+
+        await risk_manager._on_order_filled(fill_data)
+
+        # Total exposure should be updated
+        assert risk_manager.current_exposure == Decimal("5.0")
+        # But unhedged should remain 0 for arbitrage
+        assert risk_manager.unhedged_exposure == Decimal("0")
+
+        await risk_manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_on_order_filled_directional_updates_unhedged(
+        self, risk_manager, mock_event_bus
+    ):
+        """Directional fills should add to unhedged exposure."""
+        await risk_manager.start()
+
+        fill_data = {
+            "order_id": "order-1",
+            "market_id": "test-market",
+            "side": "BUY",
+            "size": "10.0",
+            "price": "0.50",
+            "signal_type": "BUY_YES",  # Directional trade
+        }
+
+        await risk_manager._on_order_filled(fill_data)
+
+        # Both should be updated for directional trade
+        assert risk_manager.current_exposure == Decimal("5.0")
+        assert risk_manager.unhedged_exposure == Decimal("5.0")
+
+        await risk_manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_on_order_filled_publishes_exposure_event(
+        self, risk_manager, mock_event_bus
+    ):
+        """_on_order_filled should publish risk.exposure.updated event."""
+        await risk_manager.start()
+
+        fill_data = {
+            "fill_id": "fill-123",
+            "order_id": "order-1",
+            "market_id": "test-market",
+            "side": "BUY",
+            "size": "10.0",
+            "price": "0.50",
+        }
+
+        await risk_manager._on_order_filled(fill_data)
+
+        # Check exposure update event was published
+        calls = mock_event_bus.publish.call_args_list
+        exposure_calls = [c for c in calls if c[0][0] == "risk.exposure.updated"]
+
+        assert len(exposure_calls) >= 1
+        event_data = exposure_calls[0][0][1]
+        assert event_data["event_type"] == "fill"
+        assert event_data["fill_id"] == "fill-123"
+        # Compare as Decimal to handle string formatting differences
+        assert Decimal(event_data["current_exposure"]) == Decimal("5.0")
+
+        await risk_manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_on_order_filled_with_explicit_cost(self, risk_manager, mock_event_bus):
+        """_on_order_filled should use explicit cost when provided."""
+        await risk_manager.start()
+
+        fill_data = {
+            "order_id": "order-1",
+            "market_id": "test-market",
+            "side": "BUY",
+            "size": "10.0",
+            "price": "0.50",
+            "cost": "7.50",  # Explicit cost includes fees
+        }
+
+        await risk_manager._on_order_filled(fill_data)
+
+        # Should use explicit cost, not computed
+        assert risk_manager.current_exposure == Decimal("7.50")
+        assert risk_manager.daily_volume == Decimal("7.50")
+
+        await risk_manager.stop()
+
+
+class TestExposureTrackingFromPositionClosed:
+    """Test exposure tracking from position.closed events."""
+
+    @pytest.mark.asyncio
+    async def test_on_position_closed_updates_pnl(self, risk_manager, mock_event_bus):
+        """_on_position_closed should update daily P&L."""
+        await risk_manager.start()
+
+        close_data = {
+            "market_id": "test-market",
+            "position_id": "pos-1",
+            "realized_pnl": "5.0",
+            "cost_basis": "10.0",
+        }
+
+        await risk_manager._on_position_closed(close_data)
+
+        assert risk_manager.daily_pnl == Decimal("5.0")
+
+        await risk_manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_on_position_closed_reduces_exposure(self, risk_manager, mock_event_bus):
+        """_on_position_closed should reduce current exposure."""
+        await risk_manager.start()
+
+        # First add some exposure via a fill
+        fill_data = {
+            "order_id": "order-1",
+            "market_id": "test-market",
+            "side": "BUY",
+            "size": "20.0",
+            "price": "0.50",
+        }
+        await risk_manager._on_order_filled(fill_data)
+        assert risk_manager.current_exposure == Decimal("10.0")
+
+        # Now close the position
+        close_data = {
+            "market_id": "test-market",
+            "position_id": "pos-1",
+            "realized_pnl": "2.0",
+            "cost_basis": "10.0",
+        }
+        await risk_manager._on_position_closed(close_data)
+
+        assert risk_manager.current_exposure == Decimal("0")
+
+        await risk_manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_on_position_closed_reduces_per_market_exposure(
+        self, risk_manager, mock_event_bus
+    ):
+        """_on_position_closed should reduce per-market exposure."""
+        await risk_manager.start()
+
+        # Add exposure in two markets
+        fill1 = {
+            "order_id": "order-1",
+            "market_id": "market-a",
+            "side": "BUY",
+            "size": "20.0",
+            "price": "0.50",
+        }
+        fill2 = {
+            "order_id": "order-2",
+            "market_id": "market-b",
+            "side": "BUY",
+            "size": "30.0",
+            "price": "0.50",
+        }
+        await risk_manager._on_order_filled(fill1)
+        await risk_manager._on_order_filled(fill2)
+
+        assert risk_manager.market_exposures["market-a"] == Decimal("10.0")
+        assert risk_manager.market_exposures["market-b"] == Decimal("15.0")
+
+        # Close position in market-a
+        close_data = {
+            "market_id": "market-a",
+            "position_id": "pos-1",
+            "realized_pnl": "1.0",
+            "cost_basis": "10.0",
+        }
+        await risk_manager._on_position_closed(close_data)
+
+        # market-a should be removed (exposure is 0)
+        assert "market-a" not in risk_manager.market_exposures
+        # market-b should be unchanged
+        assert risk_manager.market_exposures["market-b"] == Decimal("15.0")
+
+        await risk_manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_on_position_closed_reduces_unhedged_exposure(
+        self, risk_manager, mock_event_bus
+    ):
+        """_on_position_closed should reduce unhedged exposure for directional positions."""
+        await risk_manager.start()
+
+        # Add directional (unhedged) exposure
+        fill_data = {
+            "order_id": "order-1",
+            "market_id": "test-market",
+            "side": "BUY",
+            "size": "20.0",
+            "price": "0.50",
+            "signal_type": "BUY_YES",  # Directional
+        }
+        await risk_manager._on_order_filled(fill_data)
+        assert risk_manager.unhedged_exposure == Decimal("10.0")
+
+        # Close the position (unhedged)
+        close_data = {
+            "market_id": "test-market",
+            "position_id": "pos-1",
+            "realized_pnl": "1.0",
+            "cost_basis": "10.0",
+            "is_hedged": False,  # Was a directional position
+        }
+        await risk_manager._on_position_closed(close_data)
+
+        assert risk_manager.unhedged_exposure == Decimal("0")
+
+        await risk_manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_on_position_closed_hedged_does_not_reduce_unhedged(
+        self, risk_manager, mock_event_bus
+    ):
+        """Closing hedged position should not affect unhedged exposure."""
+        await risk_manager.start()
+
+        # Add some unhedged exposure separately
+        risk_manager._unhedged_exposure = Decimal("20.0")
+
+        # Add hedged exposure via fill
+        fill_data = {
+            "order_id": "order-1",
+            "market_id": "test-market",
+            "side": "BUY",
+            "size": "20.0",
+            "price": "0.50",
+            "signal_type": "ARBITRAGE",  # Hedged
+        }
+        await risk_manager._on_order_filled(fill_data)
+
+        # Close hedged position
+        close_data = {
+            "market_id": "test-market",
+            "position_id": "pos-1",
+            "realized_pnl": "1.0",
+            "cost_basis": "10.0",
+            "is_hedged": True,  # Was arbitrage position
+        }
+        await risk_manager._on_position_closed(close_data)
+
+        # Unhedged exposure should be unchanged (was not from this position)
+        assert risk_manager.unhedged_exposure == Decimal("20.0")
+
+        await risk_manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_on_position_closed_computes_cost_from_size_and_price(
+        self, risk_manager, mock_event_bus
+    ):
+        """_on_position_closed should compute cost_basis from size * entry_price."""
+        await risk_manager.start()
+
+        # Add some exposure
+        risk_manager._current_exposure = Decimal("20.0")
+        risk_manager._market_exposures["test-market"] = Decimal("20.0")
+
+        # Close with size and entry_price instead of cost_basis
+        close_data = {
+            "market_id": "test-market",
+            "position_id": "pos-1",
+            "realized_pnl": "1.0",
+            "size": "20.0",
+            "entry_price": "0.50",  # Cost = 20 * 0.5 = 10
+        }
+        await risk_manager._on_position_closed(close_data)
+
+        # Should have reduced by computed cost basis of 10
+        assert risk_manager.current_exposure == Decimal("10.0")
+
+        await risk_manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_on_position_closed_publishes_exposure_event(
+        self, risk_manager, mock_event_bus
+    ):
+        """_on_position_closed should publish risk.exposure.updated event."""
+        await risk_manager.start()
+
+        close_data = {
+            "market_id": "test-market",
+            "position_id": "pos-123",
+            "realized_pnl": "5.0",
+            "cost_basis": "10.0",
+        }
+
+        await risk_manager._on_position_closed(close_data)
+
+        # Check exposure update event was published
+        calls = mock_event_bus.publish.call_args_list
+        exposure_calls = [c for c in calls if c[0][0] == "risk.exposure.updated"]
+
+        assert len(exposure_calls) >= 1
+        event_data = exposure_calls[0][0][1]
+        assert event_data["event_type"] == "position_closed"
+        assert event_data["position_id"] == "pos-123"
+        assert event_data["realized_pnl"] == "5.0"
+        assert event_data["cost_basis_removed"] == "10.0"
+
+        await risk_manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_on_position_closed_missing_cost_basis_logs_warning(
+        self, risk_manager, mock_event_bus
+    ):
+        """Missing cost_basis should log warning but still record P&L."""
+        await risk_manager.start()
+
+        close_data = {
+            "market_id": "test-market",
+            "position_id": "pos-1",
+            "realized_pnl": "5.0",
+            # No cost_basis, size, or entry_price
+        }
+
+        await risk_manager._on_position_closed(close_data)
+
+        # P&L should still be recorded
+        assert risk_manager.daily_pnl == Decimal("5.0")
+        # But exposure should be unchanged (no cost_basis to deduct)
+        assert risk_manager.current_exposure == Decimal("0")
+
+        await risk_manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_exposure_does_not_go_negative(self, risk_manager, mock_event_bus):
+        """Exposure should never go negative."""
+        await risk_manager.start()
+
+        # Start with some exposure
+        risk_manager._current_exposure = Decimal("5.0")
+        risk_manager._unhedged_exposure = Decimal("5.0")
+        risk_manager._market_exposures["test-market"] = Decimal("5.0")
+
+        # Try to close more than we have
+        close_data = {
+            "market_id": "test-market",
+            "position_id": "pos-1",
+            "realized_pnl": "1.0",
+            "cost_basis": "10.0",  # More than current exposure
+        }
+        await risk_manager._on_position_closed(close_data)
+
+        # Should be capped at 0, not negative
+        assert risk_manager.current_exposure == Decimal("0")
+        assert risk_manager.unhedged_exposure == Decimal("0")
+        assert "test-market" not in risk_manager.market_exposures
+
+        await risk_manager.stop()
+
+
+class TestUnhedgedExposureProperty:
+    """Test unhedged_exposure property."""
+
+    def test_unhedged_exposure_property(self, risk_manager):
+        """unhedged_exposure property should return correct value."""
+        assert risk_manager.unhedged_exposure == Decimal("0")
+
+        risk_manager._unhedged_exposure = Decimal("50.0")
+        assert risk_manager.unhedged_exposure == Decimal("50.0")
+
+    def test_reset_clears_unhedged_exposure(self, risk_manager):
+        """Daily reset should clear unhedged exposure."""
+        risk_manager._unhedged_exposure = Decimal("50.0")
+        risk_manager.reset_daily()
+
+        assert risk_manager.unhedged_exposure == Decimal("0")
