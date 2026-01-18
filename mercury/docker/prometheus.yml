@@ -1,0 +1,11 @@
+# Prometheus configuration for Mercury
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'mercury'
+    static_configs:
+      - targets: ['mercury:9090']
+    metrics_path: '/metrics'

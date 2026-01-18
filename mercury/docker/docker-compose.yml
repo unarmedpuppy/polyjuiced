@@ -1,0 +1,70 @@
+# Mercury Local Development
+version: "3.8"
+
+services:
+  mercury:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    environment:
+      - MERCURY_DRY_RUN=true
+      - MERCURY_LOG_LEVEL=DEBUG
+      - MERCURY_REDIS_URL=redis://redis:6379
+      - MERCURY_DATABASE_PATH=/app/data/mercury.db
+      # Credentials (set in .env file)
+      - MERCURY_POLYMARKET_PRIVATE_KEY=${MERCURY_POLYMARKET_PRIVATE_KEY:-}
+      - MERCURY_POLYMARKET_API_KEY=${MERCURY_POLYMARKET_API_KEY:-}
+      - MERCURY_POLYMARKET_API_SECRET=${MERCURY_POLYMARKET_API_SECRET:-}
+      - MERCURY_POLYMARKET_API_PASSPHRASE=${MERCURY_POLYMARKET_API_PASSPHRASE:-}
+    depends_on:
+      - redis
+    volumes:
+      - mercury-data:/app/data
+    ports:
+      - "9090:9090"  # Metrics
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis-data:/data
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9091:9090"
+    restart: unless-stopped
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=mercury
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  mercury-data:
+  redis-data:
+  prometheus-data:
+  grafana-data:
