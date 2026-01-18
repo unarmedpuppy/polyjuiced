@@ -7,6 +7,8 @@ Tests the core ExecutionEngine functionality including:
 - Concurrent execution limits
 - Signal processing
 - Health checks
+- Single order execution (FOK/GTC)
+- Order state tracking and events
 """
 import asyncio
 import pytest
@@ -20,6 +22,15 @@ from mercury.services.execution import (
     ExecutionSignal,
     QueuedSignal,
     QueuedSignalStatus,
+)
+from mercury.domain.order import (
+    Order,
+    OrderRequest,
+    OrderResult as DomainOrderResult,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    Fill,
 )
 from mercury.domain.signal import SignalType, SignalPriority
 
@@ -432,3 +443,576 @@ class TestQueuedSignalStatus:
 
         signal.status = QueuedSignalStatus.COMPLETED
         assert signal.status == QueuedSignalStatus.COMPLETED
+
+
+class TestSingleOrderExecution:
+    """Test single order execution with FOK/GTC support."""
+
+    @pytest.fixture
+    def order_request_gtc(self):
+        """Create a GTC order request."""
+        return OrderRequest(
+            market_id="test-market-123",
+            token_id="token-yes-456",
+            side=OrderSide.BUY,
+            outcome="YES",
+            size=Decimal("10.0"),
+            price=Decimal("0.55"),
+            order_type=OrderType.GTC,
+        )
+
+    @pytest.fixture
+    def order_request_fok(self):
+        """Create a FOK order request."""
+        return OrderRequest(
+            market_id="test-market-123",
+            token_id="token-yes-456",
+            side=OrderSide.BUY,
+            outcome="YES",
+            size=Decimal("10.0"),
+            price=Decimal("0.55"),
+            order_type=OrderType.FOK,
+        )
+
+    @pytest.mark.asyncio
+    async def test_execute_order_gtc_dry_run(self, execution_engine, order_request_gtc, mock_event_bus):
+        """Verify GTC order execution in dry-run mode."""
+        await execution_engine.start()
+
+        result = await execution_engine.execute_order(order_request_gtc)
+
+        assert result.success is True
+        assert result.order is not None
+        assert result.order.status == OrderStatus.FILLED
+        assert result.order.filled_size == order_request_gtc.size
+        assert result.order.order_type == OrderType.GTC
+        assert result.latency_ms > 0
+        assert len(result.fills) == 1
+
+        # Verify events were emitted
+        assert mock_event_bus.publish.call_count >= 3  # pending, submitted, filled
+
+        await execution_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_execute_order_fok_dry_run(self, execution_engine, order_request_fok, mock_event_bus):
+        """Verify FOK order execution in dry-run mode."""
+        await execution_engine.start()
+
+        result = await execution_engine.execute_order(order_request_fok)
+
+        assert result.success is True
+        assert result.order is not None
+        assert result.order.status == OrderStatus.FILLED
+        assert result.order.filled_size == order_request_fok.size
+        assert result.order.order_type == OrderType.FOK
+        assert len(result.fills) == 1
+
+        await execution_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_execute_order_emits_pending_event(self, execution_engine, order_request_gtc, mock_event_bus):
+        """Verify order.pending event is emitted."""
+        await execution_engine.start()
+
+        await execution_engine.execute_order(order_request_gtc)
+
+        # Find the pending event
+        pending_calls = [
+            call for call in mock_event_bus.publish.call_args_list
+            if call[0][0] == "order.pending"
+        ]
+        assert len(pending_calls) == 1
+        event_data = pending_calls[0][0][1]
+        assert event_data["status"] == "pending"
+        assert event_data["market_id"] == order_request_gtc.market_id
+
+        await execution_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_execute_order_emits_submitted_event(self, execution_engine, order_request_gtc, mock_event_bus):
+        """Verify order.submitted event is emitted."""
+        await execution_engine.start()
+
+        await execution_engine.execute_order(order_request_gtc)
+
+        # Find the submitted event
+        submitted_calls = [
+            call for call in mock_event_bus.publish.call_args_list
+            if call[0][0] == "order.submitted"
+        ]
+        assert len(submitted_calls) == 1
+        event_data = submitted_calls[0][0][1]
+        assert event_data["status"] == "submitted"
+
+        await execution_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_execute_order_emits_filled_event(self, execution_engine, order_request_gtc, mock_event_bus):
+        """Verify order.filled event is emitted."""
+        await execution_engine.start()
+
+        await execution_engine.execute_order(order_request_gtc)
+
+        # Find the filled event
+        filled_calls = [
+            call for call in mock_event_bus.publish.call_args_list
+            if call[0][0] == "order.filled"
+        ]
+        assert len(filled_calls) == 1
+        event_data = filled_calls[0][0][1]
+        assert event_data["status"] == "filled"
+        assert event_data["filled_size"] == str(order_request_gtc.size)
+
+        await execution_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_execute_order_tracks_state_transitions(self, execution_engine, order_request_gtc, mock_event_bus):
+        """Verify correct state transitions: PENDING -> SUBMITTED -> FILLED."""
+        await execution_engine.start()
+
+        await execution_engine.execute_order(order_request_gtc)
+
+        # Extract all event types in order
+        event_types = [call[0][0] for call in mock_event_bus.publish.call_args_list]
+
+        # Verify the correct sequence
+        assert "order.pending" in event_types
+        assert "order.submitted" in event_types
+        assert "order.filled" in event_types
+
+        # Verify order: pending comes before submitted, submitted comes before filled
+        pending_idx = event_types.index("order.pending")
+        submitted_idx = event_types.index("order.submitted")
+        filled_idx = event_types.index("order.filled")
+
+        assert pending_idx < submitted_idx < filled_idx
+
+        await execution_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_execute_order_creates_fill(self, execution_engine, order_request_gtc):
+        """Verify Fill objects are created for filled orders."""
+        await execution_engine.start()
+
+        result = await execution_engine.execute_order(order_request_gtc)
+
+        assert len(result.fills) == 1
+        fill = result.fills[0]
+
+        assert fill.order_id == result.order.order_id
+        assert fill.market_id == order_request_gtc.market_id
+        assert fill.token_id == order_request_gtc.token_id
+        assert fill.side == order_request_gtc.side
+        assert fill.outcome == order_request_gtc.outcome
+        assert fill.size == order_request_gtc.size
+        assert fill.price == order_request_gtc.price
+
+        await execution_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_execute_order_no_fills_for_unfilled(self, execution_engine, order_request_gtc):
+        """Verify no fills for orders that don't fill."""
+        # This test would require mocking a non-dry-run scenario
+        # where the order times out. For now we verify the helper method.
+        await execution_engine.start()
+
+        # Create an unfilled order
+        order = Order(
+            order_id="test-order",
+            market_id="test-market",
+            token_id="test-token",
+            side=OrderSide.BUY,
+            outcome="YES",
+            requested_size=Decimal("10.0"),
+            filled_size=Decimal("0"),  # No fill
+            price=Decimal("0.5"),
+            status=OrderStatus.OPEN,
+        )
+
+        fills = execution_engine._create_fills_from_order(order)
+        assert len(fills) == 0
+
+        await execution_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_execute_order_result_properties(self, execution_engine, order_request_gtc):
+        """Verify DomainOrderResult properties."""
+        await execution_engine.start()
+
+        result = await execution_engine.execute_order(order_request_gtc)
+
+        # Check total_filled
+        assert result.total_filled == order_request_gtc.size
+
+        # Check total_cost
+        expected_cost = order_request_gtc.size * order_request_gtc.price
+        assert result.total_cost == expected_cost
+
+        await execution_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_execute_order_sell_side(self, execution_engine, mock_event_bus):
+        """Verify SELL orders work correctly."""
+        await execution_engine.start()
+
+        sell_request = OrderRequest(
+            market_id="test-market",
+            token_id="token-yes",
+            side=OrderSide.SELL,
+            outcome="YES",
+            size=Decimal("5.0"),
+            price=Decimal("0.60"),
+            order_type=OrderType.GTC,
+        )
+
+        result = await execution_engine.execute_order(sell_request)
+
+        assert result.success is True
+        assert result.order.side == OrderSide.SELL
+        assert result.fills[0].side == OrderSide.SELL
+
+        await execution_engine.stop()
+
+
+class TestOrderStateTracking:
+    """Test order state tracking across lifecycle."""
+
+    @pytest.mark.asyncio
+    async def test_order_has_correct_timestamps(self, execution_engine):
+        """Verify orders have correct timestamps."""
+        await execution_engine.start()
+
+        before_execution = datetime.now(timezone.utc)
+
+        request = OrderRequest(
+            market_id="test-market",
+            token_id="test-token",
+            side=OrderSide.BUY,
+            outcome="YES",
+            size=Decimal("10.0"),
+            price=Decimal("0.5"),
+        )
+
+        result = await execution_engine.execute_order(request)
+
+        after_execution = datetime.now(timezone.utc)
+
+        # created_at and updated_at should be within the execution window
+        assert result.order.created_at >= before_execution
+        assert result.order.created_at <= after_execution
+        assert result.order.updated_at >= result.order.created_at
+        assert result.order.updated_at <= after_execution
+
+        await execution_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_order_id_format(self, execution_engine):
+        """Verify order ID format."""
+        await execution_engine.start()
+
+        request = OrderRequest(
+            market_id="test-market",
+            token_id="test-token",
+            side=OrderSide.BUY,
+            outcome="YES",
+            size=Decimal("10.0"),
+            price=Decimal("0.5"),
+        )
+
+        result = await execution_engine.execute_order(request)
+
+        # Order ID should start with "ord-"
+        assert result.order.order_id.startswith("ord-")
+        # Should have reasonable length
+        assert len(result.order.order_id) == 16  # "ord-" + 12 hex chars
+
+        await execution_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_client_order_id_preserved(self, execution_engine):
+        """Verify client_order_id is preserved."""
+        await execution_engine.start()
+
+        custom_client_id = "my-custom-order-id-123"
+        request = OrderRequest(
+            market_id="test-market",
+            token_id="test-token",
+            side=OrderSide.BUY,
+            outcome="YES",
+            size=Decimal("10.0"),
+            price=Decimal("0.5"),
+            client_order_id=custom_client_id,
+        )
+
+        result = await execution_engine.execute_order(request)
+
+        assert result.order.client_order_id == custom_client_id
+
+        await execution_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_order_type_preserved(self, execution_engine):
+        """Verify order type is preserved in result."""
+        await execution_engine.start()
+
+        # Test GTC
+        gtc_request = OrderRequest(
+            market_id="test-market",
+            token_id="test-token",
+            side=OrderSide.BUY,
+            outcome="YES",
+            size=Decimal("10.0"),
+            price=Decimal("0.5"),
+            order_type=OrderType.GTC,
+        )
+
+        gtc_result = await execution_engine.execute_order(gtc_request)
+        assert gtc_result.order.order_type == OrderType.GTC
+
+        # Test FOK
+        fok_request = OrderRequest(
+            market_id="test-market",
+            token_id="test-token",
+            side=OrderSide.BUY,
+            outcome="YES",
+            size=Decimal("10.0"),
+            price=Decimal("0.5"),
+            order_type=OrderType.FOK,
+        )
+
+        fok_result = await execution_engine.execute_order(fok_request)
+        assert fok_result.order.order_type == OrderType.FOK
+
+        await execution_engine.stop()
+
+
+class TestOrderEventData:
+    """Test order event data structure and content."""
+
+    @pytest.mark.asyncio
+    async def test_event_contains_all_required_fields(self, execution_engine, mock_event_bus):
+        """Verify events contain all required fields."""
+        await execution_engine.start()
+
+        request = OrderRequest(
+            market_id="test-market-abc",
+            token_id="token-xyz",
+            side=OrderSide.BUY,
+            outcome="YES",
+            size=Decimal("15.5"),
+            price=Decimal("0.45"),
+            order_type=OrderType.GTC,
+        )
+
+        await execution_engine.execute_order(request)
+
+        # Check one of the events has all required fields
+        for call in mock_event_bus.publish.call_args_list:
+            event_type = call[0][0]
+            if event_type.startswith("order."):
+                event_data = call[0][1]
+
+                # Required fields
+                assert "order_id" in event_data
+                assert "client_order_id" in event_data
+                assert "market_id" in event_data
+                assert "token_id" in event_data
+                assert "side" in event_data
+                assert "outcome" in event_data
+                assert "order_type" in event_data
+                assert "status" in event_data
+                assert "requested_size" in event_data
+                assert "filled_size" in event_data
+                assert "price" in event_data
+                assert "timestamp" in event_data
+
+                # Verify values
+                assert event_data["market_id"] == "test-market-abc"
+                assert event_data["token_id"] == "token-xyz"
+                assert event_data["side"] == "BUY"
+                assert event_data["outcome"] == "YES"
+                assert event_data["order_type"] == "GTC"
+                break
+
+        await execution_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_error_included_in_rejected_event(self, execution_engine, mock_event_bus, mock_clob):
+        """Verify error message is included in rejected events."""
+        # Configure to not be dry run so we can trigger an error
+        execution_engine._dry_run = False
+        mock_clob._connected = True
+        mock_clob.execute_order = AsyncMock(side_effect=Exception("CLOB connection failed"))
+
+        await execution_engine.start()
+
+        request = OrderRequest(
+            market_id="test-market",
+            token_id="test-token",
+            side=OrderSide.BUY,
+            outcome="YES",
+            size=Decimal("10.0"),
+            price=Decimal("0.5"),
+        )
+
+        result = await execution_engine.execute_order(request)
+
+        assert result.success is False
+        assert result.error_message is not None
+
+        # Find rejected event
+        rejected_calls = [
+            call for call in mock_event_bus.publish.call_args_list
+            if call[0][0] == "order.rejected"
+        ]
+        assert len(rejected_calls) >= 1
+        event_data = rejected_calls[0][0][1]
+        assert "error" in event_data
+        assert "CLOB connection failed" in event_data["error"]
+
+        await execution_engine.stop()
+
+
+class TestOrderRequest:
+    """Test OrderRequest validation."""
+
+    def test_valid_order_request(self):
+        """Verify valid order request creation."""
+        request = OrderRequest(
+            market_id="test-market",
+            token_id="test-token",
+            side=OrderSide.BUY,
+            outcome="YES",
+            size=Decimal("10.0"),
+            price=Decimal("0.5"),
+        )
+
+        assert request.market_id == "test-market"
+        assert request.size == Decimal("10.0")
+        assert request.order_type == OrderType.GTC  # Default
+
+    def test_invalid_outcome_raises(self):
+        """Verify invalid outcome raises ValueError."""
+        with pytest.raises(ValueError, match="outcome must be YES or NO"):
+            OrderRequest(
+                market_id="test-market",
+                token_id="test-token",
+                side=OrderSide.BUY,
+                outcome="MAYBE",  # Invalid
+                size=Decimal("10.0"),
+                price=Decimal("0.5"),
+            )
+
+    def test_invalid_size_raises(self):
+        """Verify non-positive size raises ValueError."""
+        with pytest.raises(ValueError, match="size must be positive"):
+            OrderRequest(
+                market_id="test-market",
+                token_id="test-token",
+                side=OrderSide.BUY,
+                outcome="YES",
+                size=Decimal("0"),  # Invalid
+                price=Decimal("0.5"),
+            )
+
+    def test_invalid_price_raises(self):
+        """Verify price outside (0, 1) raises ValueError."""
+        with pytest.raises(ValueError, match="price must be between 0 and 1"):
+            OrderRequest(
+                market_id="test-market",
+                token_id="test-token",
+                side=OrderSide.BUY,
+                outcome="YES",
+                size=Decimal("10.0"),
+                price=Decimal("1.5"),  # Invalid
+            )
+
+    def test_client_order_id_auto_generated(self):
+        """Verify client_order_id is auto-generated if not provided."""
+        request = OrderRequest(
+            market_id="test-market",
+            token_id="test-token",
+            side=OrderSide.BUY,
+            outcome="YES",
+            size=Decimal("10.0"),
+            price=Decimal("0.5"),
+        )
+
+        assert request.client_order_id is not None
+        assert len(request.client_order_id) > 0
+
+
+class TestOrderModel:
+    """Test Order model properties."""
+
+    def test_remaining_size(self):
+        """Verify remaining_size calculation."""
+        order = Order(
+            order_id="test",
+            market_id="market",
+            token_id="token",
+            side=OrderSide.BUY,
+            outcome="YES",
+            requested_size=Decimal("100.0"),
+            filled_size=Decimal("30.0"),
+            price=Decimal("0.5"),
+            status=OrderStatus.PARTIALLY_FILLED,
+        )
+
+        assert order.remaining_size == Decimal("70.0")
+
+    def test_fill_ratio(self):
+        """Verify fill_ratio calculation."""
+        order = Order(
+            order_id="test",
+            market_id="market",
+            token_id="token",
+            side=OrderSide.BUY,
+            outcome="YES",
+            requested_size=Decimal("100.0"),
+            filled_size=Decimal("25.0"),
+            price=Decimal("0.5"),
+            status=OrderStatus.PARTIALLY_FILLED,
+        )
+
+        assert order.fill_ratio == Decimal("0.25")
+
+    def test_is_complete(self):
+        """Verify is_complete for terminal states."""
+        terminal_states = [
+            OrderStatus.FILLED,
+            OrderStatus.CANCELLED,
+            OrderStatus.REJECTED,
+            OrderStatus.EXPIRED,
+        ]
+
+        for status in terminal_states:
+            order = Order(
+                order_id="test",
+                market_id="market",
+                token_id="token",
+                side=OrderSide.BUY,
+                outcome="YES",
+                requested_size=Decimal("10.0"),
+                filled_size=Decimal("0"),
+                price=Decimal("0.5"),
+                status=status,
+            )
+            assert order.is_complete is True
+
+        # Non-terminal states
+        non_terminal = [OrderStatus.PENDING, OrderStatus.SUBMITTED, OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED]
+        for status in non_terminal:
+            order = Order(
+                order_id="test",
+                market_id="market",
+                token_id="token",
+                side=OrderSide.BUY,
+                outcome="YES",
+                requested_size=Decimal("10.0"),
+                filled_size=Decimal("0"),
+                price=Decimal("0.5"),
+                status=status,
+            )
+            assert order.is_complete is False

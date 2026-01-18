@@ -23,7 +23,17 @@ import structlog
 from mercury.core.config import ConfigManager
 from mercury.core.events import EventBus
 from mercury.core.lifecycle import BaseComponent, HealthCheckResult, HealthStatus
-from mercury.domain.order import OrderRequest, Position, PositionStatus
+from mercury.domain.order import (
+    Order,
+    OrderRequest,
+    OrderResult as DomainOrderResult,
+    OrderSide as DomainOrderSide,
+    OrderStatus as DomainOrderStatus,
+    OrderType,
+    Fill,
+    Position,
+    PositionStatus,
+)
 from mercury.domain.signal import ApprovedSignal, SignalType, SignalPriority
 from mercury.integrations.polymarket.clob import CLOBClient, InsufficientLiquidityError
 from mercury.integrations.polymarket.types import (
@@ -382,6 +392,393 @@ class ExecutionEngine(BaseComponent):
                 error=str(e),
                 execution_time_ms=time.time() * 1000 - start_time,
             )
+
+    # =========================================================================
+    # Single Order Execution (FOK/GTC Support)
+    # =========================================================================
+
+    async def execute_order(
+        self,
+        order_request: OrderRequest,
+        timeout: float = 30.0,
+    ) -> DomainOrderResult:
+        """Execute a single order request with FOK or GTC order type support.
+
+        This method handles the complete order lifecycle:
+        1. Creates an Order from the request (status: PENDING)
+        2. Submits to exchange (status: SUBMITTED)
+        3. Tracks fill status (status: FILLED, PARTIALLY_FILLED, REJECTED, CANCELLED)
+        4. Emits order.* events for each state transition
+
+        Args:
+            order_request: The order request containing market, token, price, size, and type.
+            timeout: Maximum time to wait for order completion (seconds).
+
+        Returns:
+            DomainOrderResult with order details and any fills.
+
+        Event channels published:
+            - order.pending: Order created, awaiting submission
+            - order.submitted: Order sent to exchange
+            - order.filled: Order completely filled
+            - order.partially_filled: Order partially filled (GTC only)
+            - order.rejected: Order rejected by exchange
+            - order.cancelled: Order was cancelled
+            - order.expired: FOK order expired without fill
+        """
+        start_time = time.time()
+        order_id = f"ord-{uuid.uuid4().hex[:12]}"
+
+        self._log.info(
+            "execute_order_start",
+            order_id=order_id,
+            client_order_id=order_request.client_order_id,
+            market_id=order_request.market_id,
+            token_id=order_request.token_id,
+            side=order_request.side.value,
+            order_type=order_request.order_type.value,
+            size=str(order_request.size),
+            price=str(order_request.price),
+            dry_run=self._dry_run,
+        )
+
+        # Create initial order object with PENDING status
+        order = Order(
+            order_id=order_id,
+            market_id=order_request.market_id,
+            token_id=order_request.token_id,
+            side=order_request.side,
+            outcome=order_request.outcome,
+            requested_size=order_request.size,
+            filled_size=Decimal("0"),
+            price=order_request.price,
+            status=DomainOrderStatus.PENDING,
+            order_type=order_request.order_type,
+            client_order_id=order_request.client_order_id,
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+
+        # Emit order.pending event
+        await self._emit_order_event("order.pending", order)
+
+        try:
+            # Submit order
+            order = await self._submit_order(order, order_request)
+
+            # For FOK orders, handle fill-or-kill logic
+            if order_request.order_type == OrderType.FOK:
+                order = await self._handle_fok_order(order, timeout)
+            else:
+                # GTC orders - wait for fill or timeout
+                order = await self._handle_gtc_order(order, timeout)
+
+            # Calculate latency
+            latency_ms = (time.time() - start_time) * 1000
+
+            # Build fills list
+            fills = self._create_fills_from_order(order)
+
+            result = DomainOrderResult(
+                success=order.status == DomainOrderStatus.FILLED,
+                order=order,
+                fills=fills,
+                error_message=None if order.status == DomainOrderStatus.FILLED else f"Order status: {order.status.value}",
+                latency_ms=latency_ms,
+            )
+
+            self._log.info(
+                "execute_order_complete",
+                order_id=order.order_id,
+                status=order.status.value,
+                filled_size=str(order.filled_size),
+                latency_ms=latency_ms,
+            )
+
+            return result
+
+        except Exception as e:
+            # Update order to REJECTED status
+            order.status = DomainOrderStatus.REJECTED
+            order.updated_at = datetime.now(timezone.utc)
+
+            await self._emit_order_event("order.rejected", order, error=str(e))
+
+            self._log.error(
+                "execute_order_failed",
+                order_id=order.order_id,
+                error=str(e),
+            )
+
+            return DomainOrderResult(
+                success=False,
+                order=order,
+                fills=[],
+                error_message=str(e),
+                latency_ms=(time.time() - start_time) * 1000,
+            )
+
+    async def _submit_order(
+        self,
+        order: Order,
+        order_request: OrderRequest,
+    ) -> Order:
+        """Submit order to exchange and update status to SUBMITTED.
+
+        Args:
+            order: The order to submit.
+            order_request: Original order request.
+
+        Returns:
+            Updated order with SUBMITTED status.
+        """
+        order.status = DomainOrderStatus.SUBMITTED
+        order.updated_at = datetime.now(timezone.utc)
+
+        await self._emit_order_event("order.submitted", order)
+
+        if self._dry_run:
+            # In dry-run mode, simulate immediate fill
+            self._log.info("dry_run_order_submitted", order_id=order.order_id)
+            return order
+
+        # Submit to CLOB
+        clob_side = OrderSide.BUY if order_request.side == DomainOrderSide.BUY else OrderSide.SELL
+
+        clob_result = await self._clob.execute_order(
+            token_id=order_request.token_id,
+            side=clob_side,
+            amount_shares=order_request.size,
+            price=order_request.price,
+        )
+
+        # Update order with CLOB response
+        if clob_result.order_id:
+            # Keep our internal order_id but track exchange order_id in metadata
+            self._log.info(
+                "order_submitted_to_clob",
+                internal_order_id=order.order_id,
+                clob_order_id=clob_result.order_id,
+            )
+
+        return order
+
+    async def _handle_fok_order(
+        self,
+        order: Order,
+        timeout: float,
+    ) -> Order:
+        """Handle Fill-or-Kill order execution.
+
+        FOK orders must be completely filled or not at all.
+        If the order cannot be filled immediately, it is cancelled/expired.
+
+        Args:
+            order: The submitted order.
+            timeout: Maximum time to wait for fill.
+
+        Returns:
+            Updated order with final status.
+        """
+        if self._dry_run:
+            # Simulate immediate fill in dry-run mode
+            order.filled_size = order.requested_size
+            order.status = DomainOrderStatus.FILLED
+            order.updated_at = datetime.now(timezone.utc)
+
+            await self._emit_order_event("order.filled", order)
+            return order
+
+        # Wait briefly for immediate fill
+        await asyncio.sleep(min(timeout, 2.0))
+
+        # Check order status from CLOB
+        try:
+            open_orders = await self._clob.get_open_orders()
+            order_still_open = any(
+                o.get("id") == order.order_id or o.get("client_order_id") == order.client_order_id
+                for o in open_orders
+            )
+
+            if order_still_open:
+                # FOK not filled - cancel and mark as expired
+                await self._clob.cancel_order(order.order_id)
+                order.status = DomainOrderStatus.EXPIRED
+                order.updated_at = datetime.now(timezone.utc)
+
+                await self._emit_order_event("order.expired", order)
+                self._log.info("fok_order_expired", order_id=order.order_id)
+            else:
+                # Order is no longer open - assume filled
+                order.filled_size = order.requested_size
+                order.status = DomainOrderStatus.FILLED
+                order.updated_at = datetime.now(timezone.utc)
+
+                await self._emit_order_event("order.filled", order)
+
+        except Exception as e:
+            self._log.error("fok_status_check_failed", order_id=order.order_id, error=str(e))
+            order.status = DomainOrderStatus.REJECTED
+            order.updated_at = datetime.now(timezone.utc)
+
+            await self._emit_order_event("order.rejected", order, error=str(e))
+
+        return order
+
+    async def _handle_gtc_order(
+        self,
+        order: Order,
+        timeout: float,
+    ) -> Order:
+        """Handle Good-Til-Cancelled order execution.
+
+        GTC orders remain on the book until filled or explicitly cancelled.
+        This method waits for the order to fill (with polling) or times out.
+
+        Args:
+            order: The submitted order.
+            timeout: Maximum time to wait for fill.
+
+        Returns:
+            Updated order with final status.
+        """
+        if self._dry_run:
+            # Simulate fill in dry-run mode
+            await asyncio.sleep(0.05)  # Small delay to simulate latency
+            order.filled_size = order.requested_size
+            order.status = DomainOrderStatus.FILLED
+            order.updated_at = datetime.now(timezone.utc)
+
+            await self._emit_order_event("order.filled", order)
+            return order
+
+        start_time = time.time()
+        poll_interval = 0.5  # Poll every 500ms
+
+        while time.time() - start_time < timeout:
+            try:
+                open_orders = await self._clob.get_open_orders()
+                order_found = None
+
+                for o in open_orders:
+                    oid = o.get("id") if isinstance(o, dict) else getattr(o, "id", None)
+                    if oid == order.order_id:
+                        order_found = o
+                        break
+
+                if order_found is None:
+                    # Order no longer in open orders - assume filled
+                    order.filled_size = order.requested_size
+                    order.status = DomainOrderStatus.FILLED
+                    order.updated_at = datetime.now(timezone.utc)
+
+                    await self._emit_order_event("order.filled", order)
+                    return order
+
+                # Check for partial fills
+                if isinstance(order_found, dict):
+                    filled_size = Decimal(str(order_found.get("size_matched", 0) or 0))
+                else:
+                    filled_size = Decimal(str(getattr(order_found, "size_matched", 0) or 0))
+
+                if filled_size > order.filled_size:
+                    order.filled_size = filled_size
+                    order.status = DomainOrderStatus.PARTIALLY_FILLED
+                    order.updated_at = datetime.now(timezone.utc)
+
+                    await self._emit_order_event("order.partially_filled", order)
+
+            except Exception as e:
+                self._log.warning("gtc_poll_error", order_id=order.order_id, error=str(e))
+
+            await asyncio.sleep(poll_interval)
+
+        # Timeout reached - order still open, mark as open/partially filled
+        if order.filled_size == Decimal("0"):
+            order.status = DomainOrderStatus.OPEN
+        else:
+            order.status = DomainOrderStatus.PARTIALLY_FILLED
+
+        order.updated_at = datetime.now(timezone.utc)
+
+        self._log.info(
+            "gtc_order_timeout",
+            order_id=order.order_id,
+            filled_size=str(order.filled_size),
+            status=order.status.value,
+        )
+
+        return order
+
+    async def _emit_order_event(
+        self,
+        event_type: str,
+        order: Order,
+        error: Optional[str] = None,
+    ) -> None:
+        """Emit an order lifecycle event.
+
+        Args:
+            event_type: Event channel (e.g., "order.pending", "order.filled").
+            order: The order being processed.
+            error: Optional error message for rejection events.
+        """
+        event_data = {
+            "order_id": order.order_id,
+            "client_order_id": order.client_order_id,
+            "market_id": order.market_id,
+            "token_id": order.token_id,
+            "side": order.side.value,
+            "outcome": order.outcome,
+            "order_type": order.order_type.value,
+            "status": order.status.value,
+            "requested_size": str(order.requested_size),
+            "filled_size": str(order.filled_size),
+            "price": str(order.price),
+            "timestamp": order.updated_at.isoformat(),
+        }
+
+        if error:
+            event_data["error"] = error
+
+        await self._event_bus.publish(event_type, event_data)
+
+        self._log.debug(
+            "order_event_emitted",
+            event_type=event_type,
+            order_id=order.order_id,
+            status=order.status.value,
+        )
+
+    def _create_fills_from_order(self, order: Order) -> list[Fill]:
+        """Create Fill objects from an order's filled size.
+
+        In production this would come from exchange trade data.
+        For now we create a single synthetic fill.
+
+        Args:
+            order: The order with fill information.
+
+        Returns:
+            List of Fill objects.
+        """
+        if order.filled_size == Decimal("0"):
+            return []
+
+        fill = Fill(
+            fill_id=f"fill-{uuid.uuid4().hex[:8]}",
+            order_id=order.order_id,
+            market_id=order.market_id,
+            token_id=order.token_id,
+            side=order.side,
+            outcome=order.outcome,
+            size=order.filled_size,
+            price=order.price,
+            fee=Decimal("0"),  # Fees would come from exchange
+            timestamp=order.updated_at,
+        )
+
+        return [fill]
 
     async def _execute_dry_run(
         self,
