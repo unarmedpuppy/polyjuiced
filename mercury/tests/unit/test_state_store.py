@@ -1285,6 +1285,477 @@ class TestSettlementQueue:
 
         await store.close()
 
+    @pytest.mark.asyncio
+    async def test_get_failed_claims(self, tmp_path):
+        """Test getting failed claim attempts."""
+        from mercury.services.state_store import StateStore, Position
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        # Create positions
+        for i in range(3):
+            position = Position(
+                position_id=f"failed-claim-{i}",
+                market_id="test-market",
+                strategy="gabagool",
+                side="YES",
+                size=Decimal("10.0"),
+                entry_price=Decimal("0.50"),
+            )
+            await store.queue_for_settlement(position)
+
+        # Record failures for first two positions
+        await store.record_claim_attempt("failed-claim-0", error="Network timeout")
+        await store.record_claim_attempt("failed-claim-0", error="Market not resolved")
+        await store.record_claim_attempt("failed-claim-1", error="Contract error")
+        # Position 2 has no failures
+
+        # Get failed claims
+        failed = await store.get_failed_claims(min_attempts=1)
+
+        assert len(failed) == 2
+        # Sorted by attempts desc, so failed-claim-0 should be first
+        assert failed[0].position_id == "failed-claim-0"
+        assert failed[0].claim_attempts == 2
+        assert failed[0].last_claim_error == "Market not resolved"
+        assert failed[1].position_id == "failed-claim-1"
+        assert failed[1].claim_attempts == 1
+
+        # Test min_attempts filter
+        failed_2plus = await store.get_failed_claims(min_attempts=2)
+        assert len(failed_2plus) == 1
+        assert failed_2plus[0].position_id == "failed-claim-0"
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_get_failed_claims_excludes_claimed(self, tmp_path):
+        """Test that get_failed_claims excludes successfully claimed positions."""
+        from mercury.services.state_store import StateStore, Position
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        # Create position
+        position = Position(
+            position_id="claimed-after-retry",
+            market_id="test-market",
+            strategy="gabagool",
+            side="YES",
+            size=Decimal("10.0"),
+            entry_price=Decimal("0.50"),
+        )
+        await store.queue_for_settlement(position)
+
+        # Record failure
+        await store.record_claim_attempt("claimed-after-retry", error="Network timeout")
+
+        # Verify it shows in failed claims
+        failed = await store.get_failed_claims()
+        assert any(f.position_id == "claimed-after-retry" for f in failed)
+
+        # Now mark as claimed
+        await store.mark_claimed("claimed-after-retry", proceeds=Decimal("10.0"))
+
+        # Should no longer appear in failed claims
+        failed = await store.get_failed_claims()
+        assert not any(f.position_id == "claimed-after-retry" for f in failed)
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_get_settlement_queue_entry(self, tmp_path):
+        """Test getting a specific settlement queue entry."""
+        from mercury.services.state_store import StateStore, Position
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        position = Position(
+            position_id="queue-entry-test",
+            market_id="test-market",
+            strategy="gabagool",
+            side="YES",
+            size=Decimal("10.0"),
+            entry_price=Decimal("0.50"),
+        )
+
+        await store.queue_for_settlement(
+            position,
+            condition_id="cond-abc",
+            token_id="token-xyz",
+            asset="BTC",
+        )
+
+        # Get the entry
+        entry = await store.get_settlement_queue_entry("queue-entry-test")
+
+        assert entry is not None
+        assert entry.position_id == "queue-entry-test"
+        assert entry.market_id == "test-market"
+        assert entry.side == "YES"
+        assert entry.size == Decimal("10.0")
+        assert entry.entry_price == Decimal("0.50")
+        assert entry.condition_id == "cond-abc"
+        assert entry.token_id == "token-xyz"
+        assert entry.asset == "BTC"
+        assert entry.status == "pending"
+        assert entry.claimed is False
+        assert entry.claim_attempts == 0
+
+        # Test non-existent entry
+        non_existent = await store.get_settlement_queue_entry("non-existent")
+        assert non_existent is None
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_get_settlement_queue(self, tmp_path):
+        """Test getting settlement queue entries with filters."""
+        from mercury.services.state_store import StateStore, Position
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        # Create multiple positions
+        for i in range(4):
+            position = Position(
+                position_id=f"queue-filter-{i}",
+                market_id="test-market",
+                strategy="gabagool",
+                side="YES",
+                size=Decimal("10.0"),
+                entry_price=Decimal("0.50"),
+            )
+            await store.queue_for_settlement(position)
+
+        # Mark one as claimed
+        await store.mark_claimed("queue-filter-0", proceeds=Decimal("10.0"))
+
+        # Get unclaimed (default)
+        unclaimed = await store.get_settlement_queue()
+        assert len(unclaimed) == 3
+        assert not any(e.position_id == "queue-filter-0" for e in unclaimed)
+
+        # Get all including claimed
+        all_entries = await store.get_settlement_queue(include_claimed=True)
+        assert len(all_entries) == 4
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_settlement_queue_entry_dataclass(self):
+        """Test SettlementQueueEntry dataclass properties."""
+        from mercury.services.state_store import SettlementQueueEntry
+
+        # Test basic entry
+        entry = SettlementQueueEntry(
+            position_id="test-entry",
+            market_id="test-market",
+            side="YES",
+            size=Decimal("100.0"),
+            entry_price=Decimal("0.45"),
+        )
+
+        assert entry.cost_basis == Decimal("45.0")
+        assert entry.is_failed is False
+
+        # Test with entry_cost
+        entry_with_cost = SettlementQueueEntry(
+            position_id="test-entry-2",
+            market_id="test-market",
+            side="YES",
+            size=Decimal("100.0"),
+            entry_price=Decimal("0.45"),
+            entry_cost=Decimal("50.0"),  # Different from size * entry_price
+        )
+
+        assert entry_with_cost.cost_basis == Decimal("50.0")
+
+        # Test failed entry
+        failed_entry = SettlementQueueEntry(
+            position_id="test-entry-3",
+            market_id="test-market",
+            side="YES",
+            size=Decimal("100.0"),
+            entry_price=Decimal("0.45"),
+            claim_attempts=3,
+            last_claim_error="Network error",
+        )
+
+        assert failed_entry.is_failed is True
+
+        # Test entry with error but claimed (not failed)
+        claimed_with_error = SettlementQueueEntry(
+            position_id="test-entry-4",
+            market_id="test-market",
+            side="YES",
+            size=Decimal("100.0"),
+            entry_price=Decimal("0.45"),
+            claim_attempts=1,
+            last_claim_error="Initial error",
+            claimed=True,
+        )
+
+        assert claimed_with_error.is_failed is False
+
+    @pytest.mark.asyncio
+    async def test_mark_settlement_failed(self, tmp_path):
+        """Test marking a settlement as permanently failed."""
+        from mercury.services.state_store import StateStore, Position
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        position = Position(
+            position_id="mark-failed-test",
+            market_id="test-market",
+            strategy="gabagool",
+            side="YES",
+            size=Decimal("10.0"),
+            entry_price=Decimal("0.50"),
+        )
+        await store.queue_for_settlement(position)
+
+        # Record some failed attempts
+        await store.record_claim_attempt("mark-failed-test", error="Error 1")
+        await store.record_claim_attempt("mark-failed-test", error="Error 2")
+
+        # Mark as permanently failed
+        await store.mark_settlement_failed("mark-failed-test", reason="Market voided")
+
+        # Should no longer be claimable
+        claimable = await store.get_claimable_positions()
+        assert not any(p.position_id == "mark-failed-test" for p in claimable)
+
+        # Check entry status
+        entry = await store.get_settlement_queue_entry("mark-failed-test")
+        assert entry.status == "failed"
+        assert entry.last_claim_error == "Market voided"
+        assert entry.claim_attempts == 2  # Preserved from earlier attempts
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_retry_failed_claim(self, tmp_path):
+        """Test resetting a failed claim for retry."""
+        from mercury.services.state_store import StateStore, Position
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        position = Position(
+            position_id="retry-test",
+            market_id="test-market",
+            strategy="gabagool",
+            side="YES",
+            size=Decimal("10.0"),
+            entry_price=Decimal("0.50"),
+        )
+        await store.queue_for_settlement(position)
+
+        # Record failure and mark as failed
+        await store.record_claim_attempt("retry-test", error="Temporary error")
+        await store.mark_settlement_failed("retry-test", reason="Manual review needed")
+
+        # Not claimable in failed state
+        claimable = await store.get_claimable_positions()
+        assert not any(p.position_id == "retry-test" for p in claimable)
+
+        # Retry
+        success = await store.retry_failed_claim("retry-test")
+        assert success is True
+
+        # Should be claimable again
+        claimable = await store.get_claimable_positions()
+        assert any(p.position_id == "retry-test" for p in claimable)
+
+        # Check entry state
+        entry = await store.get_settlement_queue_entry("retry-test")
+        assert entry.status == "pending"
+        assert entry.last_claim_error is None
+        assert entry.claim_attempts == 1  # Preserved
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_retry_failed_claim_non_failed_entry(self, tmp_path):
+        """Test retry_failed_claim returns False for non-failed entries."""
+        from mercury.services.state_store import StateStore, Position
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        position = Position(
+            position_id="not-failed",
+            market_id="test-market",
+            strategy="gabagool",
+            side="YES",
+            size=Decimal("10.0"),
+            entry_price=Decimal("0.50"),
+        )
+        await store.queue_for_settlement(position)
+
+        # Try to retry a pending (not failed) entry
+        success = await store.retry_failed_claim("not-failed")
+        assert success is False
+
+        # Entry should still be pending
+        entry = await store.get_settlement_queue_entry("not-failed")
+        assert entry.status == "pending"
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_get_settlement_stats(self, tmp_path):
+        """Test getting settlement queue statistics."""
+        from mercury.services.state_store import StateStore, Position
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        # Create positions
+        for i in range(5):
+            position = Position(
+                position_id=f"stats-test-{i}",
+                market_id="test-market",
+                strategy="gabagool",
+                side="YES",
+                size=Decimal("10.0"),
+                entry_price=Decimal("0.50"),  # Cost = 5.0 each
+            )
+            await store.queue_for_settlement(position)
+
+        # Claim 2 positions
+        await store.mark_claimed("stats-test-0", proceeds=Decimal("10.0"), profit=Decimal("5.0"))
+        await store.mark_claimed("stats-test-1", proceeds=Decimal("8.0"), profit=Decimal("3.0"))
+
+        # Get stats
+        stats = await store.get_settlement_stats()
+
+        assert stats["total_positions"] == 5
+        assert stats["claimed_count"] == 2
+        assert stats["unclaimed"] == 3
+        # Unclaimed value: 3 * (10 * 0.50) = 15.0
+        assert stats["unclaimed_value"] == 15.0
+        # Total claim profit: 5.0 + 3.0 = 8.0
+        assert stats["total_claim_profit"] == 8.0
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_settlement_queue_importable(self):
+        """Verify SettlementQueueEntry can be imported."""
+        from mercury.services.state_store import SettlementQueueEntry
+
+        assert SettlementQueueEntry is not None
+
+    @pytest.mark.asyncio
+    async def test_claim_tracking_full_lifecycle(self, tmp_path):
+        """Test full claim tracking lifecycle: queue -> attempt -> fail -> retry -> claim."""
+        from mercury.services.state_store import StateStore, Position
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        position = Position(
+            position_id="lifecycle-claim",
+            market_id="test-market",
+            strategy="gabagool",
+            side="YES",
+            size=Decimal("100.0"),
+            entry_price=Decimal("0.45"),
+        )
+
+        # 1. Queue for settlement
+        await store.queue_for_settlement(
+            position,
+            condition_id="cond-123",
+            token_id="token-abc",
+        )
+
+        entry = await store.get_settlement_queue_entry("lifecycle-claim")
+        assert entry.status == "pending"
+        assert entry.claim_attempts == 0
+
+        # 2. First claim attempt fails
+        await store.record_claim_attempt("lifecycle-claim", error="Network timeout")
+
+        entry = await store.get_settlement_queue_entry("lifecycle-claim")
+        assert entry.claim_attempts == 1
+        assert entry.last_claim_error == "Network timeout"
+
+        # Still in failed claims
+        failed = await store.get_failed_claims()
+        assert any(f.position_id == "lifecycle-claim" for f in failed)
+
+        # Still claimable (under max attempts)
+        claimable = await store.get_claimable_positions(max_attempts=5)
+        assert any(p.position_id == "lifecycle-claim" for p in claimable)
+
+        # 3. More attempts fail
+        await store.record_claim_attempt("lifecycle-claim", error="Contract reverted")
+        await store.record_claim_attempt("lifecycle-claim", error="Still not working")
+
+        entry = await store.get_settlement_queue_entry("lifecycle-claim")
+        assert entry.claim_attempts == 3
+
+        # Now exceeds max_attempts=2
+        claimable = await store.get_claimable_positions(max_attempts=2)
+        assert not any(p.position_id == "lifecycle-claim" for p in claimable)
+
+        # 4. Mark as failed
+        await store.mark_settlement_failed("lifecycle-claim", reason="Giving up after 3 attempts")
+
+        entry = await store.get_settlement_queue_entry("lifecycle-claim")
+        assert entry.status == "failed"
+
+        # Not in failed claims query (status is 'failed' not 'pending')
+        failed = await store.get_failed_claims()
+        # Should still be there since it has attempts and error
+        # Actually, let's check the query logic - failed should include both
+
+        # 5. Retry after investigation
+        await store.retry_failed_claim("lifecycle-claim")
+
+        entry = await store.get_settlement_queue_entry("lifecycle-claim")
+        assert entry.status == "pending"
+        assert entry.last_claim_error is None
+        assert entry.claim_attempts == 3  # Preserved
+
+        # 6. Finally successful claim
+        await store.mark_claimed(
+            "lifecycle-claim",
+            proceeds=Decimal("100.0"),
+            profit=Decimal("55.0"),
+        )
+
+        entry = await store.get_settlement_queue_entry("lifecycle-claim")
+        assert entry.status == "claimed"
+        assert entry.claimed is True
+        assert entry.claim_proceeds == Decimal("100.0")
+        assert entry.claim_profit == Decimal("55.0")
+        assert entry.claimed_at is not None
+
+        # No longer in any pending/failed queries
+        claimable = await store.get_claimable_positions()
+        assert not any(p.position_id == "lifecycle-claim" for p in claimable)
+
+        failed = await store.get_failed_claims()
+        assert not any(f.position_id == "lifecycle-claim" for f in failed)
+
+        await store.close()
+
 
 class TestDailyStats:
     """Test daily statistics operations."""

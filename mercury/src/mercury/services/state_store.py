@@ -497,6 +497,49 @@ class RealizedPnlEntry:
     notes: Optional[str] = None
 
 
+@dataclass
+class SettlementQueueEntry:
+    """An entry in the settlement queue.
+
+    Tracks positions pending settlement and their claim status.
+    """
+
+    position_id: str
+    market_id: str
+    side: str
+    size: Decimal
+    entry_price: Decimal
+    status: str = "pending"  # pending, claimed, failed
+    id: Optional[int] = None
+    condition_id: Optional[str] = None
+    queued_at: Optional[datetime] = None
+    claimed_at: Optional[datetime] = None
+    proceeds: Optional[Decimal] = None
+    trade_id: Optional[str] = None
+    token_id: Optional[str] = None
+    asset: Optional[str] = None
+    shares: Optional[Decimal] = None
+    entry_cost: Optional[Decimal] = None
+    market_end_time: Optional[datetime] = None
+    claimed: bool = False
+    claim_proceeds: Optional[Decimal] = None
+    claim_profit: Optional[Decimal] = None
+    claim_attempts: int = 0
+    last_claim_error: Optional[str] = None
+
+    @property
+    def is_failed(self) -> bool:
+        """Check if this entry has failed claims (attempts > 0 with error)."""
+        return self.claim_attempts > 0 and self.last_claim_error is not None and not self.claimed
+
+    @property
+    def cost_basis(self) -> Decimal:
+        """Get the cost basis (entry_cost or size * entry_price)."""
+        if self.entry_cost is not None:
+            return self.entry_cost
+        return self.size * self.entry_price
+
+
 class ConnectionPool:
     """Simple connection pool for concurrent SQLite access.
 
@@ -1563,6 +1606,216 @@ class StateStore:
         ) as cursor:
             row = await cursor.fetchone()
             return dict(row) if row else {}
+
+    async def get_failed_claims(
+        self,
+        min_attempts: int = 1,
+        limit: int = 100,
+    ) -> list[SettlementQueueEntry]:
+        """Get positions that have failed claim attempts.
+
+        Returns entries that have had at least min_attempts failed attempts
+        and have not yet been successfully claimed.
+
+        Args:
+            min_attempts: Minimum number of failed attempts to include.
+            limit: Maximum number of entries to return.
+
+        Returns:
+            List of SettlementQueueEntry objects for failed claims.
+        """
+        conn = await self._pool.acquire()
+
+        query = """
+            SELECT *
+            FROM settlement_queue
+            WHERE (claimed = 0 OR claimed IS NULL)
+              AND claim_attempts >= ?
+              AND last_claim_error IS NOT NULL
+            ORDER BY claim_attempts DESC, queued_at ASC
+            LIMIT ?
+        """
+
+        entries = []
+        async with conn.execute(query, (min_attempts, limit)) as cursor:
+            async for row in cursor:
+                entries.append(self._row_to_settlement_entry(row))
+
+        self._log.debug(
+            "get_failed_claims",
+            min_attempts=min_attempts,
+            count=len(entries),
+        )
+
+        return entries
+
+    async def get_settlement_queue_entry(
+        self,
+        position_id: str,
+    ) -> Optional[SettlementQueueEntry]:
+        """Get a specific settlement queue entry by position ID.
+
+        Args:
+            position_id: Position ID to look up.
+
+        Returns:
+            SettlementQueueEntry or None if not found.
+        """
+        conn = await self._pool.acquire()
+
+        async with conn.execute(
+            "SELECT * FROM settlement_queue WHERE position_id = ?",
+            (position_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+
+        if row is None:
+            return None
+
+        return self._row_to_settlement_entry(row)
+
+    async def get_settlement_queue(
+        self,
+        status: Optional[str] = None,
+        include_claimed: bool = False,
+        limit: int = 100,
+    ) -> list[SettlementQueueEntry]:
+        """Get settlement queue entries with optional filters.
+
+        Args:
+            status: Filter by status (pending, claimed, failed).
+            include_claimed: Include claimed entries (default False).
+            limit: Maximum entries to return.
+
+        Returns:
+            List of SettlementQueueEntry objects.
+        """
+        conn = await self._pool.acquire()
+
+        query = "SELECT * FROM settlement_queue WHERE 1=1"
+        params: list[Any] = []
+
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+
+        if not include_claimed:
+            query += " AND (claimed = 0 OR claimed IS NULL)"
+
+        query += " ORDER BY queued_at DESC LIMIT ?"
+        params.append(limit)
+
+        entries = []
+        async with conn.execute(query, params) as cursor:
+            async for row in cursor:
+                entries.append(self._row_to_settlement_entry(row))
+
+        return entries
+
+    def _row_to_settlement_entry(self, row: aiosqlite.Row) -> SettlementQueueEntry:
+        """Convert a database row to SettlementQueueEntry."""
+        # Helper to safely get value from row
+        def get_val(key: str, default=None):
+            try:
+                return row[key] if row[key] is not None else default
+            except (KeyError, IndexError):
+                return default
+
+        return SettlementQueueEntry(
+            id=get_val("id"),
+            position_id=row["position_id"],
+            market_id=row["market_id"],
+            condition_id=get_val("condition_id"),
+            side=row["side"],
+            size=Decimal(str(row["size"])),
+            entry_price=Decimal(str(row["entry_price"])),
+            queued_at=row["queued_at"] if isinstance(get_val("queued_at"), datetime) else datetime.fromisoformat(row["queued_at"]) if get_val("queued_at") else None,
+            claimed_at=row["claimed_at"] if isinstance(get_val("claimed_at"), datetime) else datetime.fromisoformat(row["claimed_at"]) if get_val("claimed_at") else None,
+            proceeds=Decimal(str(get_val("proceeds"))) if get_val("proceeds") else None,
+            status=row["status"],
+            trade_id=get_val("trade_id"),
+            token_id=get_val("token_id"),
+            asset=get_val("asset"),
+            shares=Decimal(str(get_val("shares"))) if get_val("shares") else None,
+            entry_cost=Decimal(str(get_val("entry_cost"))) if get_val("entry_cost") else None,
+            market_end_time=row["market_end_time"] if isinstance(get_val("market_end_time"), datetime) else datetime.fromisoformat(row["market_end_time"]) if get_val("market_end_time") else None,
+            claimed=bool(get_val("claimed", False)),
+            claim_proceeds=Decimal(str(get_val("claim_proceeds"))) if get_val("claim_proceeds") else None,
+            claim_profit=Decimal(str(get_val("claim_profit"))) if get_val("claim_profit") else None,
+            claim_attempts=get_val("claim_attempts", 0) or 0,
+            last_claim_error=get_val("last_claim_error"),
+        )
+
+    async def mark_settlement_failed(
+        self,
+        position_id: str,
+        reason: str,
+    ) -> None:
+        """Mark a settlement queue entry as permanently failed.
+
+        This updates the status to 'failed' and records the reason.
+        Failed entries will not be returned by get_claimable_positions.
+
+        Args:
+            position_id: Position ID to mark as failed.
+            reason: Reason for the failure.
+        """
+        conn = await self._pool.acquire()
+        async with self._pool.lock:
+            await conn.execute(
+                """
+                UPDATE settlement_queue
+                SET status = 'failed',
+                    last_claim_error = ?
+                WHERE position_id = ?
+                """,
+                (reason, position_id),
+            )
+            await conn.commit()
+
+        self._log.info(
+            "settlement_marked_failed",
+            position_id=position_id,
+            reason=reason,
+        )
+
+    async def retry_failed_claim(
+        self,
+        position_id: str,
+    ) -> bool:
+        """Reset a failed claim for retry.
+
+        Resets the status back to 'pending' and clears the error,
+        but preserves the attempt count.
+
+        Args:
+            position_id: Position ID to retry.
+
+        Returns:
+            True if entry was found and reset, False otherwise.
+        """
+        conn = await self._pool.acquire()
+        async with self._pool.lock:
+            cursor = await conn.execute(
+                """
+                UPDATE settlement_queue
+                SET status = 'pending',
+                    last_claim_error = NULL
+                WHERE position_id = ?
+                  AND status = 'failed'
+                """,
+                (position_id,),
+            )
+            await conn.commit()
+            updated = cursor.rowcount > 0
+
+        if updated:
+            self._log.info(
+                "settlement_retry_enabled",
+                position_id=position_id,
+            )
+
+        return updated
 
     # ============ Daily Stats ============
 
