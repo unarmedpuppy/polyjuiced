@@ -911,3 +911,413 @@ class TestTradeEventPublishing:
 
         assert event.price == "0.123456"
         assert event.size == "99.99"
+
+
+class TestMultiMarketSubscriptions:
+    """Tests for subscribing to and managing multiple markets simultaneously."""
+
+    @pytest.mark.asyncio
+    async def test_subscribe_multiple_markets_sequentially(self, service):
+        """Test subscribing to multiple markets one at a time."""
+        await service.start()
+
+        await service.subscribe_market("market-1", "yes-1", "no-1")
+        await service.subscribe_market("market-2", "yes-2", "no-2")
+        await service.subscribe_market("market-3", "yes-3", "no-3")
+
+        assert service.market_count == 3
+        assert service.subscribed_markets == {"market-1", "market-2", "market-3"}
+        assert service.connected_tokens == 6  # 2 tokens per market
+
+        await service.stop()
+
+    @pytest.mark.asyncio
+    async def test_subscribe_multiple_markets_concurrent(self, service):
+        """Test subscribing to multiple markets concurrently."""
+        await service.start()
+
+        # Subscribe concurrently
+        await asyncio.gather(
+            service.subscribe_market("market-a", "yes-a", "no-a"),
+            service.subscribe_market("market-b", "yes-b", "no-b"),
+            service.subscribe_market("market-c", "yes-c", "no-c"),
+        )
+
+        assert service.market_count == 3
+        assert service.subscribed_markets == {"market-a", "market-b", "market-c"}
+
+        await service.stop()
+
+    @pytest.mark.asyncio
+    async def test_unsubscribe_subset_of_markets(self, service):
+        """Test unsubscribing from some markets while keeping others."""
+        await service.start()
+
+        # Subscribe to 3 markets
+        await service.subscribe_market("market-1", "yes-1", "no-1")
+        await service.subscribe_market("market-2", "yes-2", "no-2")
+        await service.subscribe_market("market-3", "yes-3", "no-3")
+
+        # Unsubscribe from one
+        await service.unsubscribe_market("market-2")
+
+        assert service.market_count == 2
+        assert service.subscribed_markets == {"market-1", "market-3"}
+        assert service.connected_tokens == 4
+
+        await service.stop()
+
+    @pytest.mark.asyncio
+    async def test_price_updates_routed_to_correct_market(self, service):
+        """Test that price updates are routed to the correct market."""
+        await service.start()
+
+        await service.subscribe_market("market-1", "yes-token-1", "no-token-1")
+        await service.subscribe_market("market-2", "yes-token-2", "no-token-2")
+
+        # Update market 1
+        await service._on_price_update("yes-token-1", {"bid": "0.45", "ask": "0.55"})
+
+        # Update market 2
+        await service._on_price_update("yes-token-2", {"bid": "0.35", "ask": "0.65"})
+
+        # Verify correct prices
+        book1 = service.get_market_order_book("market-1")
+        book2 = service.get_market_order_book("market-2")
+
+        assert book1.yes_best_bid == Decimal("0.45")
+        assert book2.yes_best_bid == Decimal("0.35")
+
+        await service.stop()
+
+    @pytest.mark.asyncio
+    async def test_independent_staleness_per_market(self, service):
+        """Test that staleness is tracked independently for each market."""
+        await service.start()
+
+        await service.subscribe_market("fresh-market", "yes-fresh", "no-fresh")
+        await service.subscribe_market("stale-market", "yes-stale", "no-stale")
+
+        # Update fresh market
+        service._last_update["fresh-market"] = time.time()
+
+        # Make stale market old
+        service._last_update["stale-market"] = time.time() - 100
+        service._stale_threshold = Decimal("10.0")
+
+        assert not service.is_market_stale("fresh-market")
+        assert service.is_market_stale("stale-market")
+
+        stale_set = service.get_stale_markets()
+        assert stale_set == {"stale-market"}
+
+        await service.stop()
+
+    @pytest.mark.asyncio
+    async def test_book_updates_different_tokens_same_market(self, service):
+        """Test that YES and NO book updates for same market work correctly."""
+        await service.start()
+        await service.subscribe_market("test-market", "yes-token", "no-token")
+
+        # Update YES side
+        await service._on_book_update("yes-token", {
+            "bids": [{"price": "0.45", "size": "100"}],
+            "asks": [{"price": "0.55", "size": "100"}],
+        })
+
+        # Update NO side
+        await service._on_book_update("no-token", {
+            "bids": [{"price": "0.40", "size": "200"}],
+            "asks": [{"price": "0.60", "size": "200"}],
+        })
+
+        market_book = service.get_market_order_book("test-market")
+
+        assert market_book.yes_best_bid == Decimal("0.45")
+        assert market_book.yes_best_ask == Decimal("0.55")
+        assert market_book.no_best_bid == Decimal("0.40")
+        assert market_book.no_best_ask == Decimal("0.60")
+
+        await service.stop()
+
+
+class TestOrderBookIncrementalUpdates:
+    """Tests for incremental order book updates."""
+
+    @pytest.mark.asyncio
+    async def test_incremental_bid_updates(self, service):
+        """Test that incremental bid updates accumulate correctly."""
+        await service.start()
+        await service.subscribe_market("test-market", "yes-token", "no-token")
+
+        # First update: add a bid
+        await service._on_price_update("yes-token", {"bid": "0.45", "ask": "0.55"})
+
+        # Second update: better bid
+        await service._on_price_update("yes-token", {"bid": "0.46"})
+
+        market_book = service.get_market_order_book("test-market")
+        assert market_book.yes_best_bid == Decimal("0.46")
+
+        await service.stop()
+
+    @pytest.mark.asyncio
+    async def test_full_snapshot_replaces_book(self, service):
+        """Test that a full book snapshot replaces existing data."""
+        await service.start()
+        await service.subscribe_market("test-market", "yes-token", "no-token")
+
+        # Initial update
+        await service._on_price_update("yes-token", {"bid": "0.45", "ask": "0.55"})
+
+        # Full snapshot (should replace)
+        await service._on_book_update("yes-token", {
+            "bids": [
+                {"price": "0.48", "size": "500"},
+                {"price": "0.47", "size": "300"},
+            ],
+            "asks": [
+                {"price": "0.52", "size": "400"},
+                {"price": "0.53", "size": "200"},
+            ],
+        })
+
+        market_book = service.get_market_order_book("test-market")
+        assert market_book.yes_best_bid == Decimal("0.48")
+        assert market_book.yes_best_ask == Decimal("0.52")
+
+        # Check depth
+        depth = market_book.yes_book.bid_depth(5)
+        assert len(depth) == 2
+        assert depth[0].price == Decimal("0.48")
+        assert depth[1].price == Decimal("0.47")
+
+        await service.stop()
+
+    @pytest.mark.asyncio
+    async def test_update_timestamps_tracked(self, service):
+        """Test that update timestamps are correctly tracked."""
+        await service.start()
+        await service.subscribe_market("test-market", "yes-token", "no-token")
+
+        before_update = time.time()
+        await service._on_price_update("yes-token", {"bid": "0.45", "ask": "0.55"})
+        after_update = time.time()
+
+        age = service.get_market_age("test-market")
+        assert age is not None
+        assert 0 <= age <= (after_update - before_update + 0.1)
+
+        await service.stop()
+
+
+class TestEventPublishingPayloads:
+    """Tests for event publishing with correct payload structure."""
+
+    @pytest.mark.asyncio
+    async def test_orderbook_snapshot_event_includes_sizes(self, service, mock_event_bus):
+        """Test that OrderBookSnapshotEvent includes size information."""
+        await service.start()
+        await service.subscribe_market("test-market", "yes-token", "no-token")
+
+        # Populate order book with full depth
+        await service._on_book_update("yes-token", {
+            "bids": [{"price": "0.45", "size": "150"}],
+            "asks": [{"price": "0.55", "size": "200"}],
+        })
+        await service._on_book_update("no-token", {
+            "bids": [{"price": "0.40", "size": "100"}],
+            "asks": [{"price": "0.60", "size": "250"}],
+        })
+
+        # Find orderbook publish calls
+        orderbook_calls = [
+            call for call in mock_event_bus.publish.call_args_list
+            if "market.orderbook" in call[0][0]
+        ]
+        assert len(orderbook_calls) > 0
+
+        # Check the most recent orderbook event
+        last_call = orderbook_calls[-1]
+        event = last_call[0][1]  # The event dataclass
+
+        assert event.market_id == "test-market"
+        assert event.yes_best_bid is not None
+        assert event.yes_best_ask is not None
+        assert event.timestamp is not None
+
+        await service.stop()
+
+    @pytest.mark.asyncio
+    async def test_stale_event_published_with_full_context(self, service, mock_event_bus):
+        """Test that StaleAlert includes all required context."""
+        service._markets["test-market"] = MarketState(
+            market_id="test-market",
+            yes_token_id="yes",
+            no_token_id="no",
+        )
+        last_update_time = time.time() - 100
+        service._last_update["test-market"] = last_update_time
+        service._stale_threshold = Decimal("10.0")
+
+        await service._check_staleness()
+
+        stale_calls = [
+            call for call in mock_event_bus.publish.call_args_list
+            if "market.stale" in call[0][0]
+        ]
+        assert len(stale_calls) == 1
+
+        event = stale_calls[0][0][1]  # StaleAlert dataclass
+        assert event.market_id == "test-market"
+        assert event.threshold_seconds == 10.0
+        assert event.age_seconds > 90  # Should be > 90 seconds
+        assert event.last_update_timestamp is not None
+
+    @pytest.mark.asyncio
+    async def test_fresh_event_on_recovery(self, service, mock_event_bus):
+        """Test FreshAlert is published when market recovers from stale."""
+        # Set up market as already marked stale
+        state = MarketState(
+            market_id="test-market",
+            yes_token_id="yes",
+            no_token_id="no",
+            is_marked_stale=True,
+        )
+        service._markets["test-market"] = state
+        service._last_update["test-market"] = time.time()  # Now fresh
+        service._stale_threshold = Decimal("10.0")
+
+        await service._check_staleness()
+
+        fresh_calls = [
+            call for call in mock_event_bus.publish.call_args_list
+            if "market.fresh" in call[0][0]
+        ]
+        assert len(fresh_calls) == 1
+
+        event = fresh_calls[0][0][1]  # FreshAlert dataclass
+        assert event.market_id == "test-market"
+        assert event.age_seconds < 10.0
+
+
+class TestMockWebSocketIntegration:
+    """Tests for MarketDataService with mock WebSocket scenarios."""
+
+    @pytest.mark.asyncio
+    async def test_websocket_price_change_flows_to_order_book(
+        self, mock_config, mock_event_bus
+    ):
+        """Test that WebSocket price changes update the order book."""
+        # Create service with mock WebSocket
+        mock_ws = MagicMock()
+        mock_ws.start = AsyncMock()
+        mock_ws.stop = AsyncMock()
+        mock_ws.subscribe = AsyncMock()
+        mock_ws.unsubscribe = AsyncMock()
+        mock_ws.health_check = AsyncMock(return_value=MagicMock(
+            status=MagicMock(value="healthy")
+        ))
+
+        from mercury.services.market_data import MarketDataService
+        service = MarketDataService(
+            config=mock_config,
+            event_bus=mock_event_bus,
+            websocket=mock_ws,
+        )
+
+        await service.start()
+        await service.subscribe_market("ws-market", "ws-yes", "ws-no")
+
+        # Simulate WebSocket price update
+        await service._on_price_update("ws-yes", {
+            "bid": "0.47",
+            "ask": "0.53",
+        })
+
+        # Verify order book updated
+        prices = service.get_best_prices("ws-market")
+        assert prices == (Decimal("0.47"), Decimal("0.53"))
+
+        await service.stop()
+
+    @pytest.mark.asyncio
+    async def test_websocket_book_snapshot_updates_depth(
+        self, mock_config, mock_event_bus
+    ):
+        """Test that WebSocket book snapshots update full depth."""
+        mock_ws = MagicMock()
+        mock_ws.start = AsyncMock()
+        mock_ws.stop = AsyncMock()
+        mock_ws.subscribe = AsyncMock()
+        mock_ws.unsubscribe = AsyncMock()
+        mock_ws.health_check = AsyncMock(return_value=MagicMock(
+            status=MagicMock(value="healthy")
+        ))
+
+        from mercury.services.market_data import MarketDataService
+        service = MarketDataService(
+            config=mock_config,
+            event_bus=mock_event_bus,
+            websocket=mock_ws,
+        )
+
+        await service.start()
+        await service.subscribe_market("depth-market", "depth-yes", "depth-no")
+
+        # Simulate full book snapshot
+        await service._on_book_update("depth-yes", {
+            "bids": [
+                {"price": "0.50", "size": "1000"},
+                {"price": "0.49", "size": "2000"},
+                {"price": "0.48", "size": "3000"},
+            ],
+            "asks": [
+                {"price": "0.51", "size": "1000"},
+                {"price": "0.52", "size": "2000"},
+                {"price": "0.53", "size": "3000"},
+            ],
+        })
+
+        depth = service.get_depth("depth-market", levels=5)
+        assert depth is not None
+        assert len(depth["yes_bids"]) == 3
+        assert len(depth["yes_asks"]) == 3
+        assert depth["yes_bids"][0]["price"] == "0.50"
+        assert depth["yes_asks"][0]["price"] == "0.51"
+
+        await service.stop()
+
+    @pytest.mark.asyncio
+    async def test_subscribe_request_via_event_bus(
+        self, mock_config, mock_event_bus
+    ):
+        """Test subscribing to market via EventBus system.market.subscribe."""
+        mock_ws = MagicMock()
+        mock_ws.start = AsyncMock()
+        mock_ws.stop = AsyncMock()
+        mock_ws.subscribe = AsyncMock()
+        mock_ws.unsubscribe = AsyncMock()
+        mock_ws.health_check = AsyncMock(return_value=MagicMock(
+            status=MagicMock(value="healthy")
+        ))
+
+        from mercury.services.market_data import MarketDataService
+        service = MarketDataService(
+            config=mock_config,
+            event_bus=mock_event_bus,
+            websocket=mock_ws,
+        )
+
+        await service.start()
+
+        # Simulate subscribe request via EventBus
+        await service._on_subscribe_request({
+            "market_id": "eventbus-market",
+            "yes_token_id": "eb-yes",
+            "no_token_id": "eb-no",
+        })
+
+        assert "eventbus-market" in service.subscribed_markets
+
+        await service.stop()
