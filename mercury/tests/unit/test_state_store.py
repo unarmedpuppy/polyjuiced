@@ -2688,3 +2688,638 @@ class TestConcurrency:
         assert all(r.trade_id == "read-test-trade" for r in results)
 
         await store.close()
+
+
+class TestPendingTrades:
+    """Test pending trade operations."""
+
+    @pytest.mark.asyncio
+    async def test_get_pending_trades_empty(self, tmp_path):
+        """Test get_pending_trades returns empty list when no pending trades."""
+        from mercury.services.state_store import StateStore
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        pending = await store.get_pending_trades()
+        assert pending == []
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_get_pending_trades_filters_correctly(self, tmp_path):
+        """Test get_pending_trades returns only pending status trades."""
+        from mercury.services.state_store import StateStore, Trade
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        # Create trades with different statuses
+        trades = [
+            Trade(
+                trade_id="pending-1",
+                market_id="market-1",
+                strategy="gabagool",
+                side="YES",
+                size=Decimal("10.0"),
+                price=Decimal("0.50"),
+                cost=Decimal("5.0"),
+                status="pending",
+            ),
+            Trade(
+                trade_id="pending-2",
+                market_id="market-1",
+                strategy="gabagool",
+                side="YES",
+                size=Decimal("10.0"),
+                price=Decimal("0.50"),
+                cost=Decimal("5.0"),
+                status="pending",
+            ),
+            Trade(
+                trade_id="open-1",
+                market_id="market-1",
+                strategy="gabagool",
+                side="YES",
+                size=Decimal("10.0"),
+                price=Decimal("0.50"),
+                cost=Decimal("5.0"),
+                status="open",
+            ),
+            Trade(
+                trade_id="resolved-1",
+                market_id="market-1",
+                strategy="gabagool",
+                side="YES",
+                size=Decimal("10.0"),
+                price=Decimal("0.50"),
+                cost=Decimal("5.0"),
+                status="resolved",
+            ),
+        ]
+
+        for trade in trades:
+            await store.save_trade(trade)
+
+        pending = await store.get_pending_trades()
+
+        assert len(pending) == 2
+        assert all(t.status == "pending" for t in pending)
+        assert {t.trade_id for t in pending} == {"pending-1", "pending-2"}
+
+        await store.close()
+
+
+class TestTodayRealizedPnl:
+    """Test today's realized P&L operations."""
+
+    @pytest.mark.asyncio
+    async def test_get_today_realized_pnl_empty(self, tmp_path):
+        """Test get_today_realized_pnl returns zero when no P&L recorded."""
+        from mercury.services.state_store import StateStore
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        pnl = await store.get_today_realized_pnl()
+        assert pnl == Decimal("0")
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_get_today_realized_pnl_sums_correctly(self, tmp_path):
+        """Test get_today_realized_pnl sums all today's P&L entries."""
+        from mercury.services.state_store import StateStore
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        # Record P&L entries for today
+        await store.record_realized_pnl("trade-today-1", Decimal("10.0"), "resolution", Decimal("1000.0"))
+        await store.record_realized_pnl("trade-today-2", Decimal("-3.0"), "settlement", Decimal("1000.0"))
+        await store.record_realized_pnl("trade-today-3", Decimal("7.5"), "rebalance", Decimal("1000.0"))
+
+        pnl = await store.get_today_realized_pnl()
+        # The circuit breaker state tracks cumulative P&L
+        # get_today_realized_pnl returns the circuit breaker's realized_pnl
+        assert pnl == Decimal("14.5")  # 10 - 3 + 7.5
+
+        await store.close()
+
+
+class TestSchemaVersion:
+    """Test schema version operations."""
+
+    @pytest.mark.asyncio
+    async def test_get_schema_version_returns_current(self, tmp_path):
+        """Test get_schema_version returns the current schema version."""
+        from mercury.services.state_store import StateStore, SCHEMA_VERSION
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        version = await store.get_schema_version()
+        assert version == SCHEMA_VERSION
+
+        await store.close()
+
+
+class TestEventHandlers:
+    """Test event handler methods."""
+
+    @pytest.mark.asyncio
+    async def test_on_order_filled_saves_fill(self, tmp_path):
+        """Test _on_order_filled creates a fill record."""
+        from mercury.services.state_store import StateStore, Trade
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        # Create a trade first
+        trade = Trade(
+            trade_id="event-trade-1",
+            market_id="market-1",
+            strategy="gabagool",
+            side="YES",
+            size=Decimal("10.0"),
+            price=Decimal("0.50"),
+            cost=Decimal("5.0"),
+        )
+        await store.save_trade(trade)
+
+        # Simulate order filled event - must include fill_id for handler to save
+        event_data = {
+            "fill_id": "fill-event-1",  # Required for handler to save fill
+            "trade_id": "event-trade-1",
+            "order_id": "order-123",
+            "token_id": "token-abc",
+            "side": "BUY",
+            "size": 5.0,
+            "price": 0.51,
+            "fee": 0.01,
+        }
+        await store._on_order_filled(event_data)
+
+        # Verify fill was saved
+        conn = await store._pool.acquire()
+        async with conn.execute("SELECT COUNT(*) FROM fills WHERE trade_id = ?", ("event-trade-1",)) as cursor:
+            row = await cursor.fetchone()
+            assert row[0] == 1
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_on_order_filled_ignores_without_fill_id(self, tmp_path):
+        """Test _on_order_filled ignores events without fill_id."""
+        from mercury.services.state_store import StateStore, Trade
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        # Create a trade first
+        trade = Trade(
+            trade_id="event-trade-2",
+            market_id="market-1",
+            strategy="gabagool",
+            side="YES",
+            size=Decimal("10.0"),
+            price=Decimal("0.50"),
+            cost=Decimal("5.0"),
+        )
+        await store.save_trade(trade)
+
+        # Simulate order filled event without fill_id - should be ignored
+        event_data = {
+            "trade_id": "event-trade-2",
+            "order_id": "order-123",
+            "token_id": "token-abc",
+            "side": "BUY",
+            "size": 5.0,
+            "price": 0.51,
+            "fee": 0.01,
+        }
+        await store._on_order_filled(event_data)
+
+        # Verify no fill was saved
+        conn = await store._pool.acquire()
+        async with conn.execute("SELECT COUNT(*) FROM fills WHERE trade_id = ?", ("event-trade-2",)) as cursor:
+            row = await cursor.fetchone()
+            assert row[0] == 0
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_on_position_opened_increments_stats(self, tmp_path):
+        """Test _on_position_opened increments daily stats."""
+        from mercury.services.state_store import StateStore
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        # Get initial stats
+        initial = await store.get_daily_stats()
+
+        # Simulate position opened event
+        event_data = {"position_id": "pos-1", "market_id": "market-1"}
+        await store._on_position_opened(event_data)
+
+        # Verify stats incremented
+        updated = await store.get_daily_stats()
+        assert updated.positions_opened == initial.positions_opened + 1
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_on_position_closed_increments_stats(self, tmp_path):
+        """Test _on_position_closed increments daily stats."""
+        from mercury.services.state_store import StateStore
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        # Get initial stats
+        initial = await store.get_daily_stats()
+
+        # Simulate position closed event
+        event_data = {"position_id": "pos-1", "market_id": "market-1"}
+        await store._on_position_closed(event_data)
+
+        # Verify stats incremented
+        updated = await store.get_daily_stats()
+        assert updated.positions_closed == initial.positions_closed + 1
+
+        await store.close()
+
+
+class TestTradeUpsert:
+    """Test trade upsert (update existing) behavior."""
+
+    @pytest.mark.asyncio
+    async def test_save_trade_updates_existing(self, tmp_path):
+        """Test save_trade updates an existing trade with same ID."""
+        from mercury.services.state_store import StateStore, Trade
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        # Save initial trade
+        trade = Trade(
+            trade_id="upsert-trade-1",
+            market_id="market-1",
+            strategy="gabagool",
+            side="YES",
+            size=Decimal("10.0"),
+            price=Decimal("0.50"),
+            cost=Decimal("5.0"),
+            status="open",
+        )
+        await store.save_trade(trade)
+
+        # Update with new values
+        updated_trade = Trade(
+            trade_id="upsert-trade-1",
+            market_id="market-1",
+            strategy="gabagool",
+            side="YES",
+            size=Decimal("15.0"),  # Changed
+            price=Decimal("0.55"),  # Changed
+            cost=Decimal("8.25"),   # Changed
+            status="filled",        # Changed
+            filled_size=Decimal("15.0"),
+            avg_fill_price=Decimal("0.55"),
+        )
+        await store.save_trade(updated_trade)
+
+        # Verify only one trade exists with updated values
+        all_trades = await store.get_trades()
+        assert len(all_trades) == 1
+
+        retrieved = await store.get_trade("upsert-trade-1")
+        assert retrieved.size == Decimal("15.0")
+        assert retrieved.price == Decimal("0.55")
+        assert retrieved.status == "filled"
+        assert retrieved.filled_size == Decimal("15.0")
+
+        await store.close()
+
+
+class TestClaimablePositionsTimeFilter:
+    """Test claimable positions time filtering."""
+
+    @pytest.mark.asyncio
+    async def test_claimable_positions_max_attempts_filter(self, tmp_path):
+        """Test get_claimable_positions filters by max claim attempts."""
+        from mercury.services.state_store import StateStore, Position
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        # Create positions
+        position1 = Position(
+            position_id="attempts-filter-1",
+            market_id="market-1",
+            strategy="gabagool",
+            side="YES",
+            size=Decimal("10.0"),
+            entry_price=Decimal("0.50"),
+        )
+        position2 = Position(
+            position_id="attempts-filter-2",
+            market_id="market-2",
+            strategy="gabagool",
+            side="YES",
+            size=Decimal("10.0"),
+            entry_price=Decimal("0.50"),
+        )
+
+        await store.queue_for_settlement(position1)
+        await store.queue_for_settlement(position2)
+
+        # Record multiple attempts for position1
+        await store.record_claim_attempt("attempts-filter-1", error="Error 1")
+        await store.record_claim_attempt("attempts-filter-1", error="Error 2")
+        await store.record_claim_attempt("attempts-filter-1", error="Error 3")
+
+        # Record one attempt for position2
+        await store.record_claim_attempt("attempts-filter-2", error="Error 1")
+
+        # With max_attempts=2, only position2 should be claimable (has 1 attempt)
+        claimable = await store.get_claimable_positions(max_attempts=2)
+        assert len(claimable) == 1
+        assert claimable[0].position_id == "attempts-filter-2"
+
+        # With max_attempts=5, both should be claimable
+        all_claimable = await store.get_claimable_positions(max_attempts=5)
+        assert len(all_claimable) == 2
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_claimable_positions_null_market_end_time(self, tmp_path):
+        """Test positions without market_end_time are always claimable."""
+        from mercury.services.state_store import StateStore, Position
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        position = Position(
+            position_id="no-end-time",
+            market_id="market-1",
+            strategy="gabagool",
+            side="YES",
+            size=Decimal("10.0"),
+            entry_price=Decimal("0.50"),
+        )
+
+        # Queue without market_end_time
+        await store.queue_for_settlement(position)
+
+        # Should be claimable even with time filter
+        claimable = await store.get_claimable_positions(
+            min_time_since_end_seconds=999999  # Very long wait
+        )
+
+        assert len(claimable) == 1
+        assert claimable[0].position_id == "no-end-time"
+
+        await store.close()
+
+
+class TestDailyStatsDateRange:
+    """Test daily stats with different dates."""
+
+    @pytest.mark.asyncio
+    async def test_get_daily_stats_specific_date(self, tmp_path):
+        """Test get_daily_stats retrieves stats for a specific date."""
+        from mercury.services.state_store import StateStore, DailyStats
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        # Create stats for different dates
+        yesterday = date.today() - timedelta(days=1)
+        today = date.today()
+
+        yesterday_stats = DailyStats(
+            date=yesterday,
+            trade_count=5,
+            volume_usd=Decimal("100.0"),
+            realized_pnl=Decimal("10.0"),
+        )
+        today_stats = DailyStats(
+            date=today,
+            trade_count=10,
+            volume_usd=Decimal("200.0"),
+            realized_pnl=Decimal("20.0"),
+        )
+
+        await store.update_daily_stats(yesterday_stats)
+        await store.update_daily_stats(today_stats)
+
+        # Retrieve specific dates
+        retrieved_yesterday = await store.get_daily_stats(yesterday)
+        assert retrieved_yesterday.trade_count == 5
+        assert retrieved_yesterday.volume_usd == Decimal("100.0")
+
+        retrieved_today = await store.get_daily_stats(today)
+        assert retrieved_today.trade_count == 10
+        assert retrieved_today.volume_usd == Decimal("200.0")
+
+        # Default (no date) should return today
+        retrieved_default = await store.get_daily_stats()
+        assert retrieved_default.trade_count == 10
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_increment_daily_stats_creates_if_missing(self, tmp_path):
+        """Test increment_daily_stats creates stats entry if not exists."""
+        from mercury.services.state_store import StateStore
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        future_date = date.today() + timedelta(days=30)
+
+        # Increment on a date with no stats
+        await store.increment_daily_stats(
+            for_date=future_date,
+            trades=3,
+            volume=Decimal("50.0"),
+        )
+
+        # Should have created stats entry
+        stats = await store.get_daily_stats(future_date)
+        assert stats.trade_count == 3
+        assert stats.volume_usd == Decimal("50.0")
+
+        await store.close()
+
+
+class TestInMemorySQLite:
+    """Test StateStore with in-memory SQLite for fast tests."""
+
+    @pytest.mark.asyncio
+    async def test_in_memory_database(self, tmp_path):
+        """Test StateStore works with in-memory database."""
+        from mercury.services.state_store import StateStore, Trade
+
+        # Use :memory: for in-memory database
+        store = StateStore(db_path=":memory:")
+        await store.connect()
+
+        assert store.is_connected
+
+        # Basic operations should work
+        trade = Trade(
+            trade_id="mem-trade-1",
+            market_id="market-1",
+            strategy="gabagool",
+            side="YES",
+            size=Decimal("10.0"),
+            price=Decimal("0.50"),
+            cost=Decimal("5.0"),
+        )
+        await store.save_trade(trade)
+
+        retrieved = await store.get_trade("mem-trade-1")
+        assert retrieved is not None
+        assert retrieved.trade_id == "mem-trade-1"
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_in_memory_isolation(self):
+        """Test each in-memory database is isolated."""
+        from mercury.services.state_store import StateStore, Trade
+
+        # Create two in-memory stores
+        store1 = StateStore(db_path=":memory:")
+        store2 = StateStore(db_path=":memory:")
+
+        await store1.connect()
+        await store2.connect()
+
+        # Add trade to store1
+        trade = Trade(
+            trade_id="isolation-trade",
+            market_id="market-1",
+            strategy="gabagool",
+            side="YES",
+            size=Decimal("10.0"),
+            price=Decimal("0.50"),
+            cost=Decimal("5.0"),
+        )
+        await store1.save_trade(trade)
+
+        # Should exist in store1
+        retrieved1 = await store1.get_trade("isolation-trade")
+        assert retrieved1 is not None
+
+        # Should NOT exist in store2
+        retrieved2 = await store2.get_trade("isolation-trade")
+        assert retrieved2 is None
+
+        await store1.close()
+        await store2.close()
+
+
+class TestTradeTimestampFiltering:
+    """Test trade retrieval with timestamp filtering."""
+
+    @pytest.mark.asyncio
+    async def test_get_trades_since_timestamp(self, tmp_path):
+        """Test get_trades filters by timestamp."""
+        from mercury.services.state_store import StateStore, Trade
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        now = datetime.now(timezone.utc)
+
+        # Create trades at different times
+        old_trade = Trade(
+            trade_id="old-trade",
+            market_id="market-1",
+            strategy="gabagool",
+            side="YES",
+            size=Decimal("10.0"),
+            price=Decimal("0.50"),
+            cost=Decimal("5.0"),
+            timestamp=now - timedelta(hours=2),
+        )
+        recent_trade = Trade(
+            trade_id="recent-trade",
+            market_id="market-1",
+            strategy="gabagool",
+            side="YES",
+            size=Decimal("10.0"),
+            price=Decimal("0.50"),
+            cost=Decimal("5.0"),
+            timestamp=now - timedelta(minutes=30),
+        )
+
+        await store.save_trade(old_trade)
+        await store.save_trade(recent_trade)
+
+        # Get trades since 1 hour ago
+        since = now - timedelta(hours=1)
+        recent_trades = await store.get_trades(since=since)
+
+        assert len(recent_trades) == 1
+        assert recent_trades[0].trade_id == "recent-trade"
+
+        # Get all trades
+        all_trades = await store.get_trades()
+        assert len(all_trades) == 2
+
+        await store.close()
+
+
+class TestMigrationRunner:
+    """Test migration runner functionality."""
+
+    @pytest.mark.asyncio
+    async def test_migration_runner_get_current_version(self, tmp_path):
+        """Test MigrationRunner.get_current_version."""
+        from mercury.services.state_store import StateStore
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        version = await store._migration_runner.get_current_version()
+        assert version >= 1  # Should have at least base schema
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_migration_runner_run_migrations_idempotent(self, tmp_path):
+        """Test run_migrations is idempotent (running twice doesn't fail)."""
+        from mercury.services.state_store import StateStore
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        # Run migrations again (should be no-op)
+        applied = await store._migration_runner.run_migrations()
+        # Should return empty list since all migrations already applied
+        assert applied == []
+
+        await store.close()
