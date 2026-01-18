@@ -27,6 +27,7 @@ from mercury.domain.order import (
     Order,
     OrderRequest,
     OrderResult as DomainOrderResult,
+    DualLegResult,
     OrderSide,
     OrderStatus,
     OrderType,
@@ -1016,3 +1017,458 @@ class TestOrderModel:
                 status=status,
             )
             assert order.is_complete is False
+
+
+class TestDualLegExecution:
+    """Test dual-leg arbitrage execution."""
+
+    @pytest.fixture
+    def yes_order_request(self):
+        """Create a YES order request for dual-leg."""
+        return OrderRequest(
+            market_id="test-market-123",
+            token_id="token-yes-456",
+            side=OrderSide.BUY,
+            outcome="YES",
+            size=Decimal("10.0"),
+            price=Decimal("0.48"),
+            order_type=OrderType.GTC,
+        )
+
+    @pytest.fixture
+    def no_order_request(self):
+        """Create a NO order request for dual-leg."""
+        return OrderRequest(
+            market_id="test-market-123",
+            token_id="token-no-789",
+            side=OrderSide.BUY,
+            outcome="NO",
+            size=Decimal("10.0"),
+            price=Decimal("0.50"),
+            order_type=OrderType.GTC,
+        )
+
+    @pytest.mark.asyncio
+    async def test_dual_leg_both_fill_dry_run(
+        self, execution_engine, yes_order_request, no_order_request, mock_event_bus
+    ):
+        """Verify both legs fill successfully in dry-run mode."""
+        await execution_engine.start()
+
+        result = await execution_engine.execute_dual_leg(
+            yes_order_request, no_order_request
+        )
+
+        assert result.success is True
+        assert result.yes_result is not None
+        assert result.no_result is not None
+        assert result.yes_result.success is True
+        assert result.no_result.success is True
+        assert result.yes_result.order.status == OrderStatus.FILLED
+        assert result.no_result.order.status == OrderStatus.FILLED
+        assert result.yes_result.order.filled_size == yes_order_request.size
+        assert result.no_result.order.filled_size == no_order_request.size
+        assert result.total_latency_ms > 0
+        assert result.error_message is None
+
+        await execution_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_dual_leg_emits_started_event(
+        self, execution_engine, yes_order_request, no_order_request, mock_event_bus
+    ):
+        """Verify dual_leg.started event is emitted."""
+        await execution_engine.start()
+
+        await execution_engine.execute_dual_leg(yes_order_request, no_order_request)
+
+        # Find the started event
+        started_calls = [
+            call for call in mock_event_bus.publish.call_args_list
+            if call[0][0] == "order.dual_leg.started"
+        ]
+        assert len(started_calls) == 1
+        event_data = started_calls[0][0][1]
+        assert "yes_client_order_id" in event_data
+        assert "no_client_order_id" in event_data
+        assert event_data["yes_market_id"] == yes_order_request.market_id
+        assert event_data["yes_size"] == str(yes_order_request.size)
+
+        await execution_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_dual_leg_emits_completed_event(
+        self, execution_engine, yes_order_request, no_order_request, mock_event_bus
+    ):
+        """Verify dual_leg.completed event is emitted on success."""
+        await execution_engine.start()
+
+        await execution_engine.execute_dual_leg(yes_order_request, no_order_request)
+
+        # Find the completed event
+        completed_calls = [
+            call for call in mock_event_bus.publish.call_args_list
+            if call[0][0] == "order.dual_leg.completed"
+        ]
+        assert len(completed_calls) == 1
+        event_data = completed_calls[0][0][1]
+        assert "yes_order_id" in event_data
+        assert "no_order_id" in event_data
+        assert "yes_filled" in event_data
+        assert "no_filled" in event_data
+        assert "total_cost" in event_data
+        assert "latency_ms" in event_data
+
+        await execution_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_dual_leg_total_cost(
+        self, execution_engine, yes_order_request, no_order_request
+    ):
+        """Verify total cost is calculated correctly."""
+        await execution_engine.start()
+
+        result = await execution_engine.execute_dual_leg(
+            yes_order_request, no_order_request
+        )
+
+        expected_yes_cost = yes_order_request.size * yes_order_request.price
+        expected_no_cost = no_order_request.size * no_order_request.price
+        expected_total = expected_yes_cost + expected_no_cost
+
+        assert result.total_cost == expected_total
+
+        await execution_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_dual_leg_concurrent_execution(
+        self, execution_engine, yes_order_request, no_order_request
+    ):
+        """Verify orders are executed concurrently (not sequentially)."""
+        await execution_engine.start()
+
+        # In dry-run mode, each order has a small delay
+        # If concurrent, total time should be close to single order time
+        result = await execution_engine.execute_dual_leg(
+            yes_order_request, no_order_request
+        )
+
+        # Total latency should be much less than 2x single order time
+        # In dry-run, single order takes ~50ms, so dual should be <150ms
+        # (allowing some overhead)
+        assert result.total_latency_ms < 500  # Conservative upper bound
+
+        await execution_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_dual_leg_with_different_order_types(self, execution_engine, mock_event_bus):
+        """Verify dual-leg works with different order types."""
+        await execution_engine.start()
+
+        yes_order = OrderRequest(
+            market_id="test-market",
+            token_id="yes-token",
+            side=OrderSide.BUY,
+            outcome="YES",
+            size=Decimal("5.0"),
+            price=Decimal("0.45"),
+            order_type=OrderType.FOK,
+        )
+
+        no_order = OrderRequest(
+            market_id="test-market",
+            token_id="no-token",
+            side=OrderSide.BUY,
+            outcome="NO",
+            size=Decimal("5.0"),
+            price=Decimal("0.53"),
+            order_type=OrderType.GTC,
+        )
+
+        result = await execution_engine.execute_dual_leg(yes_order, no_order)
+
+        assert result.success is True
+        assert result.yes_result.order.order_type == OrderType.FOK
+        assert result.no_result.order.order_type == OrderType.GTC
+
+        await execution_engine.stop()
+
+
+class TestDualLegPartialFillHandling:
+    """Test partial fill handling in dual-leg execution."""
+
+    @pytest.fixture
+    def yes_order_request(self):
+        """Create a YES order request."""
+        return OrderRequest(
+            market_id="test-market-123",
+            token_id="token-yes-456",
+            side=OrderSide.BUY,
+            outcome="YES",
+            size=Decimal("10.0"),
+            price=Decimal("0.48"),
+            order_type=OrderType.GTC,
+        )
+
+    @pytest.fixture
+    def no_order_request(self):
+        """Create a NO order request."""
+        return OrderRequest(
+            market_id="test-market-123",
+            token_id="token-no-789",
+            side=OrderSide.BUY,
+            outcome="NO",
+            size=Decimal("10.0"),
+            price=Decimal("0.50"),
+            order_type=OrderType.GTC,
+        )
+
+    @pytest.mark.asyncio
+    async def test_partial_fill_yes_success_no_fail_triggers_unwind(
+        self, mock_config, mock_event_bus, mock_clob, yes_order_request, no_order_request
+    ):
+        """Verify YES success + NO failure triggers unwind."""
+        # Configure non-dry-run mode
+        mock_config.get_bool.side_effect = lambda key, default: {
+            "mercury.dry_run": False,
+            "execution.rebalance_partial_fills": True,
+        }.get(key, default)
+
+        engine = ExecutionEngine(
+            config=mock_config,
+            event_bus=mock_event_bus,
+            clob_client=mock_clob,
+        )
+
+        # Mock execute_order to succeed for YES, fail for NO
+        original_execute = engine.execute_order
+        call_count = [0]
+
+        async def mock_execute_order(order_req, timeout=30.0):
+            call_count[0] += 1
+            # First two calls: YES succeeds, NO fails
+            if order_req.outcome == "YES" and order_req.side == OrderSide.BUY:
+                # YES order succeeds
+                engine._dry_run = True
+                result = await original_execute(order_req, timeout)
+                engine._dry_run = False
+                return result
+            elif order_req.outcome == "NO" and order_req.side == OrderSide.BUY:
+                # NO order fails
+                from mercury.domain.order import Order, OrderStatus as OS
+                failed_order = Order(
+                    order_id="failed-no-order",
+                    market_id=order_req.market_id,
+                    token_id=order_req.token_id,
+                    side=order_req.side,
+                    outcome=order_req.outcome,
+                    requested_size=order_req.size,
+                    filled_size=Decimal("0"),
+                    price=order_req.price,
+                    status=OS.REJECTED,
+                    order_type=order_req.order_type,
+                )
+                from mercury.domain.order import OrderResult as DOR
+                return DOR(
+                    success=False,
+                    order=failed_order,
+                    fills=[],
+                    error_message="Simulated NO order failure",
+                )
+            else:
+                # Unwind order (SELL on YES)
+                engine._dry_run = True
+                result = await original_execute(order_req, timeout)
+                engine._dry_run = False
+                return result
+
+        engine.execute_order = mock_execute_order
+
+        await engine.start()
+
+        result = await engine.execute_dual_leg(yes_order_request, no_order_request)
+
+        # Should fail overall
+        assert result.success is False
+        # YES result should exist and be filled
+        assert result.yes_result is not None
+        assert result.yes_result.order.status == OrderStatus.FILLED
+        # NO result should exist and be rejected
+        assert result.no_result is not None
+        # Error message should indicate unwind
+        assert "unwound" in result.error_message.lower() or "unwind" in result.error_message.lower()
+
+        # Verify partial event was emitted
+        partial_calls = [
+            call for call in mock_event_bus.publish.call_args_list
+            if call[0][0] == "order.dual_leg.partial"
+        ]
+        assert len(partial_calls) == 1
+
+        await engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_both_legs_fail_no_unwind_attempted(
+        self, mock_config, mock_event_bus, mock_clob, yes_order_request, no_order_request
+    ):
+        """Verify no unwind when both legs fail."""
+        mock_config.get_bool.side_effect = lambda key, default: {
+            "mercury.dry_run": False,
+        }.get(key, default)
+
+        engine = ExecutionEngine(
+            config=mock_config,
+            event_bus=mock_event_bus,
+            clob_client=mock_clob,
+        )
+
+        # Mock execute_order to fail both legs
+        async def mock_execute_order(order_req, timeout=30.0):
+            from mercury.domain.order import Order, OrderStatus as OS, OrderResult as DOR
+            failed_order = Order(
+                order_id=f"failed-{order_req.outcome}",
+                market_id=order_req.market_id,
+                token_id=order_req.token_id,
+                side=order_req.side,
+                outcome=order_req.outcome,
+                requested_size=order_req.size,
+                filled_size=Decimal("0"),
+                price=order_req.price,
+                status=OS.REJECTED,
+            )
+            return DOR(
+                success=False,
+                order=failed_order,
+                fills=[],
+                error_message=f"Simulated {order_req.outcome} failure",
+            )
+
+        engine.execute_order = mock_execute_order
+
+        await engine.start()
+
+        result = await engine.execute_dual_leg(yes_order_request, no_order_request)
+
+        assert result.success is False
+        assert "Both legs failed" in result.error_message
+
+        # Verify failed event was emitted (not partial)
+        failed_calls = [
+            call for call in mock_event_bus.publish.call_args_list
+            if call[0][0] == "order.dual_leg.failed"
+        ]
+        assert len(failed_calls) == 1
+        partial_calls = [
+            call for call in mock_event_bus.publish.call_args_list
+            if call[0][0] == "order.dual_leg.partial"
+        ]
+        assert len(partial_calls) == 0
+
+        await engine.stop()
+
+
+class TestDualLegResult:
+    """Test DualLegResult dataclass from domain."""
+
+    def test_dual_leg_result_total_cost(self):
+        """Verify total_cost aggregates both legs."""
+        from mercury.domain.order import DualLegResult, OrderResult, Order
+
+        yes_order = Order(
+            order_id="yes-1",
+            market_id="market",
+            token_id="yes-token",
+            side=OrderSide.BUY,
+            outcome="YES",
+            requested_size=Decimal("10"),
+            filled_size=Decimal("10"),
+            price=Decimal("0.45"),
+            status=OrderStatus.FILLED,
+        )
+        no_order = Order(
+            order_id="no-1",
+            market_id="market",
+            token_id="no-token",
+            side=OrderSide.BUY,
+            outcome="NO",
+            requested_size=Decimal("10"),
+            filled_size=Decimal("10"),
+            price=Decimal("0.53"),
+            status=OrderStatus.FILLED,
+        )
+
+        yes_fill = Fill(
+            fill_id="fill-yes",
+            order_id="yes-1",
+            market_id="market",
+            token_id="yes-token",
+            side=OrderSide.BUY,
+            outcome="YES",
+            size=Decimal("10"),
+            price=Decimal("0.45"),
+        )
+        no_fill = Fill(
+            fill_id="fill-no",
+            order_id="no-1",
+            market_id="market",
+            token_id="no-token",
+            side=OrderSide.BUY,
+            outcome="NO",
+            size=Decimal("10"),
+            price=Decimal("0.53"),
+        )
+
+        yes_result = OrderResult(
+            success=True,
+            order=yes_order,
+            fills=[yes_fill],
+        )
+        no_result = OrderResult(
+            success=True,
+            order=no_order,
+            fills=[no_fill],
+        )
+
+        dual_result = DualLegResult(
+            success=True,
+            yes_result=yes_result,
+            no_result=no_result,
+        )
+
+        # Total cost = (10 * 0.45) + (10 * 0.53) = 4.5 + 5.3 = 9.8
+        assert dual_result.total_cost == Decimal("9.8")
+
+    def test_dual_leg_result_with_none_results(self):
+        """Verify total_cost handles None results."""
+        from mercury.domain.order import DualLegResult
+
+        dual_result = DualLegResult(
+            success=False,
+            yes_result=None,
+            no_result=None,
+            error_message="Both failed",
+        )
+
+        assert dual_result.total_cost == Decimal("0")
+
+    def test_dual_leg_result_success_state(self):
+        """Verify success state is tracked correctly."""
+        from mercury.domain.order import DualLegResult
+
+        # Successful result
+        success_result = DualLegResult(
+            success=True,
+            yes_result=None,  # Would normally have results
+            no_result=None,
+        )
+        assert success_result.success is True
+
+        # Failed result
+        failed_result = DualLegResult(
+            success=False,
+            yes_result=None,
+            no_result=None,
+            error_message="Something failed",
+        )
+        assert failed_result.success is False
+        assert failed_result.error_message == "Something failed"

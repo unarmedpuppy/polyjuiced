@@ -27,6 +27,7 @@ from mercury.domain.order import (
     Order,
     OrderRequest,
     OrderResult as DomainOrderResult,
+    DualLegResult,
     OrderSide as DomainOrderSide,
     OrderStatus as DomainOrderStatus,
     OrderType,
@@ -779,6 +780,339 @@ class ExecutionEngine(BaseComponent):
         )
 
         return [fill]
+
+    # =========================================================================
+    # Dual-Leg Arbitrage Execution
+    # =========================================================================
+
+    async def execute_dual_leg(
+        self,
+        yes_order: OrderRequest,
+        no_order: OrderRequest,
+        timeout: float = 30.0,
+    ) -> DualLegResult:
+        """Execute a dual-leg arbitrage order (YES + NO) concurrently.
+
+        Both legs are executed in parallel. If one leg fails while the other
+        succeeds, the successful leg is unwound to avoid dangling positions.
+
+        Args:
+            yes_order: Order request for the YES side.
+            no_order: Order request for the NO side.
+            timeout: Maximum time to wait for order completion (seconds).
+
+        Returns:
+            DualLegResult with both order results.
+
+        Event channels published:
+            - order.dual_leg.started: Dual-leg execution started
+            - order.dual_leg.completed: Both legs completed successfully
+            - order.dual_leg.partial: One leg filled, attempting unwind
+            - order.dual_leg.unwound: Dangling position unwound
+            - order.dual_leg.failed: Both legs failed or unwind failed
+        """
+        start_time = time.time()
+
+        self._log.info(
+            "execute_dual_leg_start",
+            yes_market_id=yes_order.market_id,
+            no_market_id=no_order.market_id,
+            yes_size=str(yes_order.size),
+            no_size=str(no_order.size),
+            yes_price=str(yes_order.price),
+            no_price=str(no_order.price),
+            dry_run=self._dry_run,
+        )
+
+        # Emit start event
+        await self._event_bus.publish("order.dual_leg.started", {
+            "yes_client_order_id": yes_order.client_order_id,
+            "no_client_order_id": no_order.client_order_id,
+            "yes_market_id": yes_order.market_id,
+            "no_market_id": no_order.market_id,
+            "yes_size": str(yes_order.size),
+            "no_size": str(no_order.size),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+
+        try:
+            # Execute both legs concurrently
+            yes_result, no_result = await asyncio.gather(
+                self.execute_order(yes_order, timeout=timeout),
+                self.execute_order(no_order, timeout=timeout),
+                return_exceptions=True,
+            )
+
+            # Handle exceptions from gather
+            if isinstance(yes_result, Exception):
+                yes_result = self._create_failed_order_result(yes_order, yes_result, start_time)
+            if isinstance(no_result, Exception):
+                no_result = self._create_failed_order_result(no_order, no_result, start_time)
+
+            # Calculate latency
+            latency_ms = (time.time() - start_time) * 1000
+
+            # Check outcomes
+            yes_success = yes_result.success and yes_result.order.status == DomainOrderStatus.FILLED
+            no_success = no_result.success and no_result.order.status == DomainOrderStatus.FILLED
+
+            if yes_success and no_success:
+                # Both legs filled - success!
+                self._log.info(
+                    "execute_dual_leg_success",
+                    yes_filled=str(yes_result.order.filled_size),
+                    no_filled=str(no_result.order.filled_size),
+                    latency_ms=latency_ms,
+                )
+
+                await self._event_bus.publish("order.dual_leg.completed", {
+                    "yes_order_id": yes_result.order.order_id,
+                    "no_order_id": no_result.order.order_id,
+                    "yes_filled": str(yes_result.order.filled_size),
+                    "no_filled": str(no_result.order.filled_size),
+                    "total_cost": str(yes_result.total_cost + no_result.total_cost),
+                    "latency_ms": latency_ms,
+                })
+
+                return DualLegResult(
+                    success=True,
+                    yes_result=yes_result,
+                    no_result=no_result,
+                    error_message=None,
+                    total_latency_ms=latency_ms,
+                )
+
+            elif yes_success and not no_success:
+                # YES filled, NO failed - unwind YES
+                self._log.warning(
+                    "execute_dual_leg_partial_yes",
+                    yes_filled=str(yes_result.order.filled_size),
+                    no_error=no_result.error_message,
+                )
+                return await self._handle_partial_dual_leg(
+                    filled_result=yes_result,
+                    failed_result=no_result,
+                    filled_side="YES",
+                    start_time=start_time,
+                    timeout=timeout,
+                )
+
+            elif no_success and not yes_success:
+                # NO filled, YES failed - unwind NO
+                self._log.warning(
+                    "execute_dual_leg_partial_no",
+                    no_filled=str(no_result.order.filled_size),
+                    yes_error=yes_result.error_message,
+                )
+                return await self._handle_partial_dual_leg(
+                    filled_result=no_result,
+                    failed_result=yes_result,
+                    filled_side="NO",
+                    start_time=start_time,
+                    timeout=timeout,
+                )
+
+            else:
+                # Both failed
+                self._log.error(
+                    "execute_dual_leg_both_failed",
+                    yes_error=yes_result.error_message,
+                    no_error=no_result.error_message,
+                )
+
+                await self._event_bus.publish("order.dual_leg.failed", {
+                    "yes_error": yes_result.error_message,
+                    "no_error": no_result.error_message,
+                    "latency_ms": latency_ms,
+                })
+
+                return DualLegResult(
+                    success=False,
+                    yes_result=yes_result,
+                    no_result=no_result,
+                    error_message=f"Both legs failed: YES={yes_result.error_message}, NO={no_result.error_message}",
+                    total_latency_ms=latency_ms,
+                )
+
+        except Exception as e:
+            latency_ms = (time.time() - start_time) * 1000
+            self._log.error("execute_dual_leg_error", error=str(e))
+
+            await self._event_bus.publish("order.dual_leg.failed", {
+                "error": str(e),
+                "latency_ms": latency_ms,
+            })
+
+            return DualLegResult(
+                success=False,
+                yes_result=None,
+                no_result=None,
+                error_message=str(e),
+                total_latency_ms=latency_ms,
+            )
+
+    async def _handle_partial_dual_leg(
+        self,
+        filled_result: DomainOrderResult,
+        failed_result: DomainOrderResult,
+        filled_side: str,
+        start_time: float,
+        timeout: float,
+    ) -> DualLegResult:
+        """Handle a partial fill by unwinding the successful leg.
+
+        When one leg of an arbitrage fills but the other fails, we must
+        unwind the filled position to avoid holding a dangling (unhedged)
+        position.
+
+        Args:
+            filled_result: The successful order result.
+            failed_result: The failed order result.
+            filled_side: "YES" or "NO" indicating which side filled.
+            start_time: Execution start time for latency calculation.
+            timeout: Timeout for unwind order.
+
+        Returns:
+            DualLegResult indicating failure with unwind details.
+        """
+        await self._event_bus.publish("order.dual_leg.partial", {
+            "filled_side": filled_side,
+            "filled_order_id": filled_result.order.order_id,
+            "filled_size": str(filled_result.order.filled_size),
+            "failed_side": "NO" if filled_side == "YES" else "YES",
+            "failed_error": failed_result.error_message,
+        })
+
+        # Create unwind order - sell what we bought
+        unwind_order = OrderRequest(
+            market_id=filled_result.order.market_id,
+            token_id=filled_result.order.token_id,
+            side=DomainOrderSide.SELL,  # Sell to unwind a buy
+            outcome=filled_result.order.outcome,
+            size=filled_result.order.filled_size,
+            price=filled_result.order.price,  # Try to get same price
+            order_type=filled_result.order.order_type,
+        )
+
+        self._log.info(
+            "unwinding_partial_fill",
+            side=filled_side,
+            size=str(unwind_order.size),
+            price=str(unwind_order.price),
+        )
+
+        try:
+            unwind_result = await self.execute_order(unwind_order, timeout=timeout)
+
+            latency_ms = (time.time() - start_time) * 1000
+
+            if unwind_result.success and unwind_result.order.status == DomainOrderStatus.FILLED:
+                self._log.info(
+                    "unwind_successful",
+                    unwind_order_id=unwind_result.order.order_id,
+                    unwind_filled=str(unwind_result.order.filled_size),
+                )
+
+                await self._event_bus.publish("order.dual_leg.unwound", {
+                    "filled_side": filled_side,
+                    "unwind_order_id": unwind_result.order.order_id,
+                    "unwind_filled": str(unwind_result.order.filled_size),
+                    "original_order_id": filled_result.order.order_id,
+                    "latency_ms": latency_ms,
+                })
+
+                # Return failure with unwind info
+                return DualLegResult(
+                    success=False,
+                    yes_result=filled_result if filled_side == "YES" else failed_result,
+                    no_result=failed_result if filled_side == "YES" else filled_result,
+                    error_message=f"{filled_side} filled but other leg failed; position unwound successfully",
+                    total_latency_ms=latency_ms,
+                )
+            else:
+                # Unwind failed - dangling position!
+                self._log.error(
+                    "unwind_failed",
+                    unwind_error=unwind_result.error_message,
+                    dangling_side=filled_side,
+                    dangling_size=str(filled_result.order.filled_size),
+                )
+
+                await self._event_bus.publish("order.dual_leg.failed", {
+                    "error": "Unwind failed - DANGLING POSITION",
+                    "dangling_side": filled_side,
+                    "dangling_size": str(filled_result.order.filled_size),
+                    "dangling_order_id": filled_result.order.order_id,
+                    "unwind_error": unwind_result.error_message,
+                    "latency_ms": latency_ms,
+                })
+
+                return DualLegResult(
+                    success=False,
+                    yes_result=filled_result if filled_side == "YES" else failed_result,
+                    no_result=failed_result if filled_side == "YES" else filled_result,
+                    error_message=f"CRITICAL: {filled_side} filled but unwind failed - dangling position of {filled_result.order.filled_size} shares",
+                    total_latency_ms=latency_ms,
+                )
+
+        except Exception as e:
+            latency_ms = (time.time() - start_time) * 1000
+            self._log.error("unwind_exception", error=str(e))
+
+            await self._event_bus.publish("order.dual_leg.failed", {
+                "error": f"Unwind exception - DANGLING POSITION: {e}",
+                "dangling_side": filled_side,
+                "dangling_size": str(filled_result.order.filled_size),
+                "latency_ms": latency_ms,
+            })
+
+            return DualLegResult(
+                success=False,
+                yes_result=filled_result if filled_side == "YES" else failed_result,
+                no_result=failed_result if filled_side == "YES" else filled_result,
+                error_message=f"CRITICAL: {filled_side} filled but unwind exception - dangling position: {e}",
+                total_latency_ms=latency_ms,
+            )
+
+    def _create_failed_order_result(
+        self,
+        order_request: OrderRequest,
+        exception: Exception,
+        start_time: float,
+    ) -> DomainOrderResult:
+        """Create a failed OrderResult from an exception.
+
+        Args:
+            order_request: The original order request.
+            exception: The exception that occurred.
+            start_time: When the order execution started.
+
+        Returns:
+            A DomainOrderResult representing the failure.
+        """
+        order = Order(
+            order_id=f"ord-failed-{uuid.uuid4().hex[:8]}",
+            market_id=order_request.market_id,
+            token_id=order_request.token_id,
+            side=order_request.side,
+            outcome=order_request.outcome,
+            requested_size=order_request.size,
+            filled_size=Decimal("0"),
+            price=order_request.price,
+            status=DomainOrderStatus.REJECTED,
+            order_type=order_request.order_type,
+            client_order_id=order_request.client_order_id,
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+
+        return DomainOrderResult(
+            success=False,
+            order=order,
+            fills=[],
+            error_message=str(exception),
+            latency_ms=(time.time() - start_time) * 1000,
+        )
 
     async def _execute_dry_run(
         self,
