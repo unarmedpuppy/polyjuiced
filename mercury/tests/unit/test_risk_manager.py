@@ -2171,3 +2171,936 @@ class TestUnhedgedExposureProperty:
         risk_manager.reset_daily()
 
         assert risk_manager.unhedged_exposure == Decimal("0")
+
+
+class TestLimitBoundaryEdgeCases:
+    """Test behavior at exact limit boundaries."""
+
+    @pytest.mark.asyncio
+    async def test_position_exactly_at_limit_allowed(self, risk_manager):
+        """Position exactly at limit should be allowed."""
+        signal = TradingSignal(
+            signal_id="boundary-test-1",
+            strategy_name="gabagool",
+            market_id="test-market",
+            signal_type=SignalType.ARBITRAGE,
+            confidence=0.8,
+            target_size_usd=Decimal("25.0"),  # Exactly at $25 limit
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+
+        allowed, reason = await risk_manager.check_pre_trade(signal)
+
+        assert allowed is True
+        assert reason is None
+
+    @pytest.mark.asyncio
+    async def test_position_one_cent_over_limit_rejected(self, risk_manager):
+        """Position $0.01 over limit should be rejected."""
+        signal = TradingSignal(
+            signal_id="boundary-test-2",
+            strategy_name="gabagool",
+            market_id="test-market",
+            signal_type=SignalType.ARBITRAGE,
+            confidence=0.8,
+            target_size_usd=Decimal("25.01"),  # Just over $25 limit
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+
+        allowed, reason = await risk_manager.check_pre_trade(signal)
+
+        assert allowed is False
+        assert "size" in reason.lower() or "limit" in reason.lower()
+
+    @pytest.mark.asyncio
+    async def test_daily_loss_exactly_at_limit_rejects(self, risk_manager):
+        """Signal rejected when daily loss exactly at limit."""
+        risk_manager._daily_pnl = Decimal("-100.0")  # Exactly at $100 limit
+
+        signal = TradingSignal(
+            signal_id="boundary-test-3",
+            strategy_name="gabagool",
+            market_id="test-market",
+            signal_type=SignalType.ARBITRAGE,
+            confidence=0.8,
+            target_size_usd=Decimal("10.0"),
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+
+        allowed, reason = await risk_manager.check_pre_trade(signal)
+
+        assert allowed is False
+        assert "daily loss" in reason.lower()
+
+    @pytest.mark.asyncio
+    async def test_daily_loss_one_cent_under_limit_allowed(self, risk_manager):
+        """Signal allowed when daily loss just under limit."""
+        risk_manager._daily_pnl = Decimal("-99.99")  # Just under $100 limit
+
+        signal = TradingSignal(
+            signal_id="boundary-test-4",
+            strategy_name="gabagool",
+            market_id="test-market",
+            signal_type=SignalType.ARBITRAGE,
+            confidence=0.8,
+            target_size_usd=Decimal("10.0"),
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+
+        allowed, reason = await risk_manager.check_pre_trade(signal)
+
+        assert allowed is True
+
+    @pytest.mark.asyncio
+    async def test_per_market_exposure_exactly_at_limit_rejects_new(self, risk_manager):
+        """New signal rejected when market exposure exactly at limit."""
+        # Fill up to exactly $100 limit
+        fill = Fill(
+            order_id="order-1",
+            market_id="test-market",
+            side="YES",
+            size=Decimal("200.0"),
+            price=Decimal("0.50"),
+            cost=Decimal("100.0"),
+        )
+        risk_manager.record_fill(fill)
+
+        signal = TradingSignal(
+            signal_id="boundary-test-5",
+            strategy_name="gabagool",
+            market_id="test-market",
+            signal_type=SignalType.ARBITRAGE,
+            confidence=0.8,
+            target_size_usd=Decimal("0.01"),  # Even tiny amount over limit
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+
+        allowed, reason = await risk_manager.check_pre_trade(signal)
+
+        assert allowed is False
+        assert "per-market" in reason.lower()
+
+    @pytest.mark.asyncio
+    async def test_unhedged_exposure_exactly_at_limit_rejects(self, risk_manager):
+        """Non-arbitrage signal rejected when unhedged exposure at limit."""
+        risk_manager._unhedged_exposure = Decimal("50.0")  # At $50 limit
+
+        signal = TradingSignal(
+            signal_id="boundary-test-6",
+            strategy_name="gabagool",
+            market_id="test-market",
+            signal_type=SignalType.BUY_YES,  # Non-arbitrage
+            confidence=0.8,
+            target_size_usd=Decimal("0.01"),  # Even tiny amount
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+
+        allowed, reason = await risk_manager.check_pre_trade(signal)
+
+        assert allowed is False
+        assert "unhedged" in reason.lower()
+
+    def test_warning_loss_exactly_at_threshold(self, risk_manager):
+        """Circuit breaker trips to WARNING at exactly $50 loss."""
+        risk_manager.record_pnl(Decimal("-50.0"))  # Exactly at threshold
+
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.WARNING
+
+    def test_caution_loss_exactly_at_threshold(self, risk_manager):
+        """Circuit breaker trips to CAUTION at exactly $75 loss."""
+        risk_manager.record_pnl(Decimal("-75.0"))  # Exactly at threshold
+
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.CAUTION
+
+    def test_halt_loss_exactly_at_threshold(self, risk_manager):
+        """Circuit breaker trips to HALT at exactly $100 loss."""
+        risk_manager.record_pnl(Decimal("-100.0"))  # Exactly at threshold
+
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.HALT
+
+    def test_one_cent_under_warning_threshold_stays_normal(self, risk_manager):
+        """Circuit breaker stays NORMAL at $49.99 loss."""
+        risk_manager.record_pnl(Decimal("-49.99"))
+
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.NORMAL
+
+
+class TestConcurrentSignalHandling:
+    """Test handling of multiple signals with overlapping exposure."""
+
+    @pytest.mark.asyncio
+    async def test_sequential_signals_accumulate_exposure_for_validation(
+        self, risk_manager
+    ):
+        """Multiple signals should not share exposure check state."""
+        # First signal creates market exposure via fill
+        fill = Fill(
+            order_id="order-1",
+            market_id="test-market",
+            side="YES",
+            size=Decimal("160.0"),
+            price=Decimal("0.50"),
+            cost=Decimal("80.0"),  # $80 exposure
+        )
+        risk_manager.record_fill(fill)
+
+        # Second signal in same market - should be limited by existing exposure
+        signal = TradingSignal(
+            signal_id="concurrent-test-1",
+            strategy_name="gabagool",
+            market_id="test-market",
+            signal_type=SignalType.ARBITRAGE,
+            confidence=0.8,
+            target_size_usd=Decimal("25.0"),  # Would push to $105, over $100 limit
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+
+        allowed, reason = await risk_manager.check_pre_trade(signal)
+
+        assert allowed is False
+        assert "per-market" in reason.lower()
+
+    @pytest.mark.asyncio
+    async def test_signals_in_different_markets_independent(self, risk_manager):
+        """Signals in different markets should have independent limits."""
+        # Fill up market-a to $90
+        fill_a = Fill(
+            order_id="order-a",
+            market_id="market-a",
+            side="YES",
+            size=Decimal("180.0"),
+            price=Decimal("0.50"),
+            cost=Decimal("90.0"),
+        )
+        risk_manager.record_fill(fill_a)
+
+        # Signal in market-b should be allowed (independent limit)
+        signal_b = TradingSignal(
+            signal_id="concurrent-test-2",
+            strategy_name="gabagool",
+            market_id="market-b",
+            signal_type=SignalType.ARBITRAGE,
+            confidence=0.8,
+            target_size_usd=Decimal("20.0"),
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+
+        allowed, reason = await risk_manager.check_pre_trade(signal_b)
+
+        assert allowed is True
+
+    @pytest.mark.asyncio
+    async def test_multiple_signals_same_batch_validated_independently(
+        self, risk_manager
+    ):
+        """Multiple signals validated in quick succession use current state."""
+        signals = [
+            TradingSignal(
+                signal_id=f"batch-{i}",
+                strategy_name="gabagool",
+                market_id=f"market-{i}",
+                signal_type=SignalType.ARBITRAGE,
+                confidence=0.8,
+                target_size_usd=Decimal("10.0"),
+                yes_price=Decimal("0.48"),
+                no_price=Decimal("0.50"),
+            )
+            for i in range(5)
+        ]
+
+        results = []
+        for signal in signals:
+            allowed, reason = await risk_manager.check_pre_trade(signal)
+            results.append((allowed, reason))
+
+        # All should be allowed (different markets, within limits)
+        assert all(allowed for allowed, _ in results)
+
+    @pytest.mark.asyncio
+    async def test_rapid_signals_with_fills_accumulate_exposure(self, risk_manager):
+        """Rapid signal validation with interleaved fills tracks exposure."""
+        # First signal passes
+        signal1 = TradingSignal(
+            signal_id="rapid-1",
+            strategy_name="gabagool",
+            market_id="test-market",
+            signal_type=SignalType.ARBITRAGE,
+            confidence=0.8,
+            target_size_usd=Decimal("20.0"),
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+        allowed1, _ = await risk_manager.check_pre_trade(signal1)
+        assert allowed1 is True
+
+        # Simulate fill from first signal - large fill to approach limit
+        fill1 = Fill(
+            order_id="order-1",
+            market_id="test-market",
+            side="YES",
+            size=Decimal("160.0"),
+            price=Decimal("0.50"),
+            cost=Decimal("80.0"),  # $80 exposure in market
+        )
+        risk_manager.record_fill(fill1)
+
+        # Second signal in same market - within position size limit but would exceed per-market
+        signal2 = TradingSignal(
+            signal_id="rapid-2",
+            strategy_name="gabagool",
+            market_id="test-market",
+            signal_type=SignalType.ARBITRAGE,
+            confidence=0.8,
+            target_size_usd=Decimal("25.0"),  # Within $25 position limit, but $80+$25=$105 > $100 per-market
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+        allowed2, reason2 = await risk_manager.check_pre_trade(signal2)
+
+        assert allowed2 is False
+        assert "per-market" in reason2.lower()
+
+
+class TestCooldownEdgeCases:
+    """Test cooldown behavior edge cases."""
+
+    @pytest.mark.asyncio
+    async def test_halt_with_active_cooldown_blocks_trading(self, risk_manager):
+        """HALT state with active cooldown should block all trading."""
+        from datetime import datetime, timezone, timedelta
+
+        risk_manager._circuit_breaker_state = CircuitBreakerState.HALT
+        risk_manager._cooldown_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+        risk_manager._circuit_breaker_reasons = ["Test reason"]
+
+        assert risk_manager.is_in_cooldown is True
+        assert risk_manager.can_trade is False
+
+        signal = TradingSignal(
+            signal_id="cooldown-test-1",
+            strategy_name="gabagool",
+            market_id="test-market",
+            signal_type=SignalType.ARBITRAGE,
+            confidence=0.8,
+            target_size_usd=Decimal("10.0"),
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+
+        allowed, reason = await risk_manager.check_pre_trade(signal)
+
+        assert allowed is False
+        assert "circuit breaker" in reason.lower() or "halt" in reason.lower()
+
+    @pytest.mark.asyncio
+    async def test_halt_with_expired_cooldown_passes_halt_check(self, risk_manager):
+        """HALT state with expired cooldown passes the HALT check specifically.
+
+        Note: When cooldown expires, the HALT state no longer blocks trading
+        at the circuit breaker level. However, HALT has size_multiplier=0,
+        so regular positions will still be rejected by position size check.
+        This test verifies that:
+        1. can_trade returns True when cooldown expired
+        2. The HALT circuit breaker check itself passes
+        3. The rejection comes from position size, not from circuit breaker
+        """
+        from datetime import datetime, timezone, timedelta
+
+        risk_manager._circuit_breaker_state = CircuitBreakerState.HALT
+        # Cooldown expired 1 minute ago
+        risk_manager._cooldown_until = datetime.now(timezone.utc) - timedelta(minutes=1)
+        risk_manager._circuit_breaker_reasons = ["Test reason"]
+        # Ensure P&L is not at loss limit
+        risk_manager._daily_pnl = Decimal("0")
+
+        assert risk_manager.is_in_cooldown is False
+        assert risk_manager.can_trade is True
+
+        # Regular signal will fail the size check (HALT has 0 multiplier)
+        # but it passes the HALT cooldown check
+        signal = TradingSignal(
+            signal_id="cooldown-test-2",
+            strategy_name="gabagool",
+            market_id="test-market",
+            signal_type=SignalType.ARBITRAGE,
+            confidence=0.8,
+            target_size_usd=Decimal("10.0"),
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+
+        allowed, reason = await risk_manager.check_pre_trade(signal)
+
+        # Should fail on position size (HALT has 0 multiplier) not on HALT cooldown
+        assert allowed is False
+        # Should be rejected by position size, not by circuit breaker
+        assert "size" in reason.lower() and "exceeds" in reason.lower()
+        # Not rejected by circuit breaker HALT
+        assert "halt" not in reason.lower()
+
+    @pytest.mark.asyncio
+    async def test_halt_with_active_cooldown_rejection_message_mentions_halt(
+        self, risk_manager
+    ):
+        """Active cooldown rejection should mention circuit breaker HALT."""
+        from datetime import datetime, timezone, timedelta
+
+        risk_manager._circuit_breaker_state = CircuitBreakerState.HALT
+        risk_manager._cooldown_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+        risk_manager._circuit_breaker_reasons = ["5 consecutive failures"]
+
+        signal = TradingSignal(
+            signal_id="cooldown-test-3",
+            strategy_name="gabagool",
+            market_id="test-market",
+            signal_type=SignalType.ARBITRAGE,
+            confidence=0.8,
+            target_size_usd=Decimal("10.0"),
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+
+        allowed, reason = await risk_manager.check_pre_trade(signal)
+
+        assert allowed is False
+        assert "halt" in reason.lower()
+        assert "circuit breaker" in reason.lower()
+
+    def test_cooldown_until_property(self, risk_manager):
+        """cooldown_until property should return correct value."""
+        from datetime import datetime, timezone, timedelta
+
+        assert risk_manager.cooldown_until is None
+
+        # Trip circuit breaker to set cooldown
+        for _ in range(5):
+            risk_manager.record_failure()
+
+        assert risk_manager.cooldown_until is not None
+        assert risk_manager.cooldown_until > datetime.now(timezone.utc)
+
+    def test_is_in_cooldown_when_no_cooldown_set(self, risk_manager):
+        """is_in_cooldown should return False when no cooldown."""
+        assert risk_manager.is_in_cooldown is False
+
+    def test_is_in_cooldown_when_cooldown_active(self, risk_manager):
+        """is_in_cooldown should return True during cooldown."""
+        # Trip to HALT
+        for _ in range(5):
+            risk_manager.record_failure()
+
+        assert risk_manager.is_in_cooldown is True
+
+    def test_cooldown_duration_from_config(self, risk_config, mock_event_bus):
+        """Cooldown duration should come from config."""
+        risk_config.get.side_effect = lambda key, default=None: {
+            "risk.circuit_breaker_cooldown_minutes": 10,
+            "risk.circuit_breaker_halt_failures": 5,
+        }.get(key, default)
+
+        risk_manager = RiskManager(config=risk_config, event_bus=mock_event_bus)
+        assert risk_manager._cooldown_duration.total_seconds() == 600  # 10 minutes
+
+
+class TestCircuitBreakerRecoveryScenarios:
+    """Test circuit breaker recovery and state transition scenarios."""
+
+    def test_cannot_downgrade_via_trip(self, risk_manager):
+        """Circuit breaker should not downgrade via trip (only via reset)."""
+        # Trip to HALT
+        for _ in range(5):
+            risk_manager.record_failure()
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.HALT
+
+        # Recording success resets failures but state stays HALT
+        risk_manager.record_success()
+        assert risk_manager.consecutive_failures == 0
+        # State should still be HALT (recovery only via reset)
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.HALT
+
+    def test_reset_recovers_from_any_state(self, risk_manager):
+        """Daily reset should recover from any circuit breaker state."""
+        # Test recovery from WARNING
+        for _ in range(3):
+            risk_manager.record_failure()
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.WARNING
+        risk_manager.reset_daily()
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.NORMAL
+
+        # Test recovery from CAUTION
+        for _ in range(4):
+            risk_manager.record_failure()
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.CAUTION
+        risk_manager.reset_daily()
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.NORMAL
+
+        # Test recovery from HALT
+        for _ in range(5):
+            risk_manager.record_failure()
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.HALT
+        risk_manager.reset_daily()
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.NORMAL
+
+    def test_combined_failure_and_loss_uses_worst_state(self, risk_manager):
+        """Combined failures and losses should use the worst state."""
+        # 3 failures = WARNING, $80 loss = CAUTION
+        for _ in range(3):
+            risk_manager.record_failure()
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.WARNING
+
+        risk_manager.record_pnl(Decimal("-80.0"))
+        # Should upgrade to CAUTION (worse state from loss)
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.CAUTION
+
+    def test_state_progression_through_all_levels(self, risk_manager):
+        """Test state progresses correctly through all levels."""
+        # Start NORMAL
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.NORMAL
+        assert risk_manager.size_multiplier == 1.0
+
+        # 3 failures -> WARNING
+        for _ in range(3):
+            risk_manager.record_failure()
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.WARNING
+        assert risk_manager.size_multiplier == 0.5
+        assert risk_manager.can_trade is True
+        assert risk_manager.can_open_positions is True
+
+        # 4th failure -> CAUTION
+        risk_manager.record_failure()
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.CAUTION
+        assert risk_manager.size_multiplier == 0.0
+        assert risk_manager.can_trade is True
+        assert risk_manager.can_open_positions is False
+
+        # 5th failure -> HALT
+        risk_manager.record_failure()
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.HALT
+        assert risk_manager.size_multiplier == 0.0
+        # During cooldown, can_trade is False
+        assert risk_manager.can_trade is False
+        assert risk_manager.can_open_positions is False
+
+    def test_loss_only_triggers_state_without_failures(self, risk_manager):
+        """Loss alone should trigger state changes independent of failures."""
+        assert risk_manager.consecutive_failures == 0
+
+        # $55 loss should trigger WARNING even with 0 failures
+        risk_manager.record_pnl(Decimal("-55.0"))
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.WARNING
+        assert risk_manager.consecutive_failures == 0
+
+    def test_profit_after_loss_does_not_downgrade(self, risk_manager):
+        """Profit after loss should not downgrade circuit breaker state."""
+        # Loss triggers WARNING
+        risk_manager.record_pnl(Decimal("-60.0"))
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.WARNING
+
+        # Profit brings P&L back up
+        risk_manager.record_pnl(Decimal("15.0"))
+        assert risk_manager.daily_pnl == Decimal("-45.0")  # Under threshold
+        # State should still be WARNING (no auto-recovery)
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.WARNING
+
+    def test_reset_clears_cooldown(self, risk_manager):
+        """Daily reset should clear cooldown."""
+        # Trip to HALT and set cooldown
+        for _ in range(5):
+            risk_manager.record_failure()
+        assert risk_manager.cooldown_until is not None
+
+        risk_manager.reset_daily()
+
+        assert risk_manager.cooldown_until is None
+        assert risk_manager.is_in_cooldown is False
+
+
+class TestResetBehaviorEdgeCases:
+    """Test edge cases in daily reset behavior."""
+
+    def test_reset_preserves_nothing_from_previous_day(self, risk_manager):
+        """Reset should clear all daily tracking state."""
+        # Build up state
+        risk_manager.record_pnl(Decimal("100.0"))
+        risk_manager.record_pnl(Decimal("-50.0"))
+        for _ in range(4):
+            risk_manager.record_failure()
+        fill = Fill(
+            order_id="order-1",
+            market_id="market-a",
+            side="YES",
+            size=Decimal("50.0"),
+            price=Decimal("0.50"),
+            cost=Decimal("25.0"),
+        )
+        risk_manager.record_fill(fill)
+        risk_manager._unhedged_exposure = Decimal("20.0")
+
+        # Verify state was built up
+        assert risk_manager.daily_pnl == Decimal("50.0")
+        assert risk_manager.daily_peak_pnl == Decimal("100.0")
+        assert risk_manager.daily_max_drawdown == Decimal("50.0")
+        assert risk_manager.consecutive_failures == 4
+        assert risk_manager.current_exposure == Decimal("25.0")
+        assert risk_manager.daily_trades == 1
+        assert risk_manager.daily_volume == Decimal("25.0")
+        assert len(risk_manager.market_exposures) > 0
+        assert risk_manager.unhedged_exposure == Decimal("20.0")
+
+        risk_manager.reset_daily()
+
+        # All should be cleared
+        assert risk_manager.daily_pnl == Decimal("0")
+        assert risk_manager.daily_peak_pnl == Decimal("0")
+        assert risk_manager.daily_max_drawdown == Decimal("0")
+        assert risk_manager.consecutive_failures == 0
+        assert risk_manager.current_exposure == Decimal("0")
+        assert risk_manager.daily_trades == 0
+        assert risk_manager.daily_volume == Decimal("0")
+        assert risk_manager.market_exposures == {}
+        assert risk_manager.unhedged_exposure == Decimal("0")
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.NORMAL
+        assert risk_manager.circuit_breaker_reasons == []
+        assert risk_manager.cooldown_until is None
+
+    def test_reset_updates_last_reset_timestamp(self, risk_manager):
+        """Reset should update last_reset timestamp."""
+        from datetime import datetime, timezone
+
+        old_reset = risk_manager.last_reset
+
+        # Small delay to ensure timestamps differ
+        import time
+        time.sleep(0.01)
+
+        risk_manager.reset_daily()
+
+        assert risk_manager.last_reset > old_reset
+        assert risk_manager.last_reset.tzinfo == timezone.utc
+
+    def test_multiple_resets_in_succession(self, risk_manager):
+        """Multiple resets should be idempotent."""
+        risk_manager.record_pnl(Decimal("-50.0"))
+
+        risk_manager.reset_daily()
+        first_reset = risk_manager.last_reset
+
+        risk_manager.reset_daily()
+        second_reset = risk_manager.last_reset
+
+        assert second_reset >= first_reset
+        assert risk_manager.daily_pnl == Decimal("0")
+
+    def test_reset_after_no_activity(self, risk_manager):
+        """Reset should work even with no activity."""
+        # No fills, no P&L, no failures
+        risk_manager.reset_daily()
+
+        assert risk_manager.daily_pnl == Decimal("0")
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.NORMAL
+
+
+class TestSignalTypeHandling:
+    """Test handling of different signal types."""
+
+    @pytest.mark.asyncio
+    async def test_all_signal_types_validated(self, risk_manager):
+        """All signal types should be validated."""
+        signal_types = [
+            SignalType.BUY_YES,
+            SignalType.BUY_NO,
+            SignalType.SELL_YES,
+            SignalType.SELL_NO,
+            SignalType.ARBITRAGE,
+            SignalType.CLOSE_POSITION,
+        ]
+
+        for signal_type in signal_types:
+            signal = TradingSignal(
+                signal_id=f"type-test-{signal_type.value}",
+                strategy_name="gabagool",
+                market_id=f"market-{signal_type.value}",
+                signal_type=signal_type,
+                confidence=0.8,
+                target_size_usd=Decimal("10.0"),
+                yes_price=Decimal("0.48"),
+                no_price=Decimal("0.50"),
+            )
+
+            allowed, reason = await risk_manager.check_pre_trade(signal)
+            # Should not raise, and should give a definitive answer
+            assert isinstance(allowed, bool)
+
+    @pytest.mark.asyncio
+    async def test_close_position_allowed_at_caution_but_not_others(self, risk_manager):
+        """At CAUTION level, only CLOSE_POSITION signals allowed."""
+        # Trip to CAUTION
+        for _ in range(4):
+            risk_manager.record_failure()
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.CAUTION
+
+        # CLOSE_POSITION should be allowed
+        close_signal = TradingSignal(
+            signal_id="close-at-caution",
+            strategy_name="gabagool",
+            market_id="test-market",
+            signal_type=SignalType.CLOSE_POSITION,
+            confidence=0.8,
+            target_size_usd=Decimal("10.0"),
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+        allowed, reason = await risk_manager.check_pre_trade(close_signal)
+        assert allowed is True
+
+        # Other types should be rejected
+        for signal_type in [SignalType.BUY_YES, SignalType.ARBITRAGE, SignalType.SELL_NO]:
+            signal = TradingSignal(
+                signal_id=f"other-at-caution-{signal_type.value}",
+                strategy_name="gabagool",
+                market_id="test-market",
+                signal_type=signal_type,
+                confidence=0.8,
+                target_size_usd=Decimal("10.0"),
+                yes_price=Decimal("0.48"),
+                no_price=Decimal("0.50"),
+            )
+            allowed, reason = await risk_manager.check_pre_trade(signal)
+            assert allowed is False
+            assert "caution" in reason.lower()
+
+
+class TestPnLAccuracyEdgeCases:
+    """Test P&L tracking edge cases."""
+
+    def test_many_small_pnl_records_accumulate_correctly(self, risk_manager):
+        """Many small P&L records should accumulate without floating point errors."""
+        # Record 100 small gains of $0.01 each
+        for _ in range(100):
+            risk_manager.record_pnl(Decimal("0.01"))
+
+        # Should be exactly $1.00, not 0.9999999 or similar
+        assert risk_manager.daily_pnl == Decimal("1.00")
+
+    def test_alternating_profit_loss_tracks_correctly(self, risk_manager):
+        """Alternating profit/loss should track P&L and drawdown correctly."""
+        risk_manager.record_pnl(Decimal("10.0"))  # +10
+        assert risk_manager.daily_pnl == Decimal("10.0")
+        assert risk_manager.daily_peak_pnl == Decimal("10.0")
+
+        risk_manager.record_pnl(Decimal("-5.0"))  # +5
+        assert risk_manager.daily_pnl == Decimal("5.0")
+        assert risk_manager.daily_max_drawdown == Decimal("5.0")
+
+        risk_manager.record_pnl(Decimal("20.0"))  # +25
+        assert risk_manager.daily_pnl == Decimal("25.0")
+        assert risk_manager.daily_peak_pnl == Decimal("25.0")
+
+        risk_manager.record_pnl(Decimal("-30.0"))  # -5
+        assert risk_manager.daily_pnl == Decimal("-5.0")
+        assert risk_manager.daily_max_drawdown == Decimal("30.0")  # From 25 to -5
+
+    def test_zero_pnl_does_not_affect_state(self, risk_manager):
+        """Recording zero P&L should not change state."""
+        risk_manager.record_pnl(Decimal("10.0"))
+        peak = risk_manager.daily_peak_pnl
+
+        risk_manager.record_pnl(Decimal("0"))
+
+        assert risk_manager.daily_pnl == Decimal("10.0")
+        assert risk_manager.daily_peak_pnl == peak
+
+    def test_negative_then_positive_drawdown_tracking(self, risk_manager):
+        """Drawdown should track correctly starting from negative."""
+        # Start with loss
+        risk_manager.record_pnl(Decimal("-20.0"))
+        assert risk_manager.daily_pnl == Decimal("-20.0")
+        assert risk_manager.daily_peak_pnl == Decimal("0")  # Never went positive
+        assert risk_manager.daily_max_drawdown == Decimal("20.0")
+
+        # Recover partially
+        risk_manager.record_pnl(Decimal("15.0"))
+        assert risk_manager.daily_pnl == Decimal("-5.0")
+        assert risk_manager.daily_peak_pnl == Decimal("0")  # Still never went positive
+        assert risk_manager.daily_max_drawdown == Decimal("20.0")  # Max drawdown unchanged
+
+
+class TestEventBusErrorHandling:
+    """Test error handling in event bus interactions."""
+
+    @pytest.mark.asyncio
+    async def test_signal_handler_handles_malformed_data(self, risk_manager, mock_event_bus):
+        """_on_signal should handle malformed signal data gracefully."""
+        await risk_manager.start()
+
+        # Missing required fields
+        malformed_data = {
+            "signal_id": "malformed-1",
+            # Missing: market_id, signal_type, target_size_usd
+        }
+
+        # Should not raise, just log error
+        await risk_manager._on_signal(malformed_data)
+
+        await risk_manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_fill_handler_handles_malformed_data(self, risk_manager, mock_event_bus):
+        """_on_order_filled should handle malformed fill data gracefully."""
+        await risk_manager.start()
+
+        # Missing required fields
+        malformed_data = {
+            "order_id": "malformed-fill",
+            # Missing: market_id, size, price
+        }
+
+        # Should not raise, just log error
+        await risk_manager._on_order_filled(malformed_data)
+
+        await risk_manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_position_closed_handler_handles_malformed_data(
+        self, risk_manager, mock_event_bus
+    ):
+        """_on_position_closed should handle malformed data gracefully."""
+        await risk_manager.start()
+
+        # Missing all fields
+        malformed_data = {}
+
+        # Should not raise
+        await risk_manager._on_position_closed(malformed_data)
+
+        await risk_manager.stop()
+
+
+class TestWarningLevelEdgeCases:
+    """Test WARNING level edge cases."""
+
+    @pytest.mark.asyncio
+    async def test_warning_exact_reduced_limit_allowed(self, risk_manager):
+        """At WARNING, signal exactly at 50% limit should be allowed."""
+        for _ in range(3):
+            risk_manager.record_failure()
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.WARNING
+
+        # Normal limit is $25, WARNING reduces to $12.50
+        signal = TradingSignal(
+            signal_id="warning-exact",
+            strategy_name="gabagool",
+            market_id="test-market",
+            signal_type=SignalType.ARBITRAGE,
+            confidence=0.8,
+            target_size_usd=Decimal("12.50"),  # Exactly at reduced limit
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+
+        allowed, reason = await risk_manager.check_pre_trade(signal)
+
+        assert allowed is True
+
+    @pytest.mark.asyncio
+    async def test_warning_one_cent_over_reduced_limit_rejected(self, risk_manager):
+        """At WARNING, signal $0.01 over reduced limit should be rejected."""
+        for _ in range(3):
+            risk_manager.record_failure()
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.WARNING
+
+        signal = TradingSignal(
+            signal_id="warning-over",
+            strategy_name="gabagool",
+            market_id="test-market",
+            signal_type=SignalType.ARBITRAGE,
+            confidence=0.8,
+            target_size_usd=Decimal("12.51"),  # Just over reduced limit
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+
+        allowed, reason = await risk_manager.check_pre_trade(signal)
+
+        assert allowed is False
+        assert "warning" in reason.lower() or "limit" in reason.lower()
+
+
+class TestCircuitBreakerEventData:
+    """Test circuit breaker event data completeness."""
+
+    @pytest.mark.asyncio
+    async def test_event_includes_all_required_fields(self, risk_manager, mock_event_bus):
+        """Circuit breaker event should include all required fields."""
+        await risk_manager.start()
+
+        # Trip to WARNING
+        for _ in range(3):
+            risk_manager.record_failure()
+
+        import asyncio
+        await asyncio.sleep(0.01)
+
+        calls = mock_event_bus.publish.call_args_list
+        circuit_breaker_calls = [c for c in calls if c[0][0] == "risk.circuit_breaker"]
+
+        assert len(circuit_breaker_calls) > 0
+        event_data = circuit_breaker_calls[0][0][1]
+
+        # Check all required fields present
+        required_fields = [
+            "old_state",
+            "new_state",
+            "reasons",
+            "size_multiplier",
+            "can_trade",
+            "can_open_positions",
+            "consecutive_failures",
+            "daily_pnl",
+            "cooldown_until",
+            "timestamp",
+        ]
+
+        for field in required_fields:
+            assert field in event_data, f"Missing required field: {field}"
+
+        await risk_manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_multiple_state_transitions_publish_multiple_events(
+        self, risk_manager, mock_event_bus
+    ):
+        """Each state transition should publish a separate event."""
+        await risk_manager.start()
+
+        # Progress through all states
+        for _ in range(5):
+            risk_manager.record_failure()
+
+        import asyncio
+        await asyncio.sleep(0.01)
+
+        calls = mock_event_bus.publish.call_args_list
+        circuit_breaker_calls = [c for c in calls if c[0][0] == "risk.circuit_breaker"]
+
+        # Should have events for: NORMAL->WARNING, WARNING->CAUTION, CAUTION->HALT
+        assert len(circuit_breaker_calls) >= 3
+
+        states_seen = set()
+        for call in circuit_breaker_calls:
+            event_data = call[0][1]
+            states_seen.add(event_data["new_state"])
+
+        assert "WARNING" in states_seen
+        assert "CAUTION" in states_seen
+        assert "HALT" in states_seen
+
+        await risk_manager.stop()
