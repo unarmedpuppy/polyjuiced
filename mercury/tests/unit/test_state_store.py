@@ -407,6 +407,200 @@ class TestTradeOperations:
 
         await store.close()
 
+    @pytest.mark.asyncio
+    async def test_get_trades_by_market(self, tmp_path):
+        """Test get_trades_by_market convenience method."""
+        from mercury.services.state_store import StateStore, Trade
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        # Create trades for different markets
+        for i in range(5):
+            trade = Trade(
+                trade_id=f"market-trade-{i}",
+                market_id="market-A" if i < 3 else "market-B",
+                strategy="gabagool",
+                side="YES",
+                size=Decimal("10.0"),
+                price=Decimal("0.50"),
+                cost=Decimal("5.0"),
+            )
+            await store.save_trade(trade)
+
+        # Get trades for market-A
+        market_a_trades = await store.get_trades_by_market("market-A")
+        assert len(market_a_trades) == 3
+        assert all(t.market_id == "market-A" for t in market_a_trades)
+
+        # Get trades for market-B
+        market_b_trades = await store.get_trades_by_market("market-B")
+        assert len(market_b_trades) == 2
+        assert all(t.market_id == "market-B" for t in market_b_trades)
+
+        # Get trades for non-existent market
+        empty_trades = await store.get_trades_by_market("market-C")
+        assert len(empty_trades) == 0
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_get_trades_by_market_with_dry_run_filter(self, tmp_path):
+        """Test get_trades_by_market with dry run filter."""
+        from mercury.services.state_store import StateStore, Trade
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        # Create regular and dry run trades
+        for i in range(4):
+            trade = Trade(
+                trade_id=f"dry-run-test-{i}",
+                market_id="test-market",
+                strategy="gabagool",
+                side="YES",
+                size=Decimal("10.0"),
+                price=Decimal("0.50"),
+                cost=Decimal("5.0"),
+                dry_run=(i % 2 == 0),  # 0, 2 are dry runs
+            )
+            await store.save_trade(trade)
+
+        # Get all trades
+        all_trades = await store.get_trades_by_market("test-market")
+        assert len(all_trades) == 4
+
+        # Exclude dry runs
+        real_trades = await store.get_trades_by_market("test-market", exclude_dry_runs=True)
+        assert len(real_trades) == 2
+        assert all(not t.dry_run for t in real_trades)
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_get_trade_with_details(self, tmp_path):
+        """Test get_trade_with_details returns trade with fills and telemetry."""
+        from mercury.services.state_store import StateStore, Trade, TradeTelemetry
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        # Create a trade
+        trade = Trade(
+            trade_id="detail-trade-1",
+            market_id="test-market",
+            strategy="gabagool",
+            side="YES",
+            size=Decimal("10.0"),
+            price=Decimal("0.50"),
+            cost=Decimal("5.0"),
+        )
+        await store.save_trade(trade)
+
+        # Add fills
+        await store.save_fill(
+            fill_id="fill-1",
+            trade_id="detail-trade-1",
+            order_id="order-1",
+            token_id="token-123",
+            side="BUY",
+            size=Decimal("5.0"),
+            price=Decimal("0.50"),
+            fee=Decimal("0.01"),
+        )
+        await store.save_fill(
+            fill_id="fill-2",
+            trade_id="detail-trade-1",
+            order_id="order-1",
+            token_id="token-123",
+            side="BUY",
+            size=Decimal("5.0"),
+            price=Decimal("0.51"),
+            fee=Decimal("0.01"),
+        )
+
+        # Add telemetry
+        telemetry = TradeTelemetry(
+            trade_id="detail-trade-1",
+            opportunity_spread=Decimal("0.05"),
+            execution_latency_ms=Decimal("75.5"),
+        )
+        await store.save_trade_telemetry(telemetry)
+
+        # Get trade with details
+        details = await store.get_trade_with_details("detail-trade-1")
+
+        assert details is not None
+        assert details["trade"].trade_id == "detail-trade-1"
+        assert len(details["fills"]) == 2
+        assert details["fills"][0]["fill_id"] == "fill-1"
+        assert details["fills"][1]["fill_id"] == "fill-2"
+        assert details["telemetry"] is not None
+        assert details["telemetry"].opportunity_spread == Decimal("0.05")
+        assert details["telemetry"].execution_latency_ms == Decimal("75.5")
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_get_trade_with_details_returns_none_for_missing(self, tmp_path):
+        """Test get_trade_with_details returns None for non-existent trade."""
+        from mercury.services.state_store import StateStore
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        details = await store.get_trade_with_details("non-existent-trade")
+        assert details is None
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_get_trade_with_details_includes_rebalance_trades(self, tmp_path):
+        """Test get_trade_with_details includes rebalance trades."""
+        from mercury.services.state_store import StateStore, Trade, RebalanceTrade
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        # Create a trade
+        trade = Trade(
+            trade_id="rebalance-detail-trade",
+            market_id="test-market",
+            strategy="gabagool",
+            side="YES",
+            size=Decimal("10.0"),
+            price=Decimal("0.50"),
+            cost=Decimal("5.0"),
+        )
+        await store.save_trade(trade)
+
+        # Add rebalance trades
+        rebalance = RebalanceTrade(
+            trade_id="rebalance-detail-trade",
+            action="SELL_YES",
+            shares=Decimal("2.0"),
+            price=Decimal("0.55"),
+            status="SUCCESS",
+            filled_shares=Decimal("2.0"),
+            profit=Decimal("0.10"),
+        )
+        await store.save_rebalance_trade(rebalance)
+
+        # Get trade with details
+        details = await store.get_trade_with_details("rebalance-detail-trade")
+
+        assert details is not None
+        assert len(details["rebalance_trades"]) == 1
+        assert details["rebalance_trades"][0].action == "SELL_YES"
+        assert details["rebalance_trades"][0].profit == Decimal("0.10")
+
+        await store.close()
+
 
 class TestPositionOperations:
     """Test position CRUD operations."""

@@ -865,6 +865,84 @@ class StateStore:
         """Get all pending trades."""
         return await self.get_trades(status="pending", limit=1000)
 
+    async def get_trades_by_market(
+        self,
+        market_id: str,
+        since: Optional[datetime] = None,
+        limit: int = 100,
+        exclude_dry_runs: bool = False,
+    ) -> list[Trade]:
+        """Get trades for a specific market.
+
+        Convenience method that wraps get_trades with market_id filter.
+
+        Args:
+            market_id: Market ID to filter by.
+            since: Only return trades after this time.
+            limit: Maximum number of trades to return.
+            exclude_dry_runs: Exclude dry run trades.
+
+        Returns:
+            List of trades for the market ordered by timestamp descending.
+        """
+        return await self.get_trades(
+            market_id=market_id,
+            since=since,
+            limit=limit,
+            exclude_dry_runs=exclude_dry_runs,
+        )
+
+    async def get_trade_with_details(
+        self,
+        trade_id: str,
+    ) -> Optional[dict[str, Any]]:
+        """Get a trade with its associated fills and telemetry.
+
+        Retrieves the full trade record along with all fill records
+        and telemetry data for comprehensive trade analysis.
+
+        Args:
+            trade_id: Trade ID to retrieve.
+
+        Returns:
+            Dict with keys: 'trade', 'fills', 'telemetry', or None if not found.
+        """
+        trade = await self.get_trade(trade_id)
+        if trade is None:
+            return None
+
+        # Get fills for this trade
+        conn = await self._pool.acquire()
+        fills = []
+        async with conn.execute(
+            "SELECT * FROM fills WHERE trade_id = ? ORDER BY timestamp ASC",
+            (trade_id,),
+        ) as cursor:
+            async for row in cursor:
+                fills.append({
+                    "fill_id": row["fill_id"],
+                    "order_id": row["order_id"],
+                    "token_id": row["token_id"],
+                    "side": row["side"],
+                    "size": Decimal(str(row["size"])),
+                    "price": Decimal(str(row["price"])),
+                    "fee": Decimal(str(row["fee"])) if row["fee"] else Decimal("0"),
+                    "timestamp": row["timestamp"],
+                })
+
+        # Get telemetry
+        telemetry = await self.get_trade_telemetry(trade_id)
+
+        # Get rebalance trades
+        rebalance_trades = await self.get_rebalance_trades(trade_id)
+
+        return {
+            "trade": trade,
+            "fills": fills,
+            "telemetry": telemetry,
+            "rebalance_trades": rebalance_trades,
+        }
+
     async def resolve_trade(
         self,
         trade_id: str,
