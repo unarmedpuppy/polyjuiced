@@ -37,6 +37,12 @@ from mercury.integrations.polymarket.clob import (
     BatchOrderError,
 )
 
+from mercury.integrations.polymarket.market_finder import (
+    MarketFinder,
+    MarketFinderCache,
+    MarketFinderWithSubscription,
+)
+
 __all__ = [
     # Enums
     "OrderSide",
@@ -75,4 +81,8 @@ __all__ = [
     "ArbitrageInvalidError",
     "OrderSigningError",
     "BatchOrderError",
+    # Market finder
+    "MarketFinder",
+    "MarketFinderCache",
+    "MarketFinderWithSubscription",
 ]
