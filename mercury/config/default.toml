@@ -67,8 +67,27 @@ max_wait_seconds = 60.0
 max_daily_loss_usd = 100.0
 max_unhedged_exposure_usd = 50.0
 max_position_size_usd = 25.0
+max_per_market_exposure_usd = 100.0
 max_daily_trades = 100
 circuit_breaker_cooldown_minutes = 5
+
+# 4-level circuit breaker thresholds (NORMAL -> WARNING -> CAUTION -> HALT)
+# Failure thresholds (consecutive failures)
+circuit_breaker_warning_failures = 3
+circuit_breaker_caution_failures = 4
+circuit_breaker_halt_failures = 5
+
+# Loss thresholds (in USD) - trip at these daily loss levels
+circuit_breaker_warning_loss = 50.0
+circuit_breaker_caution_loss = 75.0
+circuit_breaker_halt_loss = 100.0
+
+# Daily reset configuration
+# Reset time in UTC (24-hour format: "HH:MM")
+# Examples: "00:00" for midnight, "09:30" for market open
+daily_reset_time_utc = "00:00"
+# Whether to automatically reset at the configured time
+daily_reset_enabled = true
 
 [settlement]
 check_interval_seconds = 300  # 5 minutes

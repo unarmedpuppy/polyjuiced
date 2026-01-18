@@ -9,8 +9,12 @@ Tests cover:
 - Event handling
 - Circuit breaker event publishing
 - Position size multipliers
+- Daily loss limit tracking with configurable thresholds
+- Automatic daily reset scheduling
+- Daily stats event publishing
 """
 import pytest
+from datetime import timedelta
 from decimal import Decimal
 from unittest.mock import MagicMock, AsyncMock
 
@@ -1011,3 +1015,331 @@ class TestRiskLimitsConfiguration:
         assert limits.max_position_size_usd == Decimal("25.0")
         assert limits.max_unhedged_exposure_usd == Decimal("50.0")
         assert limits.max_per_market_exposure_usd == Decimal("100.0")
+
+
+class TestDailyLossLimitTracking:
+    """Test daily loss limit tracking functionality."""
+
+    def test_peak_pnl_tracking(self, risk_manager):
+        """Peak P&L should track the high water mark."""
+        assert risk_manager.daily_peak_pnl == Decimal("0")
+
+        # Record profit - should update peak
+        risk_manager.record_pnl(Decimal("20.0"))
+        assert risk_manager.daily_peak_pnl == Decimal("20.0")
+
+        # Record more profit - should update peak
+        risk_manager.record_pnl(Decimal("10.0"))
+        assert risk_manager.daily_peak_pnl == Decimal("30.0")
+
+        # Record loss - peak should remain at high water mark
+        risk_manager.record_pnl(Decimal("-15.0"))
+        assert risk_manager.daily_peak_pnl == Decimal("30.0")
+        assert risk_manager.daily_pnl == Decimal("15.0")
+
+    def test_max_drawdown_tracking(self, risk_manager):
+        """Max drawdown should track largest drop from peak."""
+        assert risk_manager.daily_max_drawdown == Decimal("0")
+
+        # Go up, then down
+        risk_manager.record_pnl(Decimal("50.0"))  # Peak at 50
+        risk_manager.record_pnl(Decimal("-30.0"))  # Now at 20, drawdown = 30
+        assert risk_manager.daily_max_drawdown == Decimal("30.0")
+
+        # Recover partially
+        risk_manager.record_pnl(Decimal("10.0"))  # Now at 30, drawdown = 20
+        assert risk_manager.daily_max_drawdown == Decimal("30.0")  # Still 30 (max)
+
+        # New higher peak
+        risk_manager.record_pnl(Decimal("30.0"))  # Now at 60, peak = 60
+        assert risk_manager.daily_peak_pnl == Decimal("60.0")
+
+        # Drop further
+        risk_manager.record_pnl(Decimal("-40.0"))  # Now at 20, drawdown = 40
+        assert risk_manager.daily_max_drawdown == Decimal("40.0")
+
+    def test_reset_clears_peak_and_drawdown(self, risk_manager):
+        """Daily reset should clear peak P&L and max drawdown."""
+        risk_manager.record_pnl(Decimal("50.0"))
+        risk_manager.record_pnl(Decimal("-30.0"))
+        assert risk_manager.daily_peak_pnl == Decimal("50.0")
+        assert risk_manager.daily_max_drawdown == Decimal("30.0")
+
+        risk_manager.reset_daily()
+
+        assert risk_manager.daily_peak_pnl == Decimal("0")
+        assert risk_manager.daily_max_drawdown == Decimal("0")
+
+    def test_daily_volume_tracking(self, risk_manager):
+        """Daily volume should track total trading volume."""
+        assert risk_manager.daily_volume == Decimal("0")
+
+        fill1 = Fill(
+            order_id="order-1",
+            market_id="test-market",
+            side="YES",
+            size=Decimal("10.0"),
+            price=Decimal("0.50"),
+            cost=Decimal("5.0"),
+        )
+        risk_manager.record_fill(fill1)
+        assert risk_manager.daily_volume == Decimal("5.0")
+
+        fill2 = Fill(
+            order_id="order-2",
+            market_id="test-market",
+            side="NO",
+            size=Decimal("20.0"),
+            price=Decimal("0.48"),
+            cost=Decimal("9.6"),
+        )
+        risk_manager.record_fill(fill2)
+        assert risk_manager.daily_volume == Decimal("14.6")
+
+
+class TestDailyResetTimeConfiguration:
+    """Test daily reset time configuration parsing."""
+
+    def test_parse_valid_reset_time(self, risk_config, mock_event_bus):
+        """Valid reset time should be parsed correctly."""
+        risk_config.get.side_effect = lambda key, default=None: {
+            "risk.daily_reset_time_utc": "09:30",
+            "risk.daily_reset_enabled": True,
+        }.get(key, default)
+
+        risk_manager = RiskManager(config=risk_config, event_bus=mock_event_bus)
+
+        assert risk_manager.daily_reset_time_utc.hour == 9
+        assert risk_manager.daily_reset_time_utc.minute == 30
+
+    def test_parse_midnight_reset_time(self, risk_config, mock_event_bus):
+        """Midnight reset time should be parsed correctly."""
+        risk_config.get.side_effect = lambda key, default=None: {
+            "risk.daily_reset_time_utc": "00:00",
+            "risk.daily_reset_enabled": True,
+        }.get(key, default)
+
+        risk_manager = RiskManager(config=risk_config, event_bus=mock_event_bus)
+
+        assert risk_manager.daily_reset_time_utc.hour == 0
+        assert risk_manager.daily_reset_time_utc.minute == 0
+
+    def test_parse_invalid_reset_time_uses_default(self, risk_config, mock_event_bus):
+        """Invalid reset time should default to midnight."""
+        risk_config.get.side_effect = lambda key, default=None: {
+            "risk.daily_reset_time_utc": "invalid",
+            "risk.daily_reset_enabled": True,
+        }.get(key, default)
+
+        risk_manager = RiskManager(config=risk_config, event_bus=mock_event_bus)
+
+        # Should default to 00:00
+        assert risk_manager.daily_reset_time_utc.hour == 0
+        assert risk_manager.daily_reset_time_utc.minute == 0
+
+    def test_daily_reset_enabled_property(self, risk_config, mock_event_bus):
+        """daily_reset_enabled property should reflect config."""
+        risk_config.get.side_effect = lambda key, default=None: {
+            "risk.daily_reset_enabled": False,
+        }.get(key, default)
+
+        risk_manager = RiskManager(config=risk_config, event_bus=mock_event_bus)
+
+        assert risk_manager.daily_reset_enabled is False
+
+
+class TestDailyResetScheduling:
+    """Test daily reset scheduling functionality."""
+
+    def test_next_reset_calculation(self, risk_manager):
+        """Next reset should be calculated correctly."""
+        from datetime import datetime, timezone
+
+        next_reset = risk_manager.next_reset
+        now = datetime.now(timezone.utc)
+
+        # Next reset should be in the future or very close to now
+        assert next_reset >= now - timedelta(seconds=1)
+        # Should be within 24 hours
+        assert next_reset <= now + timedelta(hours=24)
+
+    def test_last_reset_property(self, risk_manager):
+        """Last reset should be tracked."""
+        from datetime import datetime, timezone
+
+        # Initial last reset should be around initialization time
+        assert risk_manager.last_reset is not None
+
+        old_reset = risk_manager.last_reset
+        risk_manager.reset_daily()
+
+        # Last reset should be updated
+        assert risk_manager.last_reset >= old_reset
+
+    @pytest.mark.asyncio
+    async def test_scheduler_starts_when_enabled(self, risk_config, mock_event_bus):
+        """Scheduler should start when daily reset is enabled."""
+        risk_config.get.side_effect = lambda key, default=None: {
+            "risk.daily_reset_enabled": True,
+            "risk.daily_reset_time_utc": "00:00",
+        }.get(key, default)
+
+        risk_manager = RiskManager(config=risk_config, event_bus=mock_event_bus)
+        await risk_manager.start()
+
+        # Scheduler task should be created
+        assert risk_manager._reset_task is not None
+
+        await risk_manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_scheduler_does_not_start_when_disabled(self, risk_config, mock_event_bus):
+        """Scheduler should not start when daily reset is disabled."""
+        risk_config.get.side_effect = lambda key, default=None: {
+            "risk.daily_reset_enabled": False,
+            "risk.daily_reset_time_utc": "00:00",
+        }.get(key, default)
+
+        risk_manager = RiskManager(config=risk_config, event_bus=mock_event_bus)
+        await risk_manager.start()
+
+        # Scheduler task should not be created
+        assert risk_manager._reset_task is None
+
+        await risk_manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_scheduler_stops_on_component_stop(self, risk_config, mock_event_bus):
+        """Scheduler should be cancelled when component stops."""
+        risk_config.get.side_effect = lambda key, default=None: {
+            "risk.daily_reset_enabled": True,
+            "risk.daily_reset_time_utc": "00:00",
+        }.get(key, default)
+
+        risk_manager = RiskManager(config=risk_config, event_bus=mock_event_bus)
+        await risk_manager.start()
+
+        assert risk_manager._reset_task is not None
+        task = risk_manager._reset_task
+
+        await risk_manager.stop()
+
+        # Task should be cancelled
+        assert risk_manager._reset_task is None
+        assert task.cancelled()
+
+
+class TestDailyStatsEventPublishing:
+    """Test daily stats event publishing."""
+
+    @pytest.mark.asyncio
+    async def test_daily_stats_event_published_on_pnl(self, risk_manager, mock_event_bus):
+        """Daily stats event should be published when P&L is recorded."""
+        await risk_manager.start()
+
+        risk_manager.record_pnl(Decimal("-25.0"))
+
+        # Allow event loop to process
+        import asyncio
+        await asyncio.sleep(0.01)
+
+        # Check if daily_stats event was published
+        calls = mock_event_bus.publish.call_args_list
+        daily_stats_calls = [c for c in calls if c[0][0] == "risk.daily_stats"]
+
+        assert len(daily_stats_calls) > 0
+        event_data = daily_stats_calls[0][0][1]
+        assert event_data["daily_pnl"] == "-25.0"
+
+    @pytest.mark.asyncio
+    async def test_daily_stats_includes_thresholds(self, risk_manager, mock_event_bus):
+        """Daily stats event should include threshold information."""
+        await risk_manager.start()
+
+        risk_manager.record_pnl(Decimal("-10.0"))
+
+        import asyncio
+        await asyncio.sleep(0.01)
+
+        calls = mock_event_bus.publish.call_args_list
+        daily_stats_calls = [c for c in calls if c[0][0] == "risk.daily_stats"]
+
+        assert len(daily_stats_calls) > 0
+        event_data = daily_stats_calls[0][0][1]
+
+        assert "warning_threshold_usd" in event_data
+        assert "caution_threshold_usd" in event_data
+        assert "halt_threshold_usd" in event_data
+        assert "loss_limit_pct" in event_data
+
+    @pytest.mark.asyncio
+    async def test_daily_stats_includes_drawdown(self, risk_manager, mock_event_bus):
+        """Daily stats event should include peak and drawdown."""
+        await risk_manager.start()
+
+        risk_manager.record_pnl(Decimal("50.0"))
+        risk_manager.record_pnl(Decimal("-30.0"))
+
+        import asyncio
+        await asyncio.sleep(0.01)
+
+        calls = mock_event_bus.publish.call_args_list
+        daily_stats_calls = [c for c in calls if c[0][0] == "risk.daily_stats"]
+
+        # Get the most recent event
+        event_data = daily_stats_calls[-1][0][1]
+
+        assert event_data["daily_peak_pnl"] == "50.0"
+        assert event_data["daily_max_drawdown"] == "30.0"
+
+
+class TestLossLimitThresholds:
+    """Test loss limit threshold behavior."""
+
+    def test_warning_threshold_trips_at_50_loss(self, risk_manager):
+        """WARNING should trip at $50 loss threshold."""
+        risk_manager.record_pnl(Decimal("-55.0"))
+
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.WARNING
+        assert risk_manager.size_multiplier == 0.5
+
+    def test_caution_threshold_trips_at_75_loss(self, risk_manager):
+        """CAUTION should trip at $75 loss threshold."""
+        risk_manager.record_pnl(Decimal("-80.0"))
+
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.CAUTION
+        assert risk_manager.can_open_positions is False
+
+    def test_halt_threshold_trips_at_100_loss(self, risk_manager):
+        """HALT should trip at $100 loss threshold."""
+        risk_manager.record_pnl(Decimal("-105.0"))
+
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.HALT
+
+    def test_incremental_losses_accumulate(self, risk_manager):
+        """Incremental losses should accumulate toward thresholds."""
+        # Record multiple smaller losses
+        risk_manager.record_pnl(Decimal("-20.0"))
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.NORMAL
+
+        risk_manager.record_pnl(Decimal("-20.0"))
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.NORMAL
+
+        risk_manager.record_pnl(Decimal("-15.0"))
+        # Now at -55, should be WARNING
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.WARNING
+
+        risk_manager.record_pnl(Decimal("-25.0"))
+        # Now at -80, should be CAUTION
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.CAUTION
+
+    def test_profits_offset_losses(self, risk_manager):
+        """Profits should offset losses in daily tracking."""
+        risk_manager.record_pnl(Decimal("-60.0"))
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.WARNING
+
+        # Profit brings us back under threshold
+        risk_manager.record_pnl(Decimal("15.0"))
+        # Still at WARNING since we don't downgrade via trip
+        # (recovery happens on reset)
+        assert risk_manager.daily_pnl == Decimal("-45.0")

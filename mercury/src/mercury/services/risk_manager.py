@@ -7,6 +7,7 @@ This service:
 - Publishes risk.circuit_breaker events on state changes
 - Approves or rejects signals via event bus
 - Enforces position limits via StateStore queries
+- Schedules automatic daily reset at configurable time
 
 Circuit Breaker Levels (ported from legacy/src/risk/circuit_breaker.py):
 - NORMAL: All systems go, full position sizes
@@ -18,9 +19,16 @@ Position Limits:
 - max_position_size_usd: Maximum size for any single trade
 - max_unhedged_exposure_usd: Maximum total unhedged exposure across all markets
 - max_per_market_exposure_usd: Maximum exposure in a single market
+
+Daily Loss Tracking:
+- Tracks realized P&L throughout the day
+- Trips circuit breaker at warning/caution/halt thresholds
+- Resets at configurable time (midnight UTC by default)
+- Publishes risk.daily_stats events with current P&L state
 """
 
-from datetime import datetime, timedelta, timezone
+import asyncio
+from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -103,6 +111,13 @@ class RiskManager(BaseComponent):
         self._cooldown_minutes = self._get_int("risk.circuit_breaker_cooldown_minutes", 5)
         self._cooldown_duration = timedelta(minutes=self._cooldown_minutes)
 
+        # Daily reset configuration
+        self._daily_reset_enabled = self._config.get("risk.daily_reset_enabled", True)
+        self._daily_reset_time_utc = self._parse_reset_time(
+            self._config.get("risk.daily_reset_time_utc", "00:00")
+        )
+        self._reset_task: Optional[asyncio.Task[None]] = None
+
         # State tracking
         self._daily_pnl: Decimal = Decimal("0")
         self._daily_volume: Decimal = Decimal("0")
@@ -117,6 +132,9 @@ class RiskManager(BaseComponent):
         self._last_reset: datetime = datetime.now(timezone.utc)
         # Per-market exposure tracking (in-memory cache, updated from fills)
         self._market_exposures: dict[str, Decimal] = {}
+        # Peak/max tracking for daily stats
+        self._daily_peak_pnl: Decimal = Decimal("0")
+        self._daily_max_drawdown: Decimal = Decimal("0")
 
     def _get_decimal(self, key: str, default: Decimal) -> Decimal:
         """Get a decimal config value."""
@@ -132,6 +150,62 @@ class RiskManager(BaseComponent):
             return default
         return int(value)
 
+    def _parse_reset_time(self, time_str: str) -> time:
+        """Parse reset time from HH:MM string format.
+
+        Args:
+            time_str: Time in "HH:MM" format (24-hour).
+
+        Returns:
+            time object representing the reset time.
+        """
+        try:
+            parts = time_str.split(":")
+            hour = int(parts[0])
+            minute = int(parts[1]) if len(parts) > 1 else 0
+            return time(hour=hour, minute=minute, tzinfo=timezone.utc)
+        except (ValueError, IndexError):
+            self._log.warning(
+                "invalid_reset_time_format",
+                time_str=time_str,
+                using_default="00:00",
+            )
+            return time(hour=0, minute=0, tzinfo=timezone.utc)
+
+    def _get_next_reset_datetime(self) -> datetime:
+        """Calculate the next daily reset datetime.
+
+        Returns:
+            datetime of the next scheduled reset in UTC.
+        """
+        now = datetime.now(timezone.utc)
+        today_reset = datetime.combine(
+            now.date(),
+            self._daily_reset_time_utc,
+            tzinfo=timezone.utc,
+        )
+
+        # If today's reset time has already passed, schedule for tomorrow
+        if now >= today_reset:
+            tomorrow = now.date() + timedelta(days=1)
+            return datetime.combine(
+                tomorrow,
+                self._daily_reset_time_utc,
+                tzinfo=timezone.utc,
+            )
+
+        return today_reset
+
+    def _get_seconds_until_reset(self) -> float:
+        """Get seconds until the next daily reset.
+
+        Returns:
+            Number of seconds until the next reset.
+        """
+        next_reset = self._get_next_reset_datetime()
+        now = datetime.now(timezone.utc)
+        return (next_reset - now).total_seconds()
+
     async def _do_start(self) -> None:
         """Start the risk manager."""
         self._log.info(
@@ -141,6 +215,8 @@ class RiskManager(BaseComponent):
             max_unhedged_exposure=str(self._limits.max_unhedged_exposure_usd),
             max_per_market_exposure=str(self._limits.max_per_market_exposure_usd),
             state_store_enabled=self._state_store is not None,
+            daily_reset_enabled=self._daily_reset_enabled,
+            daily_reset_time_utc=self._daily_reset_time_utc.isoformat(),
         )
 
         # Subscribe to events
@@ -148,10 +224,29 @@ class RiskManager(BaseComponent):
         await self._event_bus.subscribe("order.filled", self._on_order_filled)
         await self._event_bus.subscribe("position.closed", self._on_position_closed)
 
+        # Start daily reset scheduler if enabled
+        if self._daily_reset_enabled:
+            self._reset_task = asyncio.create_task(self._daily_reset_scheduler())
+            self._log.info(
+                "daily_reset_scheduler_started",
+                next_reset=self._get_next_reset_datetime().isoformat(),
+                seconds_until_reset=self._get_seconds_until_reset(),
+            )
+
         self._log.info("risk_manager_started")
 
     async def _do_stop(self) -> None:
         """Stop the risk manager."""
+        # Cancel daily reset scheduler if running
+        if self._reset_task is not None:
+            self._reset_task.cancel()
+            try:
+                await self._reset_task
+            except asyncio.CancelledError:
+                pass
+            self._reset_task = None
+            self._log.info("daily_reset_scheduler_stopped")
+
         self._log.info("risk_manager_stopped")
 
     async def _do_health_check(self) -> HealthCheckResult:
@@ -392,19 +487,37 @@ class RiskManager(BaseComponent):
     def record_pnl(self, pnl: Decimal) -> None:
         """Record realized P&L.
 
+        Updates daily P&L, peak P&L, and max drawdown tracking.
+        Triggers circuit breaker state transitions based on loss thresholds.
+        Publishes risk.daily_stats event with updated metrics.
+
         Args:
             pnl: P&L amount (positive = profit, negative = loss).
         """
         self._daily_pnl += pnl
 
+        # Update peak P&L tracking (high water mark)
+        if self._daily_pnl > self._daily_peak_pnl:
+            self._daily_peak_pnl = self._daily_pnl
+
+        # Calculate and track max drawdown from peak
+        drawdown = self._daily_peak_pnl - self._daily_pnl
+        if drawdown > self._daily_max_drawdown:
+            self._daily_max_drawdown = drawdown
+
         self._log.info(
             "pnl_recorded",
             pnl=str(pnl),
             daily_pnl=str(self._daily_pnl),
+            peak_pnl=str(self._daily_peak_pnl),
+            max_drawdown=str(self._daily_max_drawdown),
         )
 
         # Update circuit breaker based on loss
         self._update_circuit_breaker_for_loss()
+
+        # Publish daily stats event asynchronously
+        self._publish_daily_stats_event()
 
     def record_failure(self) -> None:
         """Record a trading failure for circuit breaker tracking.
@@ -561,6 +674,121 @@ class RiskManager(BaseComponent):
         except Exception as e:
             self._log.error("failed_to_publish_circuit_breaker_event", error=str(e))
 
+    def _publish_daily_stats_event(self) -> None:
+        """Publish risk.daily_stats event with current P&L metrics.
+
+        This is called after each P&L update to provide real-time tracking.
+        The event is published asynchronously (fire and forget).
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._async_publish_daily_stats())
+        except RuntimeError:
+            # No event loop running (e.g., in sync tests) - skip publishing
+            pass
+
+    async def _async_publish_daily_stats(self) -> None:
+        """Async implementation of daily stats event publishing."""
+        try:
+            # Calculate loss percentage relative to limit
+            loss_pct = Decimal("0")
+            if self._limits.max_daily_loss_usd > 0:
+                current_loss = -self._daily_pnl if self._daily_pnl < 0 else Decimal("0")
+                loss_pct = (current_loss / self._limits.max_daily_loss_usd) * 100
+
+            await self._event_bus.publish(
+                "risk.daily_stats",
+                {
+                    "daily_pnl": str(self._daily_pnl),
+                    "daily_peak_pnl": str(self._daily_peak_pnl),
+                    "daily_max_drawdown": str(self._daily_max_drawdown),
+                    "daily_volume": str(self._daily_volume),
+                    "daily_trades": self._daily_trades,
+                    "current_exposure": str(self._current_exposure),
+                    "loss_limit_pct": str(loss_pct),
+                    "loss_limit_usd": str(self._limits.max_daily_loss_usd),
+                    "circuit_breaker_state": self._circuit_breaker_state.value,
+                    "warning_threshold_usd": str(self._warning_loss),
+                    "caution_threshold_usd": str(self._caution_loss),
+                    "halt_threshold_usd": str(self._halt_loss),
+                    "last_reset": self._last_reset.isoformat(),
+                    "next_reset": self._get_next_reset_datetime().isoformat(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+        except Exception as e:
+            self._log.error("failed_to_publish_daily_stats_event", error=str(e))
+
+    async def _daily_reset_scheduler(self) -> None:
+        """Background task that schedules daily resets at configured time.
+
+        This task runs continuously and waits until the next reset time,
+        then performs the reset and publishes a reset event.
+        """
+        self._log.info("daily_reset_scheduler_loop_started")
+
+        while True:
+            try:
+                # Calculate time until next reset
+                seconds_until_reset = self._get_seconds_until_reset()
+
+                self._log.debug(
+                    "daily_reset_scheduled",
+                    next_reset=self._get_next_reset_datetime().isoformat(),
+                    seconds_until_reset=seconds_until_reset,
+                )
+
+                # Wait until reset time
+                await asyncio.sleep(seconds_until_reset)
+
+                # Perform the reset
+                self._log.info(
+                    "performing_scheduled_daily_reset",
+                    reset_time=datetime.now(timezone.utc).isoformat(),
+                )
+
+                # Capture pre-reset stats for the event
+                pre_reset_stats = {
+                    "final_pnl": str(self._daily_pnl),
+                    "final_peak_pnl": str(self._daily_peak_pnl),
+                    "final_max_drawdown": str(self._daily_max_drawdown),
+                    "final_volume": str(self._daily_volume),
+                    "final_trades": self._daily_trades,
+                    "final_circuit_breaker_state": self._circuit_breaker_state.value,
+                }
+
+                # Do the reset
+                self.reset_daily()
+
+                # Publish daily reset event
+                await self._event_bus.publish(
+                    "risk.daily_reset",
+                    {
+                        **pre_reset_stats,
+                        "reset_time": self._last_reset.isoformat(),
+                        "next_reset": self._get_next_reset_datetime().isoformat(),
+                        "reset_type": "scheduled",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+
+                self._log.info(
+                    "daily_reset_completed",
+                    next_reset=self._get_next_reset_datetime().isoformat(),
+                )
+
+            except asyncio.CancelledError:
+                self._log.info("daily_reset_scheduler_cancelled")
+                raise
+            except Exception as e:
+                self._log.error(
+                    "daily_reset_scheduler_error",
+                    error=str(e),
+                    retry_in_seconds=60,
+                )
+                # Wait a bit before retrying on error
+                await asyncio.sleep(60)
+
     def _is_cooldown_expired(self) -> bool:
         """Check if circuit breaker cooldown has expired."""
         if self._cooldown_until is None:
@@ -568,12 +796,22 @@ class RiskManager(BaseComponent):
         return datetime.now(timezone.utc) >= self._cooldown_until
 
     def reset_daily(self) -> None:
-        """Reset daily counters (called at midnight or on demand)."""
+        """Reset daily counters (called at midnight or on demand).
+
+        Resets:
+        - Daily P&L, volume, and trade count
+        - Current and per-market exposure
+        - Peak P&L and max drawdown tracking
+        - Consecutive failure count
+        - Circuit breaker state to NORMAL
+        """
         self._log.info(
             "resetting_daily_limits",
             final_pnl=str(self._daily_pnl),
             final_trades=self._daily_trades,
             final_volume=str(self._daily_volume),
+            final_peak_pnl=str(self._daily_peak_pnl),
+            final_max_drawdown=str(self._daily_max_drawdown),
             final_circuit_breaker_state=self._circuit_breaker_state.value,
             markets_with_exposure=len(self._market_exposures),
         )
@@ -590,6 +828,9 @@ class RiskManager(BaseComponent):
         self._circuit_breaker_reasons = []
         self._cooldown_until = None
         self._last_reset = datetime.now(timezone.utc)
+        # Reset peak/drawdown tracking
+        self._daily_peak_pnl = Decimal("0")
+        self._daily_max_drawdown = Decimal("0")
 
     @property
     def circuit_breaker_state(self) -> CircuitBreakerState:
@@ -659,6 +900,41 @@ class RiskManager(BaseComponent):
     def limits(self) -> RiskLimits:
         """Get configured risk limits."""
         return self._limits
+
+    @property
+    def daily_peak_pnl(self) -> Decimal:
+        """Get daily peak P&L (high water mark)."""
+        return self._daily_peak_pnl
+
+    @property
+    def daily_max_drawdown(self) -> Decimal:
+        """Get daily maximum drawdown from peak."""
+        return self._daily_max_drawdown
+
+    @property
+    def daily_volume(self) -> Decimal:
+        """Get daily trading volume."""
+        return self._daily_volume
+
+    @property
+    def last_reset(self) -> datetime:
+        """Get timestamp of last daily reset."""
+        return self._last_reset
+
+    @property
+    def next_reset(self) -> datetime:
+        """Get timestamp of next scheduled daily reset."""
+        return self._get_next_reset_datetime()
+
+    @property
+    def daily_reset_enabled(self) -> bool:
+        """Check if automatic daily reset is enabled."""
+        return self._daily_reset_enabled
+
+    @property
+    def daily_reset_time_utc(self) -> time:
+        """Get configured daily reset time in UTC."""
+        return self._daily_reset_time_utc
 
     async def _on_signal(self, data: dict) -> None:
         """Handle incoming trading signal from event bus."""
