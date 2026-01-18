@@ -3154,3 +3154,205 @@ class TestBuildApprovedSignal:
         assert signal.no_token_id == ""
 
         await execution_engine.stop()
+
+
+class TestSignalValidationFlowIntegration:
+    """Integration tests for signal validation flow.
+
+    Tests that ExecutionEngine properly receives and processes
+    approved signals from RiskManager via the event bus.
+    """
+
+    @pytest.mark.asyncio
+    async def test_execution_engine_subscribes_to_approved_signals(
+        self, execution_engine, mock_event_bus
+    ):
+        """ExecutionEngine should subscribe to risk.approved.* events."""
+        await execution_engine.start()
+
+        # Verify subscription to risk.approved.*
+        subscribe_calls = mock_event_bus.subscribe.call_args_list
+        patterns = [call[0][0] for call in subscribe_calls]
+
+        assert "risk.approved.*" in patterns
+
+        await execution_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_approved_signal_triggers_execution(
+        self, execution_engine, mock_event_bus
+    ):
+        """Approved signal events should trigger execution."""
+        await execution_engine.start()
+
+        # Simulate approved signal from RiskManager
+        approved_signal_data = {
+            "signal_id": "risk-approved-test",
+            "market_id": "btc-market",
+            "signal_type": "ARBITRAGE",
+            "approved_size_usd": "10.0",
+            "target_size_usd": "10.0",
+            "yes_price": "0.48",
+            "no_price": "0.50",
+            "yes_token_id": "yes-token",
+            "no_token_id": "no-token",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+        # Call the handler directly (simulating event bus callback)
+        await execution_engine._on_approved_signal(approved_signal_data)
+
+        # Give time for queue processing
+        await asyncio.sleep(0.2)
+
+        # Check that signal was queued
+        assert execution_engine._total_queued >= 1
+
+        await execution_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_approved_signal_preserves_signal_id(
+        self, execution_engine, mock_event_bus
+    ):
+        """Signal ID from approved event should be preserved through execution."""
+        await execution_engine.start()
+
+        approved_signal_data = {
+            "signal_id": "preserve-id-test-12345",
+            "market_id": "test-market",
+            "signal_type": "ARBITRAGE",
+            "target_size_usd": "10.0",
+            "yes_price": "0.48",
+            "no_price": "0.50",
+        }
+
+        await execution_engine._on_approved_signal(approved_signal_data)
+
+        # Check signal was queued with correct ID
+        assert "preserve-id-test-12345" in execution_engine._queue_items
+
+        await execution_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_approved_signal_respects_priority(
+        self, execution_engine, mock_event_bus
+    ):
+        """Priority from approved signal should be respected."""
+        await execution_engine.start()
+
+        high_priority_signal = {
+            "signal_id": "high-priority-signal",
+            "market_id": "test-market",
+            "signal_type": "ARBITRAGE",
+            "target_size_usd": "10.0",
+            "yes_price": "0.48",
+            "no_price": "0.50",
+            "priority": "critical",
+        }
+
+        low_priority_signal = {
+            "signal_id": "low-priority-signal",
+            "market_id": "test-market",
+            "signal_type": "ARBITRAGE",
+            "target_size_usd": "5.0",
+            "yes_price": "0.48",
+            "no_price": "0.50",
+            "priority": "low",
+        }
+
+        await execution_engine._on_approved_signal(low_priority_signal)
+        await execution_engine._on_approved_signal(high_priority_signal)
+
+        # Both should be queued
+        assert "high-priority-signal" in execution_engine._queue_items
+        assert "low-priority-signal" in execution_engine._queue_items
+
+        # High priority should have CRITICAL priority
+        high_qs = execution_engine._queue_items["high-priority-signal"]
+        assert high_qs.priority == SignalPriority.CRITICAL
+
+        low_qs = execution_engine._queue_items["low-priority-signal"]
+        assert low_qs.priority == SignalPriority.LOW
+
+        await execution_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_approved_signal_publishes_queue_event(
+        self, execution_engine, mock_event_bus
+    ):
+        """Approved signal processing should publish queue events."""
+        await execution_engine.start()
+
+        approved_signal_data = {
+            "signal_id": "queue-event-test",
+            "market_id": "test-market",
+            "signal_type": "ARBITRAGE",
+            "target_size_usd": "10.0",
+            "yes_price": "0.48",
+            "no_price": "0.50",
+        }
+
+        await execution_engine._on_approved_signal(approved_signal_data)
+
+        # Check execution.queue.added event was published
+        calls = mock_event_bus.publish.call_args_list
+        queue_added_calls = [c for c in calls if c[0][0] == "execution.queue.added"]
+
+        assert len(queue_added_calls) >= 1
+        event_data = queue_added_calls[0][0][1]
+        assert event_data["signal_id"] == "queue-event-test"
+
+        await execution_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_execution_engine_ignores_rejected_signals(
+        self, execution_engine, mock_event_bus
+    ):
+        """ExecutionEngine should NOT subscribe to risk.rejected.* events."""
+        await execution_engine.start()
+
+        # Verify no subscription to risk.rejected.*
+        subscribe_calls = mock_event_bus.subscribe.call_args_list
+        patterns = [call[0][0] for call in subscribe_calls]
+
+        assert "risk.rejected.*" not in patterns
+
+        await execution_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_full_signal_flow_dry_run(
+        self, execution_engine, mock_event_bus
+    ):
+        """Test complete signal flow from approval to execution in dry-run mode."""
+        await execution_engine.start()
+
+        # Ensure we're in dry-run mode
+        assert execution_engine._dry_run is True
+
+        approved_signal_data = {
+            "signal_id": "full-flow-test",
+            "market_id": "flow-test-market",
+            "signal_type": "ARBITRAGE",
+            "target_size_usd": "10.0",
+            "yes_price": "0.48",
+            "no_price": "0.50",
+            "yes_token_id": "yes-flow",
+            "no_token_id": "no-flow",
+        }
+
+        await execution_engine._on_approved_signal(approved_signal_data)
+
+        # Wait for execution to complete
+        await asyncio.sleep(0.5)
+
+        # Check execution happened
+        assert execution_engine._total_executed >= 1 or execution_engine._total_queued >= 1
+
+        # Check execution events were published
+        calls = mock_event_bus.publish.call_args_list
+        event_channels = [c[0][0] for c in calls]
+
+        # Should have queue and possibly execution events
+        assert any("execution." in ch for ch in event_channels)
+
+        await execution_engine.stop()

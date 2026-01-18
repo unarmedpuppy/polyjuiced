@@ -1343,3 +1343,393 @@ class TestLossLimitThresholds:
         # Still at WARNING since we don't downgrade via trip
         # (recovery happens on reset)
         assert risk_manager.daily_pnl == Decimal("-45.0")
+
+
+class TestSignalValidationFlow:
+    """Test the signal validation flow - RiskManager receives signals,
+    validates, and publishes risk.approved or risk.rejected events."""
+
+    @pytest.mark.asyncio
+    async def test_approved_event_includes_signal_id(self, risk_manager, mock_event_bus):
+        """Approved event should include the original signal_id."""
+        signal = TradingSignal(
+            signal_id="approval-test-123",
+            strategy_name="gabagool",
+            market_id="test-market",
+            signal_type=SignalType.ARBITRAGE,
+            confidence=0.8,
+            target_size_usd=Decimal("10.0"),
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+
+        await risk_manager.validate_signal(signal)
+
+        # Find the approved event
+        calls = mock_event_bus.publish.call_args_list
+        approved_calls = [c for c in calls if "risk.approved" in c[0][0]]
+
+        assert len(approved_calls) == 1
+        channel, data = approved_calls[0][0]
+        assert channel == "risk.approved.approval-test-123"
+        assert data["signal_id"] == "approval-test-123"
+
+    @pytest.mark.asyncio
+    async def test_approved_event_includes_market_details(self, risk_manager, mock_event_bus):
+        """Approved event should include market_id, signal_type, and prices."""
+        signal = TradingSignal(
+            signal_id="market-details-test",
+            strategy_name="gabagool",
+            market_id="btc-prediction-market",
+            signal_type=SignalType.ARBITRAGE,
+            confidence=0.8,
+            target_size_usd=Decimal("15.0"),
+            yes_price=Decimal("0.45"),
+            no_price=Decimal("0.52"),
+        )
+
+        await risk_manager.validate_signal(signal)
+
+        calls = mock_event_bus.publish.call_args_list
+        approved_calls = [c for c in calls if "risk.approved" in c[0][0]]
+
+        assert len(approved_calls) == 1
+        _, data = approved_calls[0][0]
+
+        assert data["market_id"] == "btc-prediction-market"
+        assert data["signal_type"] == "ARBITRAGE"
+        assert data["yes_price"] == "0.45"
+        assert data["no_price"] == "0.52"
+        assert data["approved_size_usd"] == "15.0"
+        assert "timestamp" in data
+
+    @pytest.mark.asyncio
+    async def test_rejected_event_includes_reason(self, risk_manager, mock_event_bus):
+        """Rejected event should include rejection reason."""
+        signal = TradingSignal(
+            signal_id="reject-reason-test",
+            strategy_name="gabagool",
+            market_id="test-market",
+            signal_type=SignalType.ARBITRAGE,
+            confidence=0.8,
+            target_size_usd=Decimal("100.0"),  # Exceeds $25 limit
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+
+        result = await risk_manager.validate_signal(signal)
+
+        assert result is None  # Signal was rejected
+
+        calls = mock_event_bus.publish.call_args_list
+        rejected_calls = [c for c in calls if "risk.rejected" in c[0][0]]
+
+        assert len(rejected_calls) == 1
+        channel, data = rejected_calls[0][0]
+
+        assert channel == "risk.rejected.reject-reason-test"
+        assert data["signal_id"] == "reject-reason-test"
+        assert "reason" in data
+        assert data["reason"] is not None
+        assert len(data["reason"]) > 0
+        assert "timestamp" in data
+
+    @pytest.mark.asyncio
+    async def test_rejected_reason_explains_size_limit(self, risk_manager, mock_event_bus):
+        """Rejection reason should explain size limit violation."""
+        signal = TradingSignal(
+            signal_id="size-limit-test",
+            strategy_name="gabagool",
+            market_id="test-market",
+            signal_type=SignalType.ARBITRAGE,
+            confidence=0.8,
+            target_size_usd=Decimal("50.0"),  # Exceeds $25 limit
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+
+        await risk_manager.validate_signal(signal)
+
+        calls = mock_event_bus.publish.call_args_list
+        rejected_calls = [c for c in calls if "risk.rejected" in c[0][0]]
+
+        _, data = rejected_calls[0][0]
+        reason = data["reason"].lower()
+        assert "size" in reason or "limit" in reason or "exceeds" in reason
+
+    @pytest.mark.asyncio
+    async def test_rejected_reason_explains_daily_loss(self, risk_manager, mock_event_bus):
+        """Rejection reason should explain daily loss limit violation."""
+        risk_manager._daily_pnl = Decimal("-100.0")  # At limit
+
+        signal = TradingSignal(
+            signal_id="loss-limit-test",
+            strategy_name="gabagool",
+            market_id="test-market",
+            signal_type=SignalType.ARBITRAGE,
+            confidence=0.8,
+            target_size_usd=Decimal("10.0"),
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+
+        await risk_manager.validate_signal(signal)
+
+        calls = mock_event_bus.publish.call_args_list
+        rejected_calls = [c for c in calls if "risk.rejected" in c[0][0]]
+
+        _, data = rejected_calls[0][0]
+        reason = data["reason"].lower()
+        assert "daily loss" in reason
+
+    @pytest.mark.asyncio
+    async def test_rejected_reason_explains_circuit_breaker_halt(
+        self, risk_manager, mock_event_bus
+    ):
+        """Rejection reason should explain circuit breaker HALT state."""
+        from datetime import datetime, timezone, timedelta
+
+        # Trigger HALT state with active cooldown
+        risk_manager._circuit_breaker_state = CircuitBreakerState.HALT
+        risk_manager._cooldown_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+        risk_manager._circuit_breaker_reasons = ["5 consecutive failures"]
+
+        signal = TradingSignal(
+            signal_id="halt-test",
+            strategy_name="gabagool",
+            market_id="test-market",
+            signal_type=SignalType.ARBITRAGE,
+            confidence=0.8,
+            target_size_usd=Decimal("10.0"),
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+
+        await risk_manager.validate_signal(signal)
+
+        calls = mock_event_bus.publish.call_args_list
+        rejected_calls = [c for c in calls if "risk.rejected" in c[0][0]]
+
+        _, data = rejected_calls[0][0]
+        reason = data["reason"].lower()
+        assert "circuit breaker" in reason or "halt" in reason
+
+    @pytest.mark.asyncio
+    async def test_rejected_reason_explains_circuit_breaker_caution(
+        self, risk_manager, mock_event_bus
+    ):
+        """Rejection reason should explain CAUTION allows only position closes."""
+        # Trigger CAUTION state
+        for _ in range(4):
+            risk_manager.record_failure()
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.CAUTION
+
+        signal = TradingSignal(
+            signal_id="caution-test",
+            strategy_name="gabagool",
+            market_id="test-market",
+            signal_type=SignalType.ARBITRAGE,  # Not a CLOSE_POSITION
+            confidence=0.8,
+            target_size_usd=Decimal("10.0"),
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+
+        await risk_manager.validate_signal(signal)
+
+        calls = mock_event_bus.publish.call_args_list
+        rejected_calls = [c for c in calls if "risk.rejected" in c[0][0]]
+
+        _, data = rejected_calls[0][0]
+        reason = data["reason"].lower()
+        assert "caution" in reason
+        assert "close" in reason or "position" in reason
+
+    @pytest.mark.asyncio
+    async def test_event_bus_handler_processes_signals(self, risk_manager, mock_event_bus):
+        """_on_signal handler should process incoming signal events."""
+        await risk_manager.start()
+
+        # Simulate a signal event being received
+        signal_data = {
+            "signal_id": "event-bus-test",
+            "strategy": "gabagool",
+            "market_id": "test-market",
+            "signal_type": "ARBITRAGE",
+            "target_size_usd": "10.0",
+            "yes_price": "0.48",
+            "no_price": "0.50",
+            "confidence": 0.8,
+        }
+
+        await risk_manager._on_signal(signal_data)
+
+        # Should have published approved event
+        calls = mock_event_bus.publish.call_args_list
+        approved_calls = [c for c in calls if "risk.approved" in c[0][0]]
+        assert len(approved_calls) == 1
+
+        await risk_manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_event_bus_handler_rejects_invalid_signals(
+        self, risk_manager, mock_event_bus
+    ):
+        """_on_signal handler should reject signals exceeding limits."""
+        await risk_manager.start()
+
+        signal_data = {
+            "signal_id": "event-bus-reject-test",
+            "strategy": "gabagool",
+            "market_id": "test-market",
+            "signal_type": "ARBITRAGE",
+            "target_size_usd": "100.0",  # Exceeds limit
+            "yes_price": "0.48",
+            "no_price": "0.50",
+            "confidence": 0.8,
+        }
+
+        await risk_manager._on_signal(signal_data)
+
+        # Should have published rejected event
+        calls = mock_event_bus.publish.call_args_list
+        rejected_calls = [c for c in calls if "risk.rejected" in c[0][0]]
+        assert len(rejected_calls) == 1
+
+        await risk_manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_rejected_event_per_market_exposure(self, risk_manager, mock_event_bus):
+        """Rejection reason should explain per-market exposure violation."""
+        # Fill up market exposure
+        fill = Fill(
+            order_id="order-1",
+            market_id="test-market",
+            side="YES",
+            size=Decimal("200.0"),
+            price=Decimal("0.50"),
+            cost=Decimal("100.0"),  # At $100 limit
+        )
+        risk_manager.record_fill(fill)
+
+        signal = TradingSignal(
+            signal_id="market-exposure-test",
+            strategy_name="gabagool",
+            market_id="test-market",  # Same market, already at limit
+            signal_type=SignalType.ARBITRAGE,
+            confidence=0.8,
+            target_size_usd=Decimal("10.0"),
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+
+        await risk_manager.validate_signal(signal)
+
+        calls = mock_event_bus.publish.call_args_list
+        rejected_calls = [c for c in calls if "risk.rejected" in c[0][0]]
+
+        _, data = rejected_calls[0][0]
+        reason = data["reason"].lower()
+        assert "per-market" in reason or "market" in reason
+
+    @pytest.mark.asyncio
+    async def test_validate_returns_approved_signal_object(self, risk_manager):
+        """validate_signal should return ApprovedSignal object when approved."""
+        from mercury.domain.signal import ApprovedSignal
+
+        signal = TradingSignal(
+            signal_id="return-value-test",
+            strategy_name="gabagool",
+            market_id="test-market",
+            signal_type=SignalType.ARBITRAGE,
+            confidence=0.8,
+            target_size_usd=Decimal("10.0"),
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+
+        result = await risk_manager.validate_signal(signal)
+
+        assert result is not None
+        assert isinstance(result, ApprovedSignal)
+        assert result.signal == signal
+        assert result.approved_size_usd == Decimal("10.0")
+
+    @pytest.mark.asyncio
+    async def test_validate_returns_none_when_rejected(self, risk_manager):
+        """validate_signal should return None when rejected."""
+        signal = TradingSignal(
+            signal_id="none-return-test",
+            strategy_name="gabagool",
+            market_id="test-market",
+            signal_type=SignalType.ARBITRAGE,
+            confidence=0.8,
+            target_size_usd=Decimal("100.0"),  # Exceeds limit
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+
+        result = await risk_manager.validate_signal(signal)
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_multiple_signals_processed_independently(
+        self, risk_manager, mock_event_bus
+    ):
+        """Multiple signals should be processed independently."""
+        signal1 = TradingSignal(
+            signal_id="multi-1",
+            strategy_name="gabagool",
+            market_id="market-a",
+            signal_type=SignalType.ARBITRAGE,
+            confidence=0.8,
+            target_size_usd=Decimal("10.0"),  # Should pass
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+
+        signal2 = TradingSignal(
+            signal_id="multi-2",
+            strategy_name="gabagool",
+            market_id="market-b",
+            signal_type=SignalType.ARBITRAGE,
+            confidence=0.8,
+            target_size_usd=Decimal("100.0"),  # Should fail
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+
+        signal3 = TradingSignal(
+            signal_id="multi-3",
+            strategy_name="gabagool",
+            market_id="market-c",
+            signal_type=SignalType.ARBITRAGE,
+            confidence=0.8,
+            target_size_usd=Decimal("5.0"),  # Should pass
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+
+        result1 = await risk_manager.validate_signal(signal1)
+        result2 = await risk_manager.validate_signal(signal2)
+        result3 = await risk_manager.validate_signal(signal3)
+
+        assert result1 is not None  # Approved
+        assert result2 is None  # Rejected
+        assert result3 is not None  # Approved
+
+        calls = mock_event_bus.publish.call_args_list
+        approved_calls = [c for c in calls if "risk.approved" in c[0][0]]
+        rejected_calls = [c for c in calls if "risk.rejected" in c[0][0]]
+
+        assert len(approved_calls) == 2  # signal1 and signal3
+        assert len(rejected_calls) == 1  # signal2
+
+        # Verify correct signal IDs
+        approved_ids = [c[0][1]["signal_id"] for c in approved_calls]
+        assert "multi-1" in approved_ids
+        assert "multi-3" in approved_ids
+
+        rejected_ids = [c[0][1]["signal_id"] for c in rejected_calls]
+        assert "multi-2" in rejected_ids
