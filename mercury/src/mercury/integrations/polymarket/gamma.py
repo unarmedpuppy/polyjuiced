@@ -2,9 +2,17 @@
 
 The Gamma API provides market metadata, pricing, and search functionality.
 It is separate from the CLOB API which handles order execution.
+
+Features:
+- Async HTTP client with connection pooling
+- Exponential backoff retries for transient failures
+- TTL-based market metadata caching to reduce API calls
+- Type-safe data models (MarketInfo, Market15Min)
 """
 
 import json
+import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional
@@ -31,6 +39,125 @@ RETRY_ATTEMPTS = 3
 RETRY_WAIT_MIN = 1
 RETRY_WAIT_MAX = 10
 
+# Default cache TTL in seconds
+DEFAULT_CACHE_TTL = 60.0
+
+
+@dataclass
+class CacheEntry:
+    """A cached value with expiration time."""
+
+    value: MarketInfo
+    expires_at: float
+
+
+@dataclass
+class MarketCache:
+    """TTL-based cache for market metadata.
+
+    Reduces API calls by caching MarketInfo objects with configurable TTL.
+    Thread-safe for use in async contexts (single-threaded async loop).
+    """
+
+    ttl_seconds: float = DEFAULT_CACHE_TTL
+    _cache: dict[str, CacheEntry] = field(default_factory=dict)
+    _hits: int = 0
+    _misses: int = 0
+
+    def get(self, condition_id: str) -> Optional[MarketInfo]:
+        """Get a cached market if not expired.
+
+        Args:
+            condition_id: The market's condition ID.
+
+        Returns:
+            MarketInfo if cached and not expired, else None.
+        """
+        entry = self._cache.get(condition_id)
+        if entry is None:
+            self._misses += 1
+            return None
+
+        if time.monotonic() > entry.expires_at:
+            del self._cache[condition_id]
+            self._misses += 1
+            return None
+
+        self._hits += 1
+        return entry.value
+
+    def set(self, condition_id: str, market: MarketInfo) -> None:
+        """Cache a market with TTL.
+
+        Args:
+            condition_id: The market's condition ID.
+            market: The MarketInfo to cache.
+        """
+        self._cache[condition_id] = CacheEntry(
+            value=market,
+            expires_at=time.monotonic() + self.ttl_seconds,
+        )
+
+    def invalidate(self, condition_id: str) -> bool:
+        """Remove a market from cache.
+
+        Args:
+            condition_id: The market's condition ID.
+
+        Returns:
+            True if market was in cache, False otherwise.
+        """
+        if condition_id in self._cache:
+            del self._cache[condition_id]
+            return True
+        return False
+
+    def clear(self) -> int:
+        """Clear all cached entries.
+
+        Returns:
+            Number of entries cleared.
+        """
+        count = len(self._cache)
+        self._cache.clear()
+        return count
+
+    def cleanup_expired(self) -> int:
+        """Remove all expired entries.
+
+        Returns:
+            Number of entries removed.
+        """
+        now = time.monotonic()
+        expired = [k for k, v in self._cache.items() if now > v.expires_at]
+        for k in expired:
+            del self._cache[k]
+        return len(expired)
+
+    @property
+    def size(self) -> int:
+        """Number of entries in cache (including potentially expired)."""
+        return len(self._cache)
+
+    @property
+    def hit_rate(self) -> float:
+        """Cache hit rate (0.0 to 1.0)."""
+        total = self._hits + self._misses
+        if total == 0:
+            return 0.0
+        return self._hits / total
+
+    @property
+    def stats(self) -> dict:
+        """Cache statistics for observability."""
+        return {
+            "size": self.size,
+            "hits": self._hits,
+            "misses": self._misses,
+            "hit_rate": self.hit_rate,
+            "ttl_seconds": self.ttl_seconds,
+        }
+
 
 class GammaClientError(Exception):
     """Error from Gamma API client."""
@@ -48,24 +175,28 @@ class GammaClient:
     - 15-minute market discovery for arbitrage
 
     All methods are async and include retry logic for transient failures.
+    Market metadata is cached with configurable TTL to reduce API load.
     """
 
     def __init__(
         self,
         settings: PolymarketSettings,
         timeout: float = 30.0,
+        cache_ttl: float = DEFAULT_CACHE_TTL,
     ):
         """Initialize the Gamma client.
 
         Args:
             settings: Polymarket connection settings.
             timeout: HTTP request timeout in seconds.
+            cache_ttl: TTL for cached market metadata in seconds.
         """
         self._base_url = settings.gamma_url.rstrip("/")
         self._timeout = timeout
         self._proxy = settings.http_proxy
         self._client: Optional[httpx.AsyncClient] = None
         self._log = log.bind(component="gamma_client")
+        self._cache = MarketCache(ttl_seconds=cache_ttl)
 
     async def connect(self) -> None:
         """Initialize the HTTP client."""
@@ -161,6 +292,66 @@ class GammaClient:
             if e.response.status_code == 404:
                 return None
             raise
+
+    async def get_market_info(
+        self,
+        condition_id: str,
+        use_cache: bool = True,
+    ) -> Optional[MarketInfo]:
+        """Get market info with caching.
+
+        This is the preferred method for retrieving market metadata as it
+        uses the internal cache to reduce API calls.
+
+        Args:
+            condition_id: The market's condition ID.
+            use_cache: Whether to use cached data if available.
+
+        Returns:
+            MarketInfo if found, None otherwise.
+        """
+        # Check cache first
+        if use_cache:
+            cached = self._cache.get(condition_id)
+            if cached is not None:
+                self._log.debug(
+                    "market_cache_hit",
+                    condition_id=condition_id,
+                )
+                return cached
+
+        # Fetch from API
+        data = await self.get_market(condition_id)
+        if data is None:
+            return None
+
+        # Parse and cache
+        market_info = self.parse_market_info(data)
+        self._cache.set(condition_id, market_info)
+        self._log.debug(
+            "market_cached",
+            condition_id=condition_id,
+            ttl=self._cache.ttl_seconds,
+        )
+        return market_info
+
+    def invalidate_cache(self, condition_id: Optional[str] = None) -> int:
+        """Invalidate cached market data.
+
+        Args:
+            condition_id: Specific market to invalidate, or None to clear all.
+
+        Returns:
+            Number of entries invalidated.
+        """
+        if condition_id is not None:
+            return 1 if self._cache.invalidate(condition_id) else 0
+        return self._cache.clear()
+
+    @property
+    def cache_stats(self) -> dict:
+        """Get cache statistics for observability."""
+        return self._cache.stats
 
     @retry(
         stop=stop_after_attempt(RETRY_ATTEMPTS),
