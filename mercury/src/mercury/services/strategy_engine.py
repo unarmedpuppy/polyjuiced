@@ -4,13 +4,12 @@ This service:
 - Loads and manages trading strategies
 - Routes market data to strategies
 - Collects and publishes trading signals
-- Supports runtime enable/disable
+- Supports runtime enable/disable via events and config hot-reload
 """
 
 import asyncio
-import time
 from datetime import datetime
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, Optional, Set
 
 import structlog
 
@@ -32,14 +31,17 @@ class StrategyEngine(BaseComponent):
     2. Subscribes to market data for each strategy's markets
     3. Routes market data to appropriate strategies
     4. Collects signals and publishes to EventBus
+    5. Syncs strategy enabled/disabled state on config hot-reload
 
     Event channels subscribed:
     - market.orderbook.* - Market data for strategies
-    - system.strategy.enable - Enable a strategy
-    - system.strategy.disable - Disable a strategy
+    - system.strategy.enable - Enable a strategy at runtime
+    - system.strategy.disable - Disable a strategy at runtime
 
     Event channels published:
     - signal.{strategy_name} - Trading signals from strategies
+    - system.strategy.enabled - Published when a strategy is enabled
+    - system.strategy.disabled - Published when a strategy is disabled
     """
 
     def __init__(
@@ -61,6 +63,7 @@ class StrategyEngine(BaseComponent):
         self._strategies: Dict[str, BaseStrategy] = {}
         self._market_to_strategies: Dict[str, Set[str]] = {}
         self._should_run = False
+        self._config_reload_registered = False
 
     @property
     def strategy_count(self) -> int:
@@ -90,6 +93,12 @@ class StrategyEngine(BaseComponent):
         await self._event_bus.subscribe("system.strategy.enable", self._on_enable_strategy)
         await self._event_bus.subscribe("system.strategy.disable", self._on_disable_strategy)
 
+        # Register config reload callback to sync strategy states
+        if not self._config_reload_registered:
+            self._config.register_reload_callback(self._on_config_reload)
+            self._config_reload_registered = True
+            self._log.debug("config_reload_callback_registered")
+
         self._log.info(
             "strategy_engine_started",
             strategies=len(self._strategies),
@@ -103,6 +112,12 @@ class StrategyEngine(BaseComponent):
     async def stop(self) -> None:
         """Stop the strategy engine."""
         self._should_run = False
+
+        # Unregister config reload callback
+        if self._config_reload_registered:
+            self._config.unregister_reload_callback(self._on_config_reload)
+            self._config_reload_registered = False
+            self._log.debug("config_reload_callback_unregistered")
 
         # Stop all strategies
         for name, strategy in self._strategies.items():
@@ -202,40 +217,75 @@ class StrategyEngine(BaseComponent):
         strategy = self._strategies.get(name)
         return strategy is not None and strategy.enabled
 
-    async def enable_strategy(self, name: str) -> bool:
+    async def enable_strategy(self, name: str, publish_event: bool = True) -> bool:
         """Enable a strategy at runtime.
 
         Args:
             name: Strategy name.
+            publish_event: Whether to publish state change event.
 
         Returns:
-            True if enabled.
+            True if enabled, False if strategy not found or already enabled.
         """
         strategy = self._strategies.get(name)
         if strategy is None:
             self._log.warning("strategy_not_found", name=name)
             return False
 
+        if strategy.enabled:
+            # Already enabled, no state change
+            return True
+
         strategy.enable()
         self._log.info("strategy_enabled", name=name)
+
+        if publish_event:
+            await self._publish_state_change(name, enabled=True)
+
         return True
 
-    async def disable_strategy(self, name: str) -> bool:
+    async def disable_strategy(self, name: str, publish_event: bool = True) -> bool:
         """Disable a strategy at runtime.
 
         Args:
             name: Strategy name.
+            publish_event: Whether to publish state change event.
 
         Returns:
-            True if disabled.
+            True if disabled, False if strategy not found or already disabled.
         """
         strategy = self._strategies.get(name)
         if strategy is None:
             return False
 
+        if not strategy.enabled:
+            # Already disabled, no state change
+            return True
+
         strategy.disable()
         self._log.info("strategy_disabled", name=name)
+
+        if publish_event:
+            await self._publish_state_change(name, enabled=False)
+
         return True
+
+    async def _publish_state_change(self, name: str, enabled: bool) -> None:
+        """Publish strategy state change event.
+
+        Args:
+            name: Strategy name.
+            enabled: New enabled state.
+        """
+        channel = "system.strategy.enabled" if enabled else "system.strategy.disabled"
+        await self._event_bus.publish(
+            channel,
+            {
+                "strategy": name,
+                "enabled": enabled,
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+        )
 
     async def _on_market_data(self, data: dict) -> None:
         """Handle market data update."""
@@ -332,13 +382,91 @@ class StrategyEngine(BaseComponent):
         )
 
     async def _on_enable_strategy(self, data: dict) -> None:
-        """Handle enable strategy request."""
+        """Handle enable strategy request from event bus."""
         name = data.get("strategy")
         if name:
-            await self.enable_strategy(name)
+            # Don't publish event since this came from event bus
+            # (prevents infinite loop if someone listens to state change events)
+            await self.enable_strategy(name, publish_event=True)
 
     async def _on_disable_strategy(self, data: dict) -> None:
-        """Handle disable strategy request."""
+        """Handle disable strategy request from event bus."""
         name = data.get("strategy")
         if name:
-            await self.disable_strategy(name)
+            # Don't publish event since this came from event bus
+            await self.disable_strategy(name, publish_event=True)
+
+    def _on_config_reload(
+        self,
+        old_config: dict[str, Any],
+        new_config: dict[str, Any],
+    ) -> None:
+        """Handle configuration hot-reload.
+
+        Syncs strategy enabled/disabled states based on new config.
+        This is a synchronous callback, so we schedule the async work.
+
+        Args:
+            old_config: Previous configuration data.
+            new_config: New configuration data after reload.
+        """
+        self._log.info("config_reload_detected")
+
+        # Schedule the async sync operation
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # We're in an async context, schedule as a task
+                asyncio.create_task(self._sync_strategy_states_from_config())
+            else:
+                # Run directly (shouldn't happen in normal operation)
+                loop.run_until_complete(self._sync_strategy_states_from_config())
+        except RuntimeError:
+            # No event loop running, log and skip
+            self._log.warning("config_reload_no_event_loop")
+
+    async def _sync_strategy_states_from_config(self) -> None:
+        """Sync all strategy enabled/disabled states from configuration.
+
+        Reads the current configuration for each registered strategy
+        and enables/disables them accordingly.
+        """
+        enabled_count = 0
+        disabled_count = 0
+
+        for name in list(self._strategies.keys()):
+            # Check if strategy should be enabled according to config
+            config_enabled = self._config.get_bool(
+                f"strategies.{name}.enabled",
+                default=True,  # Default to enabled if not specified
+            )
+
+            strategy = self._strategies.get(name)
+            if strategy is None:
+                continue
+
+            if config_enabled and not strategy.enabled:
+                await self.enable_strategy(name)
+                enabled_count += 1
+            elif not config_enabled and strategy.enabled:
+                await self.disable_strategy(name)
+                disabled_count += 1
+
+        if enabled_count > 0 or disabled_count > 0:
+            self._log.info(
+                "strategies_synced_from_config",
+                enabled=enabled_count,
+                disabled=disabled_count,
+            )
+
+    async def sync_strategy_states(self) -> dict[str, bool]:
+        """Manually sync strategy states from configuration.
+
+        This can be called to force a sync of strategy states
+        with the current configuration values.
+
+        Returns:
+            Dict mapping strategy names to their new enabled state.
+        """
+        await self._sync_strategy_states_from_config()
+        return {name: s.enabled for name, s in self._strategies.items()}

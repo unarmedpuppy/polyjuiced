@@ -660,3 +660,200 @@ class TestEdgeCases:
 
         # Working strategy should still be stopped
         assert working_strategy._stopped
+
+
+class TestRuntimeStateChanges:
+    """Tests for runtime enable/disable with state change events."""
+
+    @pytest.mark.asyncio
+    async def test_enable_strategy_publishes_state_change_event(
+        self, strategy_engine, mock_strategy, mock_event_bus
+    ):
+        """Verify enabling a strategy publishes system.strategy.enabled event."""
+        mock_strategy.disable()
+        strategy_engine.register_strategy(mock_strategy)
+
+        await strategy_engine.enable_strategy("test_strategy")
+
+        # Find the state change event publish call
+        publish_calls = mock_event_bus.publish.call_args_list
+        state_change_calls = [
+            call for call in publish_calls
+            if call[0][0] == "system.strategy.enabled"
+        ]
+
+        assert len(state_change_calls) == 1
+        payload = state_change_calls[0][0][1]
+        assert payload["strategy"] == "test_strategy"
+        assert payload["enabled"] is True
+        assert "timestamp" in payload
+
+    @pytest.mark.asyncio
+    async def test_disable_strategy_publishes_state_change_event(
+        self, strategy_engine, mock_strategy, mock_event_bus
+    ):
+        """Verify disabling a strategy publishes system.strategy.disabled event."""
+        strategy_engine.register_strategy(mock_strategy)
+
+        await strategy_engine.disable_strategy("test_strategy")
+
+        publish_calls = mock_event_bus.publish.call_args_list
+        state_change_calls = [
+            call for call in publish_calls
+            if call[0][0] == "system.strategy.disabled"
+        ]
+
+        assert len(state_change_calls) == 1
+        payload = state_change_calls[0][0][1]
+        assert payload["strategy"] == "test_strategy"
+        assert payload["enabled"] is False
+
+    @pytest.mark.asyncio
+    async def test_enable_already_enabled_does_not_publish_event(
+        self, strategy_engine, mock_strategy, mock_event_bus
+    ):
+        """Verify enabling already-enabled strategy doesn't publish duplicate event."""
+        strategy_engine.register_strategy(mock_strategy)
+        assert mock_strategy.enabled is True
+
+        await strategy_engine.enable_strategy("test_strategy")
+
+        # Should not publish state change since already enabled
+        publish_calls = mock_event_bus.publish.call_args_list
+        state_change_calls = [
+            call for call in publish_calls
+            if call[0][0].startswith("system.strategy.")
+        ]
+
+        assert len(state_change_calls) == 0
+
+    @pytest.mark.asyncio
+    async def test_disable_already_disabled_does_not_publish_event(
+        self, strategy_engine, mock_strategy, mock_event_bus
+    ):
+        """Verify disabling already-disabled strategy doesn't publish duplicate event."""
+        mock_strategy.disable()
+        strategy_engine.register_strategy(mock_strategy)
+
+        await strategy_engine.disable_strategy("test_strategy")
+
+        publish_calls = mock_event_bus.publish.call_args_list
+        state_change_calls = [
+            call for call in publish_calls
+            if call[0][0].startswith("system.strategy.")
+        ]
+
+        assert len(state_change_calls) == 0
+
+    @pytest.mark.asyncio
+    async def test_enable_with_publish_false_skips_event(
+        self, strategy_engine, mock_strategy, mock_event_bus
+    ):
+        """Verify publish_event=False skips the state change event."""
+        mock_strategy.disable()
+        strategy_engine.register_strategy(mock_strategy)
+
+        await strategy_engine.enable_strategy("test_strategy", publish_event=False)
+
+        # Should not publish state change
+        publish_calls = mock_event_bus.publish.call_args_list
+        state_change_calls = [
+            call for call in publish_calls
+            if call[0][0].startswith("system.strategy.")
+        ]
+
+        assert len(state_change_calls) == 0
+        assert mock_strategy.enabled is True
+
+
+class TestConfigHotReload:
+    """Tests for configuration hot-reload integration."""
+
+    @pytest.mark.asyncio
+    async def test_start_registers_config_reload_callback(
+        self, strategy_engine, mock_config, mock_event_bus
+    ):
+        """Verify start() registers a config reload callback."""
+        mock_config.register_reload_callback = MagicMock()
+
+        await strategy_engine.start()
+
+        mock_config.register_reload_callback.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_stop_unregisters_config_reload_callback(
+        self, strategy_engine, mock_config, mock_event_bus
+    ):
+        """Verify stop() unregisters the config reload callback."""
+        mock_config.register_reload_callback = MagicMock()
+        mock_config.unregister_reload_callback = MagicMock()
+
+        await strategy_engine.start()
+        await strategy_engine.stop()
+
+        mock_config.unregister_reload_callback.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_config_reload_callback_only_registered_once(
+        self, strategy_engine, mock_config, mock_event_bus
+    ):
+        """Verify multiple starts don't register duplicate callbacks."""
+        mock_config.register_reload_callback = MagicMock()
+
+        await strategy_engine.start()
+        await strategy_engine.stop()
+        await strategy_engine.start()
+
+        # Should only register once (stop unregisters, start registers again)
+        assert mock_config.register_reload_callback.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_sync_strategy_states_enables_from_config(
+        self, strategy_engine, mock_strategy, mock_event_bus, mock_config
+    ):
+        """Verify sync enables strategies based on config."""
+        mock_strategy.disable()
+        strategy_engine.register_strategy(mock_strategy)
+
+        # Configure strategy as enabled
+        mock_config.get_bool.return_value = True
+
+        await strategy_engine.sync_strategy_states()
+
+        assert mock_strategy.enabled is True
+
+    @pytest.mark.asyncio
+    async def test_sync_strategy_states_disables_from_config(
+        self, strategy_engine, mock_strategy, mock_event_bus, mock_config
+    ):
+        """Verify sync disables strategies based on config."""
+        strategy_engine.register_strategy(mock_strategy)
+        assert mock_strategy.enabled is True
+
+        # Configure strategy as disabled
+        mock_config.get_bool.return_value = False
+
+        await strategy_engine.sync_strategy_states()
+
+        assert mock_strategy.enabled is False
+
+    @pytest.mark.asyncio
+    async def test_sync_returns_current_states(
+        self, strategy_engine, mock_config, mock_event_bus
+    ):
+        """Verify sync returns dict of strategy states."""
+        strategy1 = MockStrategy("strategy_1")
+        strategy2 = MockStrategy("strategy_2")
+        strategy2.disable()
+
+        strategy_engine.register_strategy(strategy1)
+        strategy_engine.register_strategy(strategy2)
+
+        # Don't change anything via config
+        mock_config.get_bool.side_effect = lambda key, default: (
+            True if "strategy_1" in key else False
+        )
+
+        states = await strategy_engine.sync_strategy_states()
+
+        assert states == {"strategy_1": True, "strategy_2": False}

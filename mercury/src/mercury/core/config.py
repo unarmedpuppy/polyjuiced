@@ -9,7 +9,7 @@ Configuration hierarchy (later overrides earlier):
 import os
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 try:
     import tomllib
@@ -40,6 +40,7 @@ class ConfigManager:
         self._data: dict[str, Any] = {}
         self._env_prefix = env_prefix
         self._config_path = config_path
+        self._reload_callbacks: list[Callable[[dict[str, Any], dict[str, Any]], None]] = []
 
         if config_path and config_path.exists():
             self._load_toml(config_path)
@@ -224,9 +225,44 @@ class ConfigManager:
         """Reload configuration from TOML file.
 
         Useful for hot-reloading configuration changes.
+        Triggers all registered reload callbacks after reloading.
         """
         if self._config_path and self._config_path.exists():
+            old_data = self._data.copy()
             self._load_toml(self._config_path)
+
+            # Notify callbacks of the reload
+            for callback in self._reload_callbacks:
+                try:
+                    callback(old_data, self._data)
+                except Exception:
+                    # Callbacks should not break the reload
+                    pass
+
+    def register_reload_callback(
+        self,
+        callback: Callable[[dict[str, Any], dict[str, Any]], None],
+    ) -> None:
+        """Register a callback to be invoked when config is reloaded.
+
+        The callback receives (old_config, new_config) dicts.
+
+        Args:
+            callback: Function to call on reload with old and new config.
+        """
+        self._reload_callbacks.append(callback)
+
+    def unregister_reload_callback(
+        self,
+        callback: Callable[[dict[str, Any], dict[str, Any]], None],
+    ) -> None:
+        """Unregister a previously registered reload callback.
+
+        Args:
+            callback: The callback to remove.
+        """
+        if callback in self._reload_callbacks:
+            self._reload_callbacks.remove(callback)
 
     @property
     def raw_data(self) -> dict[str, Any]:
