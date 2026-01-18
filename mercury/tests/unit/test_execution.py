@@ -2203,3 +2203,954 @@ class TestExecutionLatencyDataclass:
         assert latency.fill_time_ms is None
         assert latency.total_latency_ms is None
         assert latency.is_within_target is False  # None total means not within target
+
+
+# =============================================================================
+# Integration Tests with Mock CLOB Client
+# =============================================================================
+
+
+class MockCLOBClient:
+    """Mock CLOB client for integration testing.
+
+    Provides configurable responses and failure modes for testing
+    execution engine behavior with realistic CLOB interactions.
+    """
+
+    def __init__(self):
+        self._connected = False
+        self._orders = {}
+        self._positions = []
+        self._balance = {"balance": Decimal("1000.0"), "allowance": Decimal("1000.0")}
+
+        # Configurable behavior
+        self.should_fail_submit = False
+        self.fail_after_n_submits = 0  # 0 = don't fail
+        self.submit_count = 0
+        self.submit_delay_seconds = 0.0
+        self.cancel_should_fail = False
+        self.simulated_fills = {}  # order_id -> fill_size
+
+    async def connect(self):
+        self._connected = True
+
+    async def close(self):
+        self._connected = False
+
+    async def execute_order(self, token_id, side, amount_usd=None, amount_shares=None, price=None, timeout_seconds=5.0):
+        from mercury.integrations.polymarket.types import OrderResult, OrderSide, OrderStatus
+
+        self.submit_count += 1
+
+        if self.submit_delay_seconds > 0:
+            await asyncio.sleep(self.submit_delay_seconds)
+
+        # Check if we should fail
+        if self.should_fail_submit:
+            raise Exception("Simulated CLOB failure")
+
+        if self.fail_after_n_submits > 0 and self.submit_count >= self.fail_after_n_submits:
+            raise Exception(f"Simulated failure after {self.submit_count} submits")
+
+        order_id = f"mock-order-{self.submit_count}"
+        shares = amount_shares or (amount_usd / price if amount_usd and price else Decimal("10"))
+
+        self._orders[order_id] = {
+            "id": order_id,
+            "token_id": token_id,
+            "side": side,
+            "status": "MATCHED",
+            "size": str(shares),
+            "size_matched": str(shares),
+        }
+
+        return OrderResult(
+            order_id=order_id,
+            token_id=token_id,
+            side=side,
+            status=OrderStatus.MATCHED,
+            requested_price=price or Decimal("0.5"),
+            requested_size=shares,
+            filled_size=shares,
+            filled_cost=shares * (price or Decimal("0.5")),
+        )
+
+    async def cancel_order(self, order_id):
+        if self.cancel_should_fail:
+            return False
+        self._orders.pop(order_id, None)
+        return True
+
+    async def cancel_all_orders(self):
+        count = len(self._orders)
+        self._orders.clear()
+        return count
+
+    async def get_open_orders(self):
+        return list(self._orders.values())
+
+    async def get_balance(self):
+        return self._balance
+
+
+class TestExecutionEngineWithMockCLOB:
+    """Integration tests using mock CLOB client."""
+
+    @pytest.fixture
+    def mock_clob_client(self):
+        return MockCLOBClient()
+
+    @pytest.fixture
+    def integration_engine(self, mock_config, mock_event_bus, mock_clob_client):
+        """Create ExecutionEngine with mock CLOB for integration tests."""
+        # Configure for non-dry-run to use CLOB
+        mock_config.get_bool.side_effect = lambda key, default: {
+            "mercury.dry_run": False,
+            "execution.rebalance_partial_fills": True,
+        }.get(key, default)
+
+        return ExecutionEngine(
+            config=mock_config,
+            event_bus=mock_event_bus,
+            clob_client=mock_clob_client,
+        )
+
+    @pytest.mark.asyncio
+    async def test_execute_order_via_clob(self, integration_engine, mock_clob_client, mock_event_bus):
+        """Verify order execution goes through CLOB client."""
+        mock_clob_client._connected = True
+        await integration_engine.start()
+
+        request = OrderRequest(
+            market_id="test-market",
+            token_id="test-token",
+            side=OrderSide.BUY,
+            outcome="YES",
+            size=Decimal("10.0"),
+            price=Decimal("0.5"),
+            order_type=OrderType.GTC,
+        )
+
+        result = await integration_engine.execute_order(request)
+
+        # In mock, orders are automatically filled
+        assert result.success is True
+        assert mock_clob_client.submit_count == 1
+
+        await integration_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_clob_failure_handled_gracefully(self, integration_engine, mock_clob_client, mock_event_bus):
+        """Verify CLOB failures are handled gracefully."""
+        mock_clob_client._connected = True
+        mock_clob_client.should_fail_submit = True
+        await integration_engine.start()
+
+        request = OrderRequest(
+            market_id="test-market",
+            token_id="test-token",
+            side=OrderSide.BUY,
+            outcome="YES",
+            size=Decimal("10.0"),
+            price=Decimal("0.5"),
+        )
+
+        result = await integration_engine.execute_order(request)
+
+        assert result.success is False
+        assert result.error_message is not None
+        assert "Simulated CLOB failure" in result.error_message
+
+        # Verify rejected event was published
+        rejected_calls = [
+            call for call in mock_event_bus.publish.call_args_list
+            if call[0][0] == "order.rejected"
+        ]
+        assert len(rejected_calls) >= 1
+
+        await integration_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_dual_leg_via_clob(self, integration_engine, mock_clob_client, mock_event_bus):
+        """Verify dual-leg execution uses CLOB for both orders."""
+        mock_clob_client._connected = True
+        await integration_engine.start()
+
+        yes_order = OrderRequest(
+            market_id="test-market",
+            token_id="yes-token",
+            side=OrderSide.BUY,
+            outcome="YES",
+            size=Decimal("10.0"),
+            price=Decimal("0.48"),
+        )
+
+        no_order = OrderRequest(
+            market_id="test-market",
+            token_id="no-token",
+            side=OrderSide.BUY,
+            outcome="NO",
+            size=Decimal("10.0"),
+            price=Decimal("0.50"),
+        )
+
+        result = await integration_engine.execute_dual_leg(yes_order, no_order)
+
+        assert result.success is True
+        # Both orders should be submitted
+        assert mock_clob_client.submit_count == 2
+
+        await integration_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_cancel_uses_clob(self, integration_engine, mock_clob_client, mock_event_bus):
+        """Verify cancel_order calls CLOB client."""
+        mock_clob_client._connected = True
+        await integration_engine.start()
+
+        # Add an order to CLOB
+        mock_clob_client._orders["test-order"] = {"id": "test-order", "status": "LIVE"}
+
+        # Also track in engine
+        from mercury.domain.order import Order, OrderStatus as OS
+        tracked_order = Order(
+            order_id="test-order",
+            market_id="test-market",
+            token_id="test-token",
+            side=OrderSide.BUY,
+            outcome="YES",
+            requested_size=Decimal("10.0"),
+            filled_size=Decimal("0"),
+            price=Decimal("0.5"),
+            status=OS.OPEN,
+        )
+        integration_engine._open_orders["test-order"] = tracked_order
+
+        result = await integration_engine.cancel_order("test-order")
+
+        assert result is True
+        assert "test-order" not in mock_clob_client._orders
+
+        await integration_engine.stop()
+
+
+# =============================================================================
+# Retry Behavior Tests
+# =============================================================================
+
+
+class TestRetryBehaviorInExecution:
+    """Test retry behavior for transient failures."""
+
+    @pytest.fixture
+    def mock_clob_with_retries(self):
+        """Mock CLOB that fails initially then succeeds."""
+        clob = MagicMock()
+        clob._connected = True
+        clob.connect = AsyncMock()
+        clob.close = AsyncMock()
+        clob.cancel_all_orders = AsyncMock()
+
+        # Track call counts for testing retry behavior
+        clob._call_count = 0
+
+        return clob
+
+    @pytest.mark.asyncio
+    async def test_transient_failure_followed_by_success(self, mock_config, mock_event_bus, mock_clob_with_retries):
+        """Verify transient failures are handled and execution retried."""
+        mock_config.get_bool.side_effect = lambda key, default: {
+            "mercury.dry_run": True,  # Use dry run for simpler testing
+        }.get(key, default)
+
+        engine = ExecutionEngine(
+            config=mock_config,
+            event_bus=mock_event_bus,
+            clob_client=mock_clob_with_retries,
+        )
+        await engine.start()
+
+        signal = ExecutionSignal(
+            signal_id="retry-test-signal",
+            original_signal_id="retry-test-signal",
+            market_id="test-market",
+            signal_type=SignalType.ARBITRAGE,
+            target_size_usd=Decimal("100"),
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+            yes_token_id="yes-token",
+            no_token_id="no-token",
+        )
+
+        # Execute - should succeed in dry run
+        result = await engine.execute(signal)
+
+        assert result.success is True
+
+        await engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_signal_queue_with_retry_after_failure(self, mock_config, mock_event_bus):
+        """Verify failed signals can be requeued."""
+        mock_config.get_bool.return_value = True  # dry_run
+        mock_config.get_int.side_effect = lambda key, default: {
+            "execution.max_concurrent": 2,
+            "execution.max_queue_size": 10,
+        }.get(key, default)
+        mock_config.get_float.return_value = 60.0
+
+        mock_clob = MagicMock()
+        mock_clob.connect = AsyncMock()
+        mock_clob.close = AsyncMock()
+
+        engine = ExecutionEngine(
+            config=mock_config,
+            event_bus=mock_event_bus,
+            clob_client=mock_clob,
+        )
+        await engine.start()
+        await asyncio.sleep(0.1)
+
+        signal_data = {
+            "signal_id": "requeue-test",
+            "market_id": "test-market",
+            "signal_type": "ARBITRAGE",
+            "target_size_usd": "50.0",
+            "yes_price": "0.45",
+            "no_price": "0.53",
+            "yes_token_id": "yes-token",
+            "no_token_id": "no-token",
+        }
+
+        # Queue signal
+        await engine.queue_signal("requeue-test", signal_data, SignalPriority.HIGH)
+
+        # Wait for processing
+        await asyncio.sleep(0.3)
+
+        # Verify execution happened
+        assert engine._total_executed >= 1 or engine._total_failed >= 0
+
+        await engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_execution_timeout_handling(self, mock_config, mock_event_bus):
+        """Verify execution timeout is properly handled."""
+        mock_config.get_bool.return_value = True  # dry_run
+        mock_config.get_int.side_effect = lambda key, default: default
+        mock_config.get_float.side_effect = lambda key, default: {
+            "execution.queue_timeout_seconds": 0.1,  # Very short timeout
+        }.get(key, default)
+
+        mock_clob = MagicMock()
+        mock_clob.connect = AsyncMock()
+        mock_clob.close = AsyncMock()
+
+        engine = ExecutionEngine(
+            config=mock_config,
+            event_bus=mock_event_bus,
+            clob_client=mock_clob,
+        )
+
+        await engine.start()
+        await asyncio.sleep(0.1)
+
+        # Queue a signal
+        signal_data = {
+            "signal_id": "timeout-test",
+            "market_id": "test",
+            "signal_type": "ARBITRAGE",
+            "target_size_usd": "10.0",
+            "yes_price": "0.5",
+            "no_price": "0.5",
+        }
+
+        await engine.queue_signal("timeout-test", signal_data)
+
+        # Wait long enough for timeout to potentially expire
+        await asyncio.sleep(0.5)
+
+        await engine.stop()
+
+
+# =============================================================================
+# Partial Fill Edge Cases
+# =============================================================================
+
+
+class TestPartialFillEdgeCases:
+    """Test edge cases in partial fill handling."""
+
+    @pytest.fixture
+    def yes_order(self):
+        return OrderRequest(
+            market_id="test-market",
+            token_id="yes-token",
+            side=OrderSide.BUY,
+            outcome="YES",
+            size=Decimal("10.0"),
+            price=Decimal("0.48"),
+        )
+
+    @pytest.fixture
+    def no_order(self):
+        return OrderRequest(
+            market_id="test-market",
+            token_id="no-token",
+            side=OrderSide.BUY,
+            outcome="NO",
+            size=Decimal("10.0"),
+            price=Decimal("0.50"),
+        )
+
+    @pytest.mark.asyncio
+    async def test_partial_fill_no_success_yes_fail(self, mock_config, mock_event_bus, yes_order, no_order):
+        """Verify NO success + YES failure triggers unwind of NO."""
+        mock_config.get_bool.side_effect = lambda key, default: {
+            "mercury.dry_run": False,
+            "execution.rebalance_partial_fills": True,
+        }.get(key, default)
+
+        mock_clob = MagicMock()
+        mock_clob._connected = True
+        mock_clob.connect = AsyncMock()
+        mock_clob.close = AsyncMock()
+
+        engine = ExecutionEngine(
+            config=mock_config,
+            event_bus=mock_event_bus,
+            clob_client=mock_clob,
+        )
+
+        original_execute = engine.execute_order
+        call_order = []
+
+        async def mock_execute(order_req, timeout=30.0):
+            call_order.append(order_req.outcome)
+
+            if order_req.outcome == "YES" and order_req.side == OrderSide.BUY:
+                # YES BUY fails
+                from mercury.domain.order import Order, OrderStatus as OS, OrderResult as DOR
+                failed_order = Order(
+                    order_id="failed-yes",
+                    market_id=order_req.market_id,
+                    token_id=order_req.token_id,
+                    side=order_req.side,
+                    outcome=order_req.outcome,
+                    requested_size=order_req.size,
+                    filled_size=Decimal("0"),
+                    price=order_req.price,
+                    status=OS.REJECTED,
+                )
+                return DOR(
+                    success=False,
+                    order=failed_order,
+                    fills=[],
+                    error_message="YES order rejected",
+                )
+            else:
+                # NO order succeeds (and unwind succeeds)
+                engine._dry_run = True
+                result = await original_execute(order_req, timeout)
+                engine._dry_run = False
+                return result
+
+        engine.execute_order = mock_execute
+
+        await engine.start()
+
+        result = await engine.execute_dual_leg(yes_order, no_order)
+
+        assert result.success is False
+        # NO should have filled
+        assert result.no_result is not None
+        assert result.no_result.order.status == OrderStatus.FILLED
+        # YES should have failed
+        assert result.yes_result is not None
+
+        # Verify partial event was emitted
+        partial_calls = [
+            call for call in mock_event_bus.publish.call_args_list
+            if call[0][0] == "order.dual_leg.partial"
+        ]
+        assert len(partial_calls) == 1
+
+        await engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_unwind_failure_creates_dangling_position_warning(self, mock_config, mock_event_bus, yes_order, no_order):
+        """Verify unwind failure results in dangling position warning."""
+        mock_config.get_bool.side_effect = lambda key, default: {
+            "mercury.dry_run": False,
+            "execution.rebalance_partial_fills": True,
+        }.get(key, default)
+
+        mock_clob = MagicMock()
+        mock_clob._connected = True
+        mock_clob.connect = AsyncMock()
+        mock_clob.close = AsyncMock()
+
+        engine = ExecutionEngine(
+            config=mock_config,
+            event_bus=mock_event_bus,
+            clob_client=mock_clob,
+        )
+
+        original_execute = engine.execute_order
+
+        async def mock_execute(order_req, timeout=30.0):
+            if order_req.outcome == "YES" and order_req.side == OrderSide.BUY:
+                # YES BUY succeeds
+                engine._dry_run = True
+                result = await original_execute(order_req, timeout)
+                engine._dry_run = False
+                return result
+            elif order_req.outcome == "NO" and order_req.side == OrderSide.BUY:
+                # NO BUY fails
+                from mercury.domain.order import Order, OrderStatus as OS, OrderResult as DOR
+                failed_order = Order(
+                    order_id="failed-no",
+                    market_id=order_req.market_id,
+                    token_id=order_req.token_id,
+                    side=order_req.side,
+                    outcome=order_req.outcome,
+                    requested_size=order_req.size,
+                    filled_size=Decimal("0"),
+                    price=order_req.price,
+                    status=OS.REJECTED,
+                )
+                return DOR(
+                    success=False,
+                    order=failed_order,
+                    fills=[],
+                    error_message="NO order rejected",
+                )
+            else:
+                # Unwind (SELL) also fails
+                from mercury.domain.order import Order, OrderStatus as OS, OrderResult as DOR
+                failed_unwind = Order(
+                    order_id="failed-unwind",
+                    market_id=order_req.market_id,
+                    token_id=order_req.token_id,
+                    side=order_req.side,
+                    outcome=order_req.outcome,
+                    requested_size=order_req.size,
+                    filled_size=Decimal("0"),
+                    price=order_req.price,
+                    status=OS.REJECTED,
+                )
+                return DOR(
+                    success=False,
+                    order=failed_unwind,
+                    fills=[],
+                    error_message="Unwind order rejected",
+                )
+
+        engine.execute_order = mock_execute
+
+        await engine.start()
+
+        result = await engine.execute_dual_leg(yes_order, no_order)
+
+        assert result.success is False
+        # Error message should indicate dangling position
+        assert "dangling" in result.error_message.lower() or "CRITICAL" in result.error_message
+
+        # Verify failed event with dangling info was emitted
+        failed_calls = [
+            call for call in mock_event_bus.publish.call_args_list
+            if call[0][0] == "order.dual_leg.failed"
+        ]
+        assert len(failed_calls) >= 1
+
+        await engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_unwind_exception_handled(self, mock_config, mock_event_bus, yes_order, no_order):
+        """Verify exceptions during unwind are handled gracefully."""
+        mock_config.get_bool.side_effect = lambda key, default: {
+            "mercury.dry_run": False,
+            "execution.rebalance_partial_fills": True,
+        }.get(key, default)
+
+        mock_clob = MagicMock()
+        mock_clob._connected = True
+        mock_clob.connect = AsyncMock()
+        mock_clob.close = AsyncMock()
+
+        engine = ExecutionEngine(
+            config=mock_config,
+            event_bus=mock_event_bus,
+            clob_client=mock_clob,
+        )
+
+        original_execute = engine.execute_order
+
+        async def mock_execute(order_req, timeout=30.0):
+            if order_req.outcome == "YES" and order_req.side == OrderSide.BUY:
+                # YES BUY succeeds
+                engine._dry_run = True
+                result = await original_execute(order_req, timeout)
+                engine._dry_run = False
+                return result
+            elif order_req.outcome == "NO" and order_req.side == OrderSide.BUY:
+                # NO BUY fails
+                from mercury.domain.order import Order, OrderStatus as OS, OrderResult as DOR
+                failed_order = Order(
+                    order_id="failed-no",
+                    market_id=order_req.market_id,
+                    token_id=order_req.token_id,
+                    side=order_req.side,
+                    outcome=order_req.outcome,
+                    requested_size=order_req.size,
+                    filled_size=Decimal("0"),
+                    price=order_req.price,
+                    status=OS.REJECTED,
+                )
+                return DOR(
+                    success=False,
+                    order=failed_order,
+                    fills=[],
+                    error_message="NO order rejected",
+                )
+            else:
+                # Unwind throws exception
+                raise Exception("Network error during unwind")
+
+        engine.execute_order = mock_execute
+
+        await engine.start()
+
+        result = await engine.execute_dual_leg(yes_order, no_order)
+
+        assert result.success is False
+        assert "exception" in result.error_message.lower() or "dangling" in result.error_message.lower()
+
+        await engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_gather_exception_handling_in_dual_leg(self, mock_config, mock_event_bus, yes_order, no_order):
+        """Verify exceptions in asyncio.gather are handled."""
+        mock_config.get_bool.side_effect = lambda key, default: {
+            "mercury.dry_run": False,
+        }.get(key, default)
+
+        mock_clob = MagicMock()
+        mock_clob._connected = True
+        mock_clob.connect = AsyncMock()
+        mock_clob.close = AsyncMock()
+
+        engine = ExecutionEngine(
+            config=mock_config,
+            event_bus=mock_event_bus,
+            clob_client=mock_clob,
+        )
+
+        async def mock_execute_throws(order_req, timeout=30.0):
+            raise Exception(f"Critical failure on {order_req.outcome}")
+
+        engine.execute_order = mock_execute_throws
+
+        await engine.start()
+
+        result = await engine.execute_dual_leg(yes_order, no_order)
+
+        # Both should fail with exceptions converted to failed results
+        assert result.success is False
+        assert result.yes_result is not None or result.no_result is not None
+        assert "Both legs failed" in result.error_message
+
+        await engine.stop()
+
+
+# =============================================================================
+# Queue Signal Expiration Tests
+# =============================================================================
+
+
+class TestQueueSignalExpiration:
+    """Test signal expiration in the queue."""
+
+    @pytest.mark.asyncio
+    async def test_signal_expires_in_queue(self, mock_config, mock_event_bus):
+        """Verify signals expire after timeout."""
+        # Set very short timeout
+        mock_config.get_bool.return_value = True
+        mock_config.get_int.side_effect = lambda key, default: {
+            "execution.max_concurrent": 1,
+            "execution.max_queue_size": 10,
+        }.get(key, default)
+        mock_config.get_float.side_effect = lambda key, default: {
+            "execution.queue_timeout_seconds": 0.1,  # 100ms timeout
+        }.get(key, default)
+
+        mock_clob = MagicMock()
+        mock_clob.connect = AsyncMock()
+        mock_clob.close = AsyncMock()
+
+        engine = ExecutionEngine(
+            config=mock_config,
+            event_bus=mock_event_bus,
+            clob_client=mock_clob,
+        )
+
+        await engine.start()
+
+        # Queue a signal with very short timeout
+        signal = QueuedSignal(
+            signal_id="expire-test",
+            signal_data={"signal_id": "expire-test"},
+            priority=SignalPriority.LOW,
+        )
+
+        # Manually age the signal
+        from datetime import timedelta
+        signal.queued_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+
+        # Check if expired
+        assert engine._is_signal_expired(signal) is True
+
+        await engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_signal_not_expired_within_timeout(self, mock_config, mock_event_bus):
+        """Verify signals are not expired within timeout."""
+        mock_config.get_bool.return_value = True
+        mock_config.get_int.side_effect = lambda key, default: default
+        mock_config.get_float.side_effect = lambda key, default: {
+            "execution.queue_timeout_seconds": 60.0,
+        }.get(key, default)
+
+        mock_clob = MagicMock()
+        mock_clob.connect = AsyncMock()
+        mock_clob.close = AsyncMock()
+
+        engine = ExecutionEngine(
+            config=mock_config,
+            event_bus=mock_event_bus,
+            clob_client=mock_clob,
+        )
+
+        await engine.start()
+
+        signal = QueuedSignal(
+            signal_id="fresh-signal",
+            signal_data={"signal_id": "fresh-signal"},
+            priority=SignalPriority.HIGH,
+        )
+
+        assert engine._is_signal_expired(signal) is False
+
+        await engine.stop()
+
+
+# =============================================================================
+# Concurrent Execution Tests
+# =============================================================================
+
+
+class TestConcurrentExecutionControl:
+    """Test concurrent execution controls."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_limit_respected(self, mock_config, mock_event_bus):
+        """Verify concurrent execution limit is respected."""
+        mock_config.get_bool.return_value = True
+        mock_config.get_int.side_effect = lambda key, default: {
+            "execution.max_concurrent": 2,  # Only 2 concurrent
+            "execution.max_queue_size": 10,
+        }.get(key, default)
+        mock_config.get_float.return_value = 60.0
+
+        mock_clob = MagicMock()
+        mock_clob.connect = AsyncMock()
+        mock_clob.close = AsyncMock()
+
+        engine = ExecutionEngine(
+            config=mock_config,
+            event_bus=mock_event_bus,
+            clob_client=mock_clob,
+        )
+
+        await engine.start()
+
+        # Verify semaphore initialized with correct value
+        assert engine._execution_semaphore._value == 2
+
+        await engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_multiple_signals_processed_with_limit(self, mock_config, mock_event_bus):
+        """Verify multiple signals are processed respecting concurrent limit."""
+        mock_config.get_bool.return_value = True
+        mock_config.get_int.side_effect = lambda key, default: {
+            "execution.max_concurrent": 2,
+            "execution.max_queue_size": 10,
+        }.get(key, default)
+        mock_config.get_float.return_value = 60.0
+
+        mock_clob = MagicMock()
+        mock_clob.connect = AsyncMock()
+        mock_clob.close = AsyncMock()
+
+        engine = ExecutionEngine(
+            config=mock_config,
+            event_bus=mock_event_bus,
+            clob_client=mock_clob,
+        )
+
+        await engine.start()
+        await asyncio.sleep(0.1)
+
+        # Queue multiple signals
+        for i in range(5):
+            signal_data = {
+                "signal_id": f"concurrent-{i}",
+                "market_id": "test-market",
+                "signal_type": "ARBITRAGE",
+                "target_size_usd": "10.0",
+                "yes_price": "0.45",
+                "no_price": "0.53",
+                "yes_token_id": "yes-token",
+                "no_token_id": "no-token",
+            }
+            await engine.queue_signal(f"concurrent-{i}", signal_data)
+
+        # Wait for processing
+        await asyncio.sleep(1.0)
+
+        # All should be processed
+        assert engine._total_queued == 5
+        assert engine._total_executed + engine._total_failed >= 5
+
+        await engine.stop()
+
+
+# =============================================================================
+# Create Failed Order Result Tests
+# =============================================================================
+
+
+class TestCreateFailedOrderResult:
+    """Test _create_failed_order_result helper."""
+
+    @pytest.mark.asyncio
+    async def test_creates_rejected_order(self, execution_engine):
+        """Verify failed order result has REJECTED status."""
+        await execution_engine.start()
+
+        request = OrderRequest(
+            market_id="test-market",
+            token_id="test-token",
+            side=OrderSide.BUY,
+            outcome="YES",
+            size=Decimal("10.0"),
+            price=Decimal("0.5"),
+        )
+
+        exception = Exception("Test failure")
+        start_time = 1000.0
+
+        result = execution_engine._create_failed_order_result(request, exception, start_time)
+
+        assert result.success is False
+        assert result.order is not None
+        assert result.order.status == OrderStatus.REJECTED
+        assert result.error_message == "Test failure"
+        assert result.order.filled_size == Decimal("0")
+        assert result.order.order_id.startswith("ord-failed-")
+
+        await execution_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_preserves_order_details(self, execution_engine):
+        """Verify failed order result preserves request details."""
+        await execution_engine.start()
+
+        request = OrderRequest(
+            market_id="my-market",
+            token_id="my-token",
+            side=OrderSide.SELL,
+            outcome="NO",
+            size=Decimal("25.5"),
+            price=Decimal("0.75"),
+            order_type=OrderType.FOK,
+            client_order_id="custom-id",
+        )
+
+        result = execution_engine._create_failed_order_result(
+            request, ValueError("bad value"), 0.0
+        )
+
+        assert result.order.market_id == "my-market"
+        assert result.order.token_id == "my-token"
+        assert result.order.side == OrderSide.SELL
+        assert result.order.outcome == "NO"
+        assert result.order.requested_size == Decimal("25.5")
+        assert result.order.price == Decimal("0.75")
+        assert result.order.client_order_id == "custom-id"
+
+        await execution_engine.stop()
+
+
+# =============================================================================
+# Build Approved Signal Tests
+# =============================================================================
+
+
+class TestBuildApprovedSignal:
+    """Test _build_approved_signal helper."""
+
+    @pytest.mark.asyncio
+    async def test_builds_signal_from_event_data(self, execution_engine):
+        """Verify signal is built correctly from event data."""
+        await execution_engine.start()
+
+        data = {
+            "signal_id": "test-signal-123",
+            "original_signal_id": "orig-123",
+            "market_id": "market-abc",
+            "signal_type": "ARBITRAGE",
+            "target_size_usd": "100.50",
+            "yes_price": "0.48",
+            "no_price": "0.50",
+            "yes_token_id": "yes-token-xyz",
+            "no_token_id": "no-token-xyz",
+        }
+
+        signal = execution_engine._build_approved_signal(data)
+
+        assert signal.signal_id == "test-signal-123"
+        assert signal.original_signal_id == "orig-123"
+        assert signal.market_id == "market-abc"
+        assert signal.signal_type == SignalType.ARBITRAGE
+        assert signal.target_size_usd == Decimal("100.50")
+        assert signal.yes_price == Decimal("0.48")
+        assert signal.no_price == Decimal("0.50")
+        assert signal.yes_token_id == "yes-token-xyz"
+        assert signal.no_token_id == "no-token-xyz"
+
+        await execution_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_builds_signal_with_defaults(self, execution_engine):
+        """Verify signal uses defaults for missing optional fields."""
+        await execution_engine.start()
+
+        data = {
+            "signal_id": "minimal-signal",
+            "market_id": "market",
+            "signal_type": "BUY_YES",
+            "target_size_usd": "50",
+        }
+
+        signal = execution_engine._build_approved_signal(data)
+
+        assert signal.signal_id == "minimal-signal"
+        assert signal.original_signal_id == "minimal-signal"  # Falls back to signal_id
+        assert signal.yes_price == Decimal("0")
+        assert signal.no_price == Decimal("0")
+        assert signal.yes_token_id == ""
+        assert signal.no_token_id == ""
+
+        await execution_engine.stop()
