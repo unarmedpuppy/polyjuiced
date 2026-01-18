@@ -97,6 +97,8 @@ class RiskLimits:
     max_unhedged_exposure_usd: Decimal = Decimal("100.0")
     max_concurrent_positions: int = 20
     circuit_breaker_cooldown_minutes: int = 5
+    # Per-market position limit (max exposure in a single market)
+    max_per_market_exposure_usd: Decimal = Decimal("100.0")
 
     # Warning thresholds (percentage of limits)
     warning_threshold: Decimal = Decimal("0.7")   # 70% of limit

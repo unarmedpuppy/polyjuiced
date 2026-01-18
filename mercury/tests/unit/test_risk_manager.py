@@ -30,6 +30,7 @@ def risk_config():
             "risk.max_daily_loss_usd": Decimal("100.0"),
             "risk.max_unhedged_exposure_usd": Decimal("50.0"),
             "risk.max_position_size_usd": Decimal("25.0"),
+            "risk.max_per_market_exposure_usd": Decimal("100.0"),
             # 4-level circuit breaker: NORMAL -> WARNING -> CAUTION -> HALT
             "risk.circuit_breaker_warning_failures": 3,
             "risk.circuit_breaker_caution_failures": 4,
@@ -657,3 +658,356 @@ class TestWarningLevelPositionSizing:
         allowed, reason = await risk_manager.check_pre_trade(signal)
 
         assert allowed is True
+
+
+class TestPositionLimitEnforcement:
+    """Test position limit enforcement functionality."""
+
+    @pytest.mark.asyncio
+    async def test_rejects_when_per_market_limit_exceeded(self, risk_manager):
+        """Signal should be rejected when per-market exposure would exceed limit."""
+        # Simulate existing exposure in the market via fills
+        fill = Fill(
+            order_id="order-1",
+            market_id="test-market",
+            side="YES",
+            size=Decimal("200.0"),
+            price=Decimal("0.50"),
+            cost=Decimal("100.0"),
+        )
+        risk_manager.record_fill(fill)
+
+        # Current market exposure is $100, limit is $100, new $10 would exceed
+        signal = TradingSignal(
+            signal_id="test-per-market",
+            strategy_name="gabagool",
+            market_id="test-market",
+            signal_type=SignalType.ARBITRAGE,
+            confidence=0.8,
+            target_size_usd=Decimal("10.0"),
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+
+        allowed, reason = await risk_manager.check_pre_trade(signal)
+
+        assert allowed is False
+        assert "per-market exposure" in reason.lower()
+
+    @pytest.mark.asyncio
+    async def test_allows_within_per_market_limit(self, risk_manager):
+        """Signal should be allowed when within per-market exposure limit."""
+        # Simulate existing exposure in the market via fills
+        fill = Fill(
+            order_id="order-1",
+            market_id="test-market",
+            side="YES",
+            size=Decimal("100.0"),
+            price=Decimal("0.50"),
+            cost=Decimal("50.0"),  # $50 exposure
+        )
+        risk_manager.record_fill(fill)
+
+        # Current market exposure is $50, limit is $100, new $10 is OK
+        signal = TradingSignal(
+            signal_id="test-per-market-ok",
+            strategy_name="gabagool",
+            market_id="test-market",
+            signal_type=SignalType.ARBITRAGE,
+            confidence=0.8,
+            target_size_usd=Decimal("10.0"),
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+
+        allowed, reason = await risk_manager.check_pre_trade(signal)
+
+        assert allowed is True
+
+    @pytest.mark.asyncio
+    async def test_different_markets_have_separate_limits(self, risk_manager):
+        """Each market should have its own exposure limit."""
+        # Fill up market-1
+        fill1 = Fill(
+            order_id="order-1",
+            market_id="market-1",
+            side="YES",
+            size=Decimal("180.0"),
+            price=Decimal("0.50"),
+            cost=Decimal("90.0"),  # $90 exposure in market-1
+        )
+        risk_manager.record_fill(fill1)
+
+        # market-2 should still have room
+        signal = TradingSignal(
+            signal_id="test-market-2",
+            strategy_name="gabagool",
+            market_id="market-2",  # Different market
+            signal_type=SignalType.ARBITRAGE,
+            confidence=0.8,
+            target_size_usd=Decimal("15.0"),
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+
+        allowed, reason = await risk_manager.check_pre_trade(signal)
+
+        assert allowed is True
+
+    @pytest.mark.asyncio
+    async def test_market_exposures_tracked_correctly(self, risk_manager):
+        """Market exposures should be tracked correctly through fills."""
+        assert risk_manager.market_exposures == {}
+
+        fill1 = Fill(
+            order_id="order-1",
+            market_id="market-1",
+            side="YES",
+            size=Decimal("20.0"),
+            price=Decimal("0.50"),
+            cost=Decimal("10.0"),
+        )
+        risk_manager.record_fill(fill1)
+
+        assert risk_manager.market_exposures["market-1"] == Decimal("10.0")
+
+        fill2 = Fill(
+            order_id="order-2",
+            market_id="market-1",
+            side="NO",
+            size=Decimal("30.0"),
+            price=Decimal("0.50"),
+            cost=Decimal("15.0"),
+        )
+        risk_manager.record_fill(fill2)
+
+        assert risk_manager.market_exposures["market-1"] == Decimal("25.0")
+
+    def test_reset_clears_market_exposures(self, risk_manager):
+        """Daily reset should clear per-market exposures."""
+        fill = Fill(
+            order_id="order-1",
+            market_id="market-1",
+            side="YES",
+            size=Decimal("20.0"),
+            price=Decimal("0.50"),
+            cost=Decimal("10.0"),
+        )
+        risk_manager.record_fill(fill)
+        assert len(risk_manager.market_exposures) > 0
+
+        risk_manager.reset_daily()
+
+        assert risk_manager.market_exposures == {}
+
+
+class TestUnhedgedExposureLimit:
+    """Test total unhedged exposure limit enforcement."""
+
+    @pytest.mark.asyncio
+    async def test_rejects_non_arbitrage_exceeding_unhedged_limit(self, risk_manager):
+        """Non-arbitrage signal should be rejected when unhedged exposure exceeds limit."""
+        # Set existing unhedged exposure close to limit ($50)
+        risk_manager._unhedged_exposure = Decimal("45.0")
+
+        signal = TradingSignal(
+            signal_id="test-unhedged",
+            strategy_name="gabagool",
+            market_id="test-market",
+            signal_type=SignalType.BUY_YES,  # Non-arbitrage
+            confidence=0.8,
+            target_size_usd=Decimal("10.0"),  # Would push to $55, over $50 limit
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+
+        allowed, reason = await risk_manager.check_pre_trade(signal)
+
+        assert allowed is False
+        assert "unhedged exposure" in reason.lower()
+
+    @pytest.mark.asyncio
+    async def test_arbitrage_skips_unhedged_check(self, risk_manager):
+        """Arbitrage signals should not be checked against unhedged exposure limit."""
+        # Set existing unhedged exposure at limit
+        risk_manager._unhedged_exposure = Decimal("50.0")
+
+        signal = TradingSignal(
+            signal_id="test-arbitrage-unhedged",
+            strategy_name="gabagool",
+            market_id="test-market",
+            signal_type=SignalType.ARBITRAGE,  # Arbitrage is hedged
+            confidence=0.8,
+            target_size_usd=Decimal("10.0"),
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+
+        allowed, reason = await risk_manager.check_pre_trade(signal)
+
+        # Should pass unhedged check (fails on per-market if at limit, but not unhedged)
+        # Per-market starts at 0, so this should pass
+        assert allowed is True
+
+    @pytest.mark.asyncio
+    async def test_allows_non_arbitrage_within_unhedged_limit(self, risk_manager):
+        """Non-arbitrage signal should be allowed when within unhedged exposure limit."""
+        risk_manager._unhedged_exposure = Decimal("30.0")
+
+        signal = TradingSignal(
+            signal_id="test-unhedged-ok",
+            strategy_name="gabagool",
+            market_id="test-market",
+            signal_type=SignalType.BUY_NO,  # Non-arbitrage
+            confidence=0.8,
+            target_size_usd=Decimal("15.0"),  # Would be $45, under $50 limit
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+
+        allowed, reason = await risk_manager.check_pre_trade(signal)
+
+        assert allowed is True
+
+
+class TestStateStoreIntegration:
+    """Test RiskManager integration with StateStore for position queries."""
+
+    @pytest.fixture
+    def mock_state_store(self):
+        """Create a mock StateStore."""
+        store = MagicMock()
+        store.is_connected = True
+        store.get_open_positions = AsyncMock(return_value=[])
+        return store
+
+    @pytest.fixture
+    def risk_manager_with_store(self, risk_config, mock_event_bus, mock_state_store):
+        """Create RiskManager with StateStore."""
+        return RiskManager(
+            config=risk_config,
+            event_bus=mock_event_bus,
+            state_store=mock_state_store,
+        )
+
+    @pytest.mark.asyncio
+    async def test_queries_state_store_for_market_exposure(
+        self, risk_manager_with_store, mock_state_store
+    ):
+        """RiskManager should query StateStore for current market exposure."""
+        # Create mock position
+        from mercury.services.state_store import Position as StorePosition
+        mock_position = MagicMock()
+        mock_position.size = Decimal("100.0")
+        mock_position.entry_price = Decimal("0.50")
+        mock_state_store.get_open_positions.return_value = [mock_position]
+
+        signal = TradingSignal(
+            signal_id="test-store-query",
+            strategy_name="gabagool",
+            market_id="test-market",
+            signal_type=SignalType.ARBITRAGE,
+            confidence=0.8,
+            target_size_usd=Decimal("10.0"),
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+
+        await risk_manager_with_store.check_pre_trade(signal)
+
+        # Should have queried state store for market positions
+        mock_state_store.get_open_positions.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_uses_state_store_positions_for_limit_check(
+        self, risk_manager_with_store, mock_state_store
+    ):
+        """RiskManager should use StateStore positions for per-market limit check."""
+        # Create mock position with $90 exposure
+        mock_position = MagicMock()
+        mock_position.size = Decimal("180.0")
+        mock_position.entry_price = Decimal("0.50")  # Cost = 180 * 0.5 = $90
+        mock_state_store.get_open_positions.return_value = [mock_position]
+
+        signal = TradingSignal(
+            signal_id="test-store-limit",
+            strategy_name="gabagool",
+            market_id="test-market",
+            signal_type=SignalType.ARBITRAGE,
+            confidence=0.8,
+            target_size_usd=Decimal("15.0"),  # Would push to $105, over $100 limit
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+
+        allowed, reason = await risk_manager_with_store.check_pre_trade(signal)
+
+        assert allowed is False
+        assert "per-market exposure" in reason.lower()
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_memory_on_store_error(
+        self, risk_manager_with_store, mock_state_store
+    ):
+        """RiskManager should fallback to in-memory tracking on StateStore errors."""
+        mock_state_store.get_open_positions.side_effect = Exception("DB error")
+
+        signal = TradingSignal(
+            signal_id="test-fallback",
+            strategy_name="gabagool",
+            market_id="test-market",
+            signal_type=SignalType.ARBITRAGE,
+            confidence=0.8,
+            target_size_usd=Decimal("10.0"),
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+
+        # Should not raise, should fallback to in-memory (which is 0)
+        allowed, reason = await risk_manager_with_store.check_pre_trade(signal)
+
+        assert allowed is True  # In-memory starts at 0
+
+
+class TestClosePositionSignals:
+    """Test CLOSE_POSITION signal handling at CAUTION level."""
+
+    @pytest.mark.asyncio
+    async def test_caution_allows_close_position_signals(self, risk_manager):
+        """CAUTION level should allow CLOSE_POSITION signals."""
+        # Trip to CAUTION
+        for _ in range(4):
+            risk_manager.record_failure()
+
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.CAUTION
+
+        signal = TradingSignal(
+            signal_id="test-close",
+            strategy_name="gabagool",
+            market_id="test-market",
+            signal_type=SignalType.CLOSE_POSITION,
+            confidence=0.8,
+            target_size_usd=Decimal("10.0"),
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+
+        allowed, reason = await risk_manager.check_pre_trade(signal)
+
+        assert allowed is True
+
+
+class TestRiskLimitsConfiguration:
+    """Test risk limits are properly configured."""
+
+    def test_per_market_limit_loaded_from_config(self, risk_manager):
+        """Per-market exposure limit should be loaded from config."""
+        assert risk_manager.limits.max_per_market_exposure_usd == Decimal("100.0")
+
+    def test_limits_property_returns_configured_limits(self, risk_manager):
+        """limits property should return configured RiskLimits."""
+        limits = risk_manager.limits
+        assert limits.max_daily_loss_usd == Decimal("100.0")
+        assert limits.max_position_size_usd == Decimal("25.0")
+        assert limits.max_unhedged_exposure_usd == Decimal("50.0")
+        assert limits.max_per_market_exposure_usd == Decimal("100.0")

@@ -6,17 +6,23 @@ This service:
 - Manages 4-level circuit breaker state based on failures and losses
 - Publishes risk.circuit_breaker events on state changes
 - Approves or rejects signals via event bus
+- Enforces position limits via StateStore queries
 
 Circuit Breaker Levels (ported from legacy/src/risk/circuit_breaker.py):
 - NORMAL: All systems go, full position sizes
 - WARNING: Near limits, reduce position sizes by 50%
 - CAUTION: Only close existing positions, no new positions
 - HALT: No trading at all, full system pause
+
+Position Limits:
+- max_position_size_usd: Maximum size for any single trade
+- max_unhedged_exposure_usd: Maximum total unhedged exposure across all markets
+- max_per_market_exposure_usd: Maximum exposure in a single market
 """
 
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import structlog
 
@@ -26,6 +32,9 @@ from mercury.core.lifecycle import BaseComponent, HealthCheckResult, HealthStatu
 from mercury.domain.order import Fill
 from mercury.domain.risk import CircuitBreakerState, RiskLimits
 from mercury.domain.signal import ApprovedSignal, RejectedSignal, SignalType, TradingSignal
+
+if TYPE_CHECKING:
+    from mercury.services.state_store import StateStore
 
 log = structlog.get_logger()
 
@@ -55,16 +64,20 @@ class RiskManager(BaseComponent):
         self,
         config: ConfigManager,
         event_bus: EventBus,
+        state_store: Optional["StateStore"] = None,
     ):
         """Initialize the risk manager.
 
         Args:
             config: Configuration manager.
             event_bus: EventBus for events.
+            state_store: Optional StateStore for querying current positions.
+                         If not provided, position limit checks will use in-memory tracking only.
         """
         super().__init__()
         self._config = config
         self._event_bus = event_bus
+        self._state_store = state_store
         self._log = log.bind(component="risk_manager")
 
         # Load limits from config
@@ -72,6 +85,7 @@ class RiskManager(BaseComponent):
             max_daily_loss_usd=self._get_decimal("risk.max_daily_loss_usd", Decimal("100")),
             max_position_size_usd=self._get_decimal("risk.max_position_size_usd", Decimal("25")),
             max_unhedged_exposure_usd=self._get_decimal("risk.max_unhedged_exposure_usd", Decimal("50")),
+            max_per_market_exposure_usd=self._get_decimal("risk.max_per_market_exposure_usd", Decimal("100")),
         )
 
         # Circuit breaker thresholds - 4 levels: NORMAL -> WARNING -> CAUTION -> HALT
@@ -101,6 +115,8 @@ class RiskManager(BaseComponent):
         self._circuit_breaker_reasons: List[str] = []
         self._cooldown_until: Optional[datetime] = None
         self._last_reset: datetime = datetime.now(timezone.utc)
+        # Per-market exposure tracking (in-memory cache, updated from fills)
+        self._market_exposures: dict[str, Decimal] = {}
 
     def _get_decimal(self, key: str, default: Decimal) -> Decimal:
         """Get a decimal config value."""
@@ -122,6 +138,9 @@ class RiskManager(BaseComponent):
             "starting_risk_manager",
             max_daily_loss=str(self._limits.max_daily_loss_usd),
             max_position_size=str(self._limits.max_position_size_usd),
+            max_unhedged_exposure=str(self._limits.max_unhedged_exposure_usd),
+            max_per_market_exposure=str(self._limits.max_per_market_exposure_usd),
+            state_store_enabled=self._state_store is not None,
         )
 
         # Subscribe to events
@@ -165,6 +184,13 @@ class RiskManager(BaseComponent):
     async def check_pre_trade(self, signal: TradingSignal) -> Tuple[bool, Optional[str]]:
         """Validate a signal against risk limits.
 
+        Checks performed:
+        1. Circuit breaker state (HALT blocks all, CAUTION blocks new positions)
+        2. Daily loss limit
+        3. Per-trade position size limit (with WARNING state multiplier)
+        4. Total unhedged exposure limit
+        5. Per-market exposure limit (queries StateStore if available)
+
         Args:
             signal: Trading signal to validate.
 
@@ -181,8 +207,9 @@ class RiskManager(BaseComponent):
         # Check CAUTION level - only closing positions allowed
         if state == CircuitBreakerState.CAUTION:
             # CAUTION only allows closing existing positions, not opening new ones
-            # For now, reject all signals at CAUTION level
-            # TODO: Allow CLOSE signals when signal types support it
+            # Allow CLOSE_POSITION signals at CAUTION level
+            if signal.signal_type == SignalType.CLOSE_POSITION:
+                return True, None
             return False, f"Circuit breaker at CAUTION: only position closes allowed. Reasons: {', '.join(self._circuit_breaker_reasons)}"
 
         # Check daily loss limit
@@ -196,13 +223,80 @@ class RiskManager(BaseComponent):
                 return False, f"Position size ${signal.target_size_usd:.2f} exceeds WARNING-adjusted limit ${effective_max_size:.2f}"
             return False, f"Position size ${signal.target_size_usd:.2f} exceeds limit ${self._limits.max_position_size_usd:.2f}"
 
-        # Check unhedged exposure for non-arbitrage
+        # Check total unhedged exposure for non-arbitrage signals
         if signal.signal_type != SignalType.ARBITRAGE:
-            new_exposure = self._unhedged_exposure + signal.target_size_usd
+            # Get current unhedged exposure from StateStore if available, else use in-memory tracking
+            total_unhedged = await self._get_total_unhedged_exposure()
+            new_exposure = total_unhedged + signal.target_size_usd
             if new_exposure > self._limits.max_unhedged_exposure_usd:
-                return False, "Unhedged exposure would exceed limit"
+                return False, f"Unhedged exposure would exceed limit: ${new_exposure:.2f} > ${self._limits.max_unhedged_exposure_usd:.2f}"
+
+        # Check per-market exposure limit
+        market_exposure = await self._get_market_exposure(signal.market_id)
+        new_market_exposure = market_exposure + signal.target_size_usd
+        if new_market_exposure > self._limits.max_per_market_exposure_usd:
+            return False, f"Per-market exposure would exceed limit for {signal.market_id}: ${new_market_exposure:.2f} > ${self._limits.max_per_market_exposure_usd:.2f}"
 
         return True, None
+
+    async def _get_total_unhedged_exposure(self) -> Decimal:
+        """Get total unhedged exposure across all markets.
+
+        Queries StateStore for open positions if available, otherwise
+        uses in-memory tracking.
+
+        Returns:
+            Total unhedged exposure in USD.
+        """
+        if self._state_store is not None and self._state_store.is_connected:
+            try:
+                positions = await self._state_store.get_open_positions()
+                # Sum up exposure from non-hedged positions
+                # For arbitrage positions (both YES and NO), exposure is hedged
+                # For single-sided positions, the full cost is unhedged exposure
+                total = Decimal("0")
+                for position in positions:
+                    # Position cost basis is size * entry_price
+                    total += position.size * position.entry_price
+                return total
+            except Exception as e:
+                self._log.warning(
+                    "failed_to_query_positions_for_exposure",
+                    error=str(e),
+                    fallback="in-memory",
+                )
+                return self._unhedged_exposure
+        return self._unhedged_exposure
+
+    async def _get_market_exposure(self, market_id: str) -> Decimal:
+        """Get current exposure in a specific market.
+
+        Queries StateStore for open positions in the market if available,
+        otherwise uses in-memory tracking.
+
+        Args:
+            market_id: The market to check exposure for.
+
+        Returns:
+            Current exposure in USD for the market.
+        """
+        if self._state_store is not None and self._state_store.is_connected:
+            try:
+                positions = await self._state_store.get_open_positions(market_id=market_id)
+                # Sum up all position values for this market
+                total = Decimal("0")
+                for position in positions:
+                    total += position.size * position.entry_price
+                return total
+            except Exception as e:
+                self._log.warning(
+                    "failed_to_query_positions_for_market_exposure",
+                    market_id=market_id,
+                    error=str(e),
+                    fallback="in-memory",
+                )
+                return self._market_exposures.get(market_id, Decimal("0"))
+        return self._market_exposures.get(market_id, Decimal("0"))
 
     async def validate_signal(self, signal: TradingSignal) -> Optional[ApprovedSignal]:
         """Validate and potentially approve a trading signal.
@@ -269,6 +363,12 @@ class RiskManager(BaseComponent):
     def record_fill(self, fill: Fill) -> None:
         """Record a fill for exposure tracking.
 
+        Updates:
+        - Daily trade count
+        - Daily volume
+        - Current total exposure
+        - Per-market exposure
+
         Args:
             fill: The fill to record.
         """
@@ -276,12 +376,17 @@ class RiskManager(BaseComponent):
         self._daily_volume += fill.cost
         self._current_exposure += fill.cost
 
+        # Track per-market exposure
+        current_market_exposure = self._market_exposures.get(fill.market_id, Decimal("0"))
+        self._market_exposures[fill.market_id] = current_market_exposure + fill.cost
+
         self._log.debug(
             "fill_recorded",
             order_id=fill.order_id,
             market_id=fill.market_id,
             cost=str(fill.cost),
             current_exposure=str(self._current_exposure),
+            market_exposure=str(self._market_exposures[fill.market_id]),
         )
 
     def record_pnl(self, pnl: Decimal) -> None:
@@ -470,6 +575,7 @@ class RiskManager(BaseComponent):
             final_trades=self._daily_trades,
             final_volume=str(self._daily_volume),
             final_circuit_breaker_state=self._circuit_breaker_state.value,
+            markets_with_exposure=len(self._market_exposures),
         )
 
         self._daily_pnl = Decimal("0")
@@ -477,6 +583,7 @@ class RiskManager(BaseComponent):
         self._daily_trades = 0
         self._current_exposure = Decimal("0")
         self._unhedged_exposure = Decimal("0")
+        self._market_exposures = {}
         self._consecutive_failures = 0
         self._circuit_breaker_state = CircuitBreakerState.NORMAL
         self._circuit_breaker_triggered_at = None
@@ -542,6 +649,16 @@ class RiskManager(BaseComponent):
     def consecutive_failures(self) -> int:
         """Get current consecutive failure count."""
         return self._consecutive_failures
+
+    @property
+    def market_exposures(self) -> dict[str, Decimal]:
+        """Get per-market exposure snapshot (copy)."""
+        return self._market_exposures.copy()
+
+    @property
+    def limits(self) -> RiskLimits:
+        """Get configured risk limits."""
+        return self._limits
 
     async def _on_signal(self, data: dict) -> None:
         """Handle incoming trading signal from event bus."""
