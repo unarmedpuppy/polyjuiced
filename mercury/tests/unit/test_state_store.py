@@ -5,7 +5,7 @@ Tests the SQLite persistence layer for trades, positions, settlement queue,
 and daily statistics.
 """
 import pytest
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 
@@ -210,7 +210,7 @@ class TestStateStoreConnection:
 
         assert health["status"] == "healthy"
         assert "Database connected" in health["message"]
-        assert health["schema_version"] == 2
+        assert health["schema_version"] == 3
 
         await store.close()
 
@@ -1876,6 +1876,333 @@ class TestDailyStats:
         assert stats.volume_usd == Decimal("125.0")
         assert stats.positions_opened == 1
         assert stats.positions_closed == 1
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_update_daily_stats_with_max_drawdown(self, tmp_path):
+        """Test updating daily stats with max_drawdown field."""
+        from mercury.services.state_store import StateStore, DailyStats
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        today = date.today()
+
+        stats = DailyStats(
+            date=today,
+            trade_count=5,
+            volume_usd=Decimal("100.0"),
+            realized_pnl=Decimal("10.5"),
+            positions_opened=3,
+            positions_closed=2,
+            wins=3,
+            losses=2,
+            max_drawdown=Decimal("15.5"),
+        )
+
+        await store.update_daily_stats(stats)
+
+        retrieved = await store.get_daily_stats(today)
+
+        assert retrieved.max_drawdown == Decimal("15.5")
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_daily_stats_win_rate_property(self, tmp_path):
+        """Test DailyStats win_rate property calculation."""
+        from mercury.services.state_store import DailyStats
+
+        today = date.today()
+
+        # No trades - win rate should be 0
+        stats_no_trades = DailyStats(date=today)
+        assert stats_no_trades.win_rate == Decimal("0")
+
+        # 3 wins, 2 losses - win rate should be 0.6
+        stats_with_trades = DailyStats(date=today, wins=3, losses=2)
+        assert stats_with_trades.win_rate == Decimal("3") / Decimal("5")
+
+        # All wins - win rate should be 1
+        stats_all_wins = DailyStats(date=today, wins=5, losses=0)
+        assert stats_all_wins.win_rate == Decimal("1")
+
+        # All losses - win rate should be 0
+        stats_all_losses = DailyStats(date=today, wins=0, losses=5)
+        assert stats_all_losses.win_rate == Decimal("0")
+
+    @pytest.mark.asyncio
+    async def test_aggregate_daily_stats_empty(self, tmp_path):
+        """Test aggregate_daily_stats with no trades."""
+        from mercury.services.state_store import StateStore
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        today = date.today()
+        stats = await store.aggregate_daily_stats(today)
+
+        assert stats.date == today
+        assert stats.trade_count == 0
+        assert stats.volume_usd == Decimal("0")
+        assert stats.realized_pnl == Decimal("0")
+        assert stats.wins == 0
+        assert stats.losses == 0
+        assert stats.max_drawdown == Decimal("0")
+        assert stats.win_rate == Decimal("0")
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_aggregate_daily_stats_with_trades(self, tmp_path):
+        """Test aggregate_daily_stats calculates stats from trades."""
+        from mercury.services.state_store import StateStore, Trade
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        today = date.today()
+        now = datetime.now(timezone.utc)
+
+        # Create trades with varying P&L
+        trades = [
+            Trade(
+                trade_id="agg-trade-1",
+                market_id="market-1",
+                strategy="gabagool",
+                side="YES",
+                size=Decimal("10.0"),
+                price=Decimal("0.50"),
+                cost=Decimal("5.0"),
+                timestamp=now,
+                actual_profit=Decimal("2.0"),  # Win
+            ),
+            Trade(
+                trade_id="agg-trade-2",
+                market_id="market-1",
+                strategy="gabagool",
+                side="NO",
+                size=Decimal("20.0"),
+                price=Decimal("0.40"),
+                cost=Decimal("8.0"),
+                timestamp=now,
+                actual_profit=Decimal("-1.0"),  # Loss
+            ),
+            Trade(
+                trade_id="agg-trade-3",
+                market_id="market-2",
+                strategy="gabagool",
+                side="YES",
+                size=Decimal("15.0"),
+                price=Decimal("0.60"),
+                cost=Decimal("9.0"),
+                timestamp=now,
+                actual_profit=Decimal("3.0"),  # Win
+            ),
+        ]
+
+        for trade in trades:
+            await store.save_trade(trade)
+
+        stats = await store.aggregate_daily_stats(today)
+
+        assert stats.trade_count == 3
+        assert stats.volume_usd == Decimal("22.0")  # 5 + 8 + 9
+        assert stats.realized_pnl == Decimal("4.0")  # 2 - 1 + 3
+        assert stats.wins == 2
+        assert stats.losses == 1
+        # win_rate = 2/3
+        assert stats.win_rate == Decimal("2") / Decimal("3")
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_aggregate_daily_stats_calculates_max_drawdown(self, tmp_path):
+        """Test that aggregate_daily_stats correctly calculates max drawdown."""
+        from mercury.services.state_store import StateStore, Trade
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        today = date.today()
+        base_time = datetime.now(timezone.utc)
+
+        # Create a sequence of trades that demonstrates drawdown
+        # P&L sequence: +5, -3, +4, -8, +2
+        # Cumulative: 5, 2, 6, -2, 0
+        # Peak: 6 (after trade 3)
+        # Worst drawdown: 6 - (-2) = 8 (after trade 4)
+        trades = [
+            Trade(
+                trade_id="dd-trade-1",
+                market_id="market-1",
+                strategy="gabagool",
+                side="YES",
+                size=Decimal("10.0"),
+                price=Decimal("0.50"),
+                cost=Decimal("5.0"),
+                timestamp=base_time + timedelta(minutes=1),
+                actual_profit=Decimal("5.0"),
+            ),
+            Trade(
+                trade_id="dd-trade-2",
+                market_id="market-1",
+                strategy="gabagool",
+                side="YES",
+                size=Decimal("10.0"),
+                price=Decimal("0.50"),
+                cost=Decimal("5.0"),
+                timestamp=base_time + timedelta(minutes=2),
+                actual_profit=Decimal("-3.0"),
+            ),
+            Trade(
+                trade_id="dd-trade-3",
+                market_id="market-1",
+                strategy="gabagool",
+                side="YES",
+                size=Decimal("10.0"),
+                price=Decimal("0.50"),
+                cost=Decimal("5.0"),
+                timestamp=base_time + timedelta(minutes=3),
+                actual_profit=Decimal("4.0"),
+            ),
+            Trade(
+                trade_id="dd-trade-4",
+                market_id="market-1",
+                strategy="gabagool",
+                side="YES",
+                size=Decimal("10.0"),
+                price=Decimal("0.50"),
+                cost=Decimal("5.0"),
+                timestamp=base_time + timedelta(minutes=4),
+                actual_profit=Decimal("-8.0"),
+            ),
+            Trade(
+                trade_id="dd-trade-5",
+                market_id="market-1",
+                strategy="gabagool",
+                side="YES",
+                size=Decimal("10.0"),
+                price=Decimal("0.50"),
+                cost=Decimal("5.0"),
+                timestamp=base_time + timedelta(minutes=5),
+                actual_profit=Decimal("2.0"),
+            ),
+        ]
+
+        for trade in trades:
+            await store.save_trade(trade)
+
+        stats = await store.aggregate_daily_stats(today)
+
+        # Max drawdown should be 8 (from peak of 6 to trough of -2)
+        assert stats.max_drawdown == Decimal("8.0")
+        # Total P&L: 5 - 3 + 4 - 8 + 2 = 0
+        assert stats.realized_pnl == Decimal("0")
+        # 3 wins, 2 losses
+        assert stats.wins == 3
+        assert stats.losses == 2
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_aggregate_daily_stats_excludes_dry_runs(self, tmp_path):
+        """Test that aggregate_daily_stats excludes dry run trades."""
+        from mercury.services.state_store import StateStore, Trade
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        today = date.today()
+        now = datetime.now(timezone.utc)
+
+        # Create real and dry run trades
+        trades = [
+            Trade(
+                trade_id="real-trade",
+                market_id="market-1",
+                strategy="gabagool",
+                side="YES",
+                size=Decimal("10.0"),
+                price=Decimal("0.50"),
+                cost=Decimal("5.0"),
+                timestamp=now,
+                actual_profit=Decimal("2.0"),
+                dry_run=False,
+            ),
+            Trade(
+                trade_id="dry-trade",
+                market_id="market-1",
+                strategy="gabagool",
+                side="YES",
+                size=Decimal("100.0"),
+                price=Decimal("0.50"),
+                cost=Decimal("50.0"),
+                timestamp=now,
+                actual_profit=Decimal("20.0"),
+                dry_run=True,
+            ),
+        ]
+
+        for trade in trades:
+            await store.save_trade(trade)
+
+        stats = await store.aggregate_daily_stats(today)
+
+        # Only the real trade should count
+        assert stats.trade_count == 1
+        assert stats.volume_usd == Decimal("5.0")
+        assert stats.realized_pnl == Decimal("2.0")
+        assert stats.wins == 1
+        assert stats.losses == 0
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_aggregate_daily_stats_preserves_opportunities(self, tmp_path):
+        """Test that aggregate_daily_stats preserves existing opportunities data."""
+        from mercury.services.state_store import StateStore, Trade
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        today = date.today()
+        now = datetime.now(timezone.utc)
+
+        # First, set opportunities data via increment
+        await store.increment_daily_stats(
+            for_date=today,
+            opportunities_detected=50,
+            opportunities_executed=10,
+        )
+
+        # Create a trade
+        trade = Trade(
+            trade_id="preserve-trade",
+            market_id="market-1",
+            strategy="gabagool",
+            side="YES",
+            size=Decimal("10.0"),
+            price=Decimal("0.50"),
+            cost=Decimal("5.0"),
+            timestamp=now,
+            actual_profit=Decimal("2.0"),
+        )
+        await store.save_trade(trade)
+
+        # Aggregate should preserve opportunities
+        stats = await store.aggregate_daily_stats(today)
+
+        assert stats.opportunities_detected == 50
+        assert stats.opportunities_executed == 10
+        assert stats.trade_count == 1
 
         await store.close()
 

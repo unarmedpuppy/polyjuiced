@@ -35,7 +35,7 @@ log = structlog.get_logger()
 
 # Schema version - increment when base schema changes
 # Migrations handle upgrades from previous versions
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Base schema (version 1) - minimal schema for new databases
 # Migrations add additional tables and columns
@@ -143,7 +143,9 @@ CREATE TABLE IF NOT EXISTS daily_stats (
     losses INTEGER DEFAULT 0,
     exposure REAL DEFAULT 0,
     opportunities_detected INTEGER DEFAULT 0,
-    opportunities_executed INTEGER DEFAULT 0
+    opportunities_executed INTEGER DEFAULT 0,
+    -- Daily risk metrics
+    max_drawdown REAL DEFAULT 0
 );
 
 -- Fills for slippage analysis (basic)
@@ -275,7 +277,7 @@ CREATE INDEX IF NOT EXISTS idx_pnl_ledger_type ON realized_pnl_ledger(pnl_type);
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER PRIMARY KEY
 );
-INSERT OR IGNORE INTO schema_version (version) VALUES (2);
+INSERT OR IGNORE INTO schema_version (version) VALUES (3);
 
 -- Initialize circuit breaker singleton
 INSERT OR IGNORE INTO circuit_breaker_state (id, date)
@@ -389,7 +391,11 @@ class PositionResult:
 
 @dataclass
 class DailyStats:
-    """Daily trading statistics."""
+    """Daily trading statistics.
+
+    Tracks trade metrics, P&L, and risk statistics for a single day.
+    Aggregation is typically done at end of day or on position close.
+    """
 
     date: date
     trade_count: int = 0
@@ -403,6 +409,20 @@ class DailyStats:
     exposure: Decimal = Decimal("0")
     opportunities_detected: int = 0
     opportunities_executed: int = 0
+    # Daily risk metrics
+    max_drawdown: Decimal = Decimal("0")  # Maximum drawdown during the day
+
+    @property
+    def win_rate(self) -> Decimal:
+        """Calculate win rate as percentage.
+
+        Returns:
+            Win rate as a Decimal between 0 and 1, or 0 if no completed trades.
+        """
+        total = self.wins + self.losses
+        if total == 0:
+            return Decimal("0")
+        return Decimal(self.wins) / Decimal(total)
 
 
 @dataclass
@@ -658,7 +678,8 @@ class MigrationRunner:
         # Import migrations dynamically
         try:
             from mercury.services.migrations import v001_port_legacy_schema
-            migrations = [v001_port_legacy_schema]
+            from mercury.services.migrations import v002_add_daily_stats_drawdown
+            migrations = [v001_port_legacy_schema, v002_add_daily_stats_drawdown]
         except ImportError:
             migrations = []
 
@@ -1859,6 +1880,7 @@ class StateStore:
             exposure=Decimal(str(get_val("exposure", 0) or 0)),
             opportunities_detected=get_val("opportunities_detected", 0) or 0,
             opportunities_executed=get_val("opportunities_executed", 0) or 0,
+            max_drawdown=Decimal(str(get_val("max_drawdown", 0) or 0)),
         )
 
     async def update_daily_stats(self, stats: DailyStats) -> None:
@@ -1873,8 +1895,8 @@ class StateStore:
                 """
                 INSERT INTO daily_stats
                 (date, trade_count, volume_usd, realized_pnl, positions_opened, positions_closed,
-                 wins, losses, exposure, opportunities_detected, opportunities_executed, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 wins, losses, exposure, opportunities_detected, opportunities_executed, max_drawdown, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(date) DO UPDATE SET
                     trade_count = excluded.trade_count,
                     volume_usd = excluded.volume_usd,
@@ -1886,6 +1908,7 @@ class StateStore:
                     exposure = excluded.exposure,
                     opportunities_detected = excluded.opportunities_detected,
                     opportunities_executed = excluded.opportunities_executed,
+                    max_drawdown = excluded.max_drawdown,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -1900,6 +1923,7 @@ class StateStore:
                     float(stats.exposure),
                     stats.opportunities_detected,
                     stats.opportunities_executed,
+                    float(stats.max_drawdown),
                     datetime.now(timezone.utc),
                 ),
             )
@@ -1970,6 +1994,147 @@ class StateStore:
                 ),
             )
             await conn.commit()
+
+    async def aggregate_daily_stats(self, for_date: Optional[date] = None) -> DailyStats:
+        """Aggregate daily statistics from trades and positions.
+
+        Calculates comprehensive daily statistics by analyzing all trades
+        and position closures for the specified date. Computes:
+        - Trade count and volume
+        - Realized P&L from closed positions
+        - Win/loss counts and win rate
+        - Maximum drawdown (worst cumulative P&L during the day)
+
+        This method should be called at end of day or when aggregating
+        historical statistics. It recalculates stats from source data
+        and saves them to the daily_stats table.
+
+        Args:
+            for_date: Date to aggregate stats for (defaults to today).
+
+        Returns:
+            Aggregated DailyStats for the date.
+        """
+        target_date = for_date or date.today()
+        conn = await self._pool.acquire()
+
+        # Get trades for the target date
+        # Use SQLite's date() function to compare just the date portion
+        target_date_str = target_date.isoformat()
+
+        trade_count = 0
+        volume_usd = Decimal("0")
+        realized_pnl = Decimal("0")
+        wins = 0
+        losses = 0
+        exposure = Decimal("0")
+
+        # Track P&L progression for drawdown calculation
+        cumulative_pnl = Decimal("0")
+        peak_pnl = Decimal("0")
+        max_drawdown = Decimal("0")
+
+        # Query trades for the day ordered by timestamp to track drawdown
+        # Use date() function to extract just the date part from the timestamp
+        async with conn.execute(
+            """
+            SELECT cost, actual_profit, status, dry_run
+            FROM trades
+            WHERE date(timestamp) = ?
+            ORDER BY timestamp ASC
+            """,
+            (target_date_str,),
+        ) as cursor:
+            async for row in cursor:
+                # Skip dry runs
+                if row["dry_run"]:
+                    continue
+
+                trade_count += 1
+                cost = Decimal(str(row["cost"] or 0))
+                volume_usd += abs(cost)
+                exposure += cost
+
+                # Track P&L if trade has actual_profit (resolved trades)
+                actual_profit = row["actual_profit"]
+                if actual_profit is not None:
+                    pnl = Decimal(str(actual_profit))
+                    realized_pnl += pnl
+
+                    if pnl > 0:
+                        wins += 1
+                    elif pnl < 0:
+                        losses += 1
+
+                    # Track cumulative P&L for drawdown
+                    cumulative_pnl += pnl
+                    if cumulative_pnl > peak_pnl:
+                        peak_pnl = cumulative_pnl
+
+                    # Drawdown is difference from peak (always positive or zero)
+                    current_drawdown = peak_pnl - cumulative_pnl
+                    if current_drawdown > max_drawdown:
+                        max_drawdown = current_drawdown
+
+        # Also count positions opened/closed on this date
+        positions_opened = 0
+        positions_closed = 0
+
+        async with conn.execute(
+            """
+            SELECT COUNT(*) as cnt FROM positions
+            WHERE date(opened_at) = ?
+            """,
+            (target_date_str,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            positions_opened = row["cnt"] if row else 0
+
+        async with conn.execute(
+            """
+            SELECT COUNT(*) as cnt FROM positions
+            WHERE date(closed_at) = ?
+            """,
+            (target_date_str,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            positions_closed = row["cnt"] if row else 0
+
+        # Get existing stats to preserve opportunities data
+        existing_stats = await self.get_daily_stats(target_date)
+
+        # Build updated stats
+        stats = DailyStats(
+            date=target_date,
+            trade_count=trade_count,
+            volume_usd=volume_usd,
+            realized_pnl=realized_pnl,
+            positions_opened=positions_opened,
+            positions_closed=positions_closed,
+            wins=wins,
+            losses=losses,
+            exposure=exposure,
+            max_drawdown=max_drawdown,
+            # Preserve opportunities tracking from existing stats
+            opportunities_detected=existing_stats.opportunities_detected,
+            opportunities_executed=existing_stats.opportunities_executed,
+        )
+
+        # Save the aggregated stats
+        await self.update_daily_stats(stats)
+
+        self._log.info(
+            "daily_stats_aggregated",
+            date=target_date.isoformat(),
+            trade_count=trade_count,
+            realized_pnl=str(realized_pnl),
+            wins=wins,
+            losses=losses,
+            win_rate=str(stats.win_rate),
+            max_drawdown=str(max_drawdown),
+        )
+
+        return stats
 
     # ============ Fill Operations ============
 
