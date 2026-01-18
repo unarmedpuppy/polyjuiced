@@ -100,22 +100,36 @@ class Order:
 
 @dataclass
 class Fill:
-    """A fill (partial or complete) of an order."""
-    fill_id: str
+    """A fill (partial or complete) of an order.
+
+    Flexible constructor allows for:
+    - Full specification with all fields
+    - Simplified usage with just order_id, market_id, side, size, price
+    - Direct cost specification (overrides computed cost)
+    """
     order_id: str
     market_id: str
-    token_id: str
-    side: OrderSide
-    outcome: str
+    side: str  # "YES", "NO", "BUY", "SELL" - flexible string
     size: Decimal
     price: Decimal
+    fill_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    token_id: str = ""
+    outcome: str = ""
     fee: Decimal = Decimal("0")
+    cost: Optional[Decimal] = None  # If None, computed from size * price + fee
     timestamp: datetime = field(default_factory=datetime.utcnow)
 
-    @property
-    def cost(self) -> Decimal:
-        """Get total cost including fee."""
-        return (self.size * self.price) + self.fee
+    def __post_init__(self) -> None:
+        """Handle flexible constructor parameters."""
+        # Normalize side to uppercase
+        if isinstance(self.side, str):
+            self.side = self.side.upper()
+        elif isinstance(self.side, OrderSide):
+            self.side = self.side.value
+
+        # Compute cost if not provided
+        if self.cost is None:
+            self.cost = (self.size * self.price) + self.fee
 
 
 @dataclass

@@ -3,42 +3,24 @@
 This service:
 - Validates trading signals against risk limits
 - Tracks exposure and daily P&L
-- Manages circuit breaker state
-- Approves or rejects signals
+- Manages circuit breaker state based on failures and losses
+- Approves or rejects signals via event bus
 """
 
-import time
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Dict, Optional, Tuple
+from typing import Optional, Tuple
 
 import structlog
 
 from mercury.core.config import ConfigManager
 from mercury.core.events import EventBus
 from mercury.core.lifecycle import BaseComponent, HealthCheckResult, HealthStatus
+from mercury.domain.order import Fill
 from mercury.domain.risk import CircuitBreakerState, RiskLimits
 from mercury.domain.signal import ApprovedSignal, RejectedSignal, SignalType, TradingSignal
 
 log = structlog.get_logger()
-
-
-@dataclass
-class RiskState:
-    """Current risk state tracking."""
-
-    daily_pnl: Decimal = Decimal("0")
-    daily_volume: Decimal = Decimal("0")
-    daily_trades: int = 0
-
-    unhedged_exposure: Decimal = Decimal("0")
-    total_exposure: Decimal = Decimal("0")
-
-    circuit_breaker_level: int = 0  # 0=NORMAL, 1=WARNING, 2=CRITICAL, 3=TRIGGERED
-    circuit_breaker_until: Optional[datetime] = None
-
-    last_reset: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class RiskManager(BaseComponent):
@@ -49,7 +31,7 @@ class RiskManager(BaseComponent):
     2. Validates against configured risk limits
     3. Tracks exposure and daily P&L
     4. Approves or rejects signals
-    5. Manages circuit breaker state
+    5. Manages circuit breaker state based on consecutive failures and daily loss
 
     Event channels subscribed:
     - signal.* - Trading signals to validate
@@ -80,24 +62,49 @@ class RiskManager(BaseComponent):
 
         # Load limits from config
         self._limits = RiskLimits(
-            max_daily_loss=config.get_decimal("risk.max_daily_loss_usd", Decimal("100")),
-            max_position_size=config.get_decimal("risk.max_position_size_usd", Decimal("25")),
-            max_unhedged_exposure=config.get_decimal("risk.max_unhedged_exposure_usd", Decimal("50")),
-            max_daily_trades=config.get_int("risk.max_daily_trades", 100),
-            circuit_breaker_cooldown_minutes=config.get_int("risk.circuit_breaker_cooldown_minutes", 5),
+            max_daily_loss_usd=self._get_decimal("risk.max_daily_loss_usd", Decimal("100")),
+            max_position_size_usd=self._get_decimal("risk.max_position_size_usd", Decimal("25")),
+            max_unhedged_exposure_usd=self._get_decimal("risk.max_unhedged_exposure_usd", Decimal("50")),
         )
 
-        # State
-        self._state = RiskState()
-        self._position_exposure: Dict[str, Decimal] = {}  # market_id -> exposure
+        # Circuit breaker thresholds
+        self._warning_failures = self._get_int("risk.circuit_breaker_warning_failures", 3)
+        self._halt_failures = self._get_int("risk.circuit_breaker_halt_failures", 5)
+        self._warning_loss = self._get_decimal("risk.circuit_breaker_warning_loss", Decimal("50"))
+        self._halt_loss = self._get_decimal("risk.circuit_breaker_halt_loss", Decimal("100"))
+        self._cooldown_minutes = self._get_int("risk.circuit_breaker_cooldown_minutes", 5)
 
-    async def start(self) -> None:
+        # State tracking
+        self._daily_pnl: Decimal = Decimal("0")
+        self._daily_volume: Decimal = Decimal("0")
+        self._daily_trades: int = 0
+        self._current_exposure: Decimal = Decimal("0")
+        self._unhedged_exposure: Decimal = Decimal("0")
+        self._consecutive_failures: int = 0
+        self._circuit_breaker_state: CircuitBreakerState = CircuitBreakerState.NORMAL
+        self._circuit_breaker_triggered_at: Optional[datetime] = None
+        self._last_reset: datetime = datetime.now(timezone.utc)
+
+    def _get_decimal(self, key: str, default: Decimal) -> Decimal:
+        """Get a decimal config value."""
+        value = self._config.get(key)
+        if value is None:
+            return default
+        return Decimal(str(value))
+
+    def _get_int(self, key: str, default: int) -> int:
+        """Get an int config value."""
+        value = self._config.get(key)
+        if value is None:
+            return default
+        return int(value)
+
+    async def _do_start(self) -> None:
         """Start the risk manager."""
-        self._start_time = time.time()
         self._log.info(
             "starting_risk_manager",
-            max_daily_loss=str(self._limits.max_daily_loss),
-            max_position_size=str(self._limits.max_position_size),
+            max_daily_loss=str(self._limits.max_daily_loss_usd),
+            max_position_size=str(self._limits.max_position_size_usd),
         )
 
         # Subscribe to events
@@ -107,19 +114,23 @@ class RiskManager(BaseComponent):
 
         self._log.info("risk_manager_started")
 
-    async def stop(self) -> None:
+    async def _do_stop(self) -> None:
         """Stop the risk manager."""
         self._log.info("risk_manager_stopped")
 
-    async def health_check(self) -> HealthCheckResult:
+    async def _do_health_check(self) -> HealthCheckResult:
         """Check risk manager health."""
-        if self._state.circuit_breaker_level >= 3:
+        if self._circuit_breaker_state == CircuitBreakerState.HALT:
             return HealthCheckResult(
                 status=HealthStatus.DEGRADED,
                 message="Circuit breaker triggered",
                 details={
-                    "level": self._state.circuit_breaker_level,
-                    "until": self._state.circuit_breaker_until.isoformat() if self._state.circuit_breaker_until else None,
+                    "state": self._circuit_breaker_state.value,
+                    "triggered_at": (
+                        self._circuit_breaker_triggered_at.isoformat()
+                        if self._circuit_breaker_triggered_at
+                        else None
+                    ),
                 },
             )
 
@@ -127,47 +138,45 @@ class RiskManager(BaseComponent):
             status=HealthStatus.HEALTHY,
             message="Risk checks active",
             details={
-                "daily_pnl": str(self._state.daily_pnl),
-                "daily_trades": self._state.daily_trades,
-                "circuit_breaker_level": self._state.circuit_breaker_level,
+                "daily_pnl": str(self._daily_pnl),
+                "daily_trades": self._daily_trades,
+                "circuit_breaker_state": self._circuit_breaker_state.value,
+                "current_exposure": str(self._current_exposure),
             },
         )
 
-    def check_pre_trade(self, signal: TradingSignal) -> Tuple[bool, str]:
+    async def check_pre_trade(self, signal: TradingSignal) -> Tuple[bool, Optional[str]]:
         """Validate a signal against risk limits.
 
         Args:
             signal: Trading signal to validate.
 
         Returns:
-            Tuple of (allowed, reason).
+            Tuple of (allowed, reason). Reason is None if allowed.
         """
         # Check circuit breaker
-        if self._is_circuit_breaker_triggered():
-            return False, "Circuit breaker triggered"
+        if self._circuit_breaker_state == CircuitBreakerState.HALT:
+            if not self._is_cooldown_expired():
+                return False, "Circuit breaker triggered"
 
         # Check daily loss limit
-        if self._state.daily_pnl <= -self._limits.max_daily_loss:
-            return False, f"Daily loss limit reached: ${-self._state.daily_pnl:.2f}"
+        if self._daily_pnl <= -self._limits.max_daily_loss_usd:
+            return False, f"Daily loss limit reached: ${-self._daily_pnl:.2f}"
 
         # Check position size
-        if signal.target_size_usd > self._limits.max_position_size:
-            return False, f"Position size ${signal.target_size_usd:.2f} exceeds limit ${self._limits.max_position_size:.2f}"
+        if signal.target_size_usd > self._limits.max_position_size_usd:
+            return False, f"Position size ${signal.target_size_usd:.2f} exceeds limit ${self._limits.max_position_size_usd:.2f}"
 
         # Check unhedged exposure for non-arbitrage
         if signal.signal_type != SignalType.ARBITRAGE:
-            new_exposure = self._state.unhedged_exposure + signal.target_size_usd
-            if new_exposure > self._limits.max_unhedged_exposure:
-                return False, f"Unhedged exposure would exceed limit"
+            new_exposure = self._unhedged_exposure + signal.target_size_usd
+            if new_exposure > self._limits.max_unhedged_exposure_usd:
+                return False, "Unhedged exposure would exceed limit"
 
-        # Check daily trade limit
-        if self._state.daily_trades >= self._limits.max_daily_trades:
-            return False, f"Daily trade limit reached: {self._limits.max_daily_trades}"
-
-        return True, "Approved"
+        return True, None
 
     async def validate_signal(self, signal: TradingSignal) -> Optional[ApprovedSignal]:
-        """Validate and potentially adjust a trading signal.
+        """Validate and potentially approve a trading signal.
 
         Args:
             signal: Signal to validate.
@@ -175,7 +184,7 @@ class RiskManager(BaseComponent):
         Returns:
             ApprovedSignal if approved, None if rejected.
         """
-        allowed, reason = self.check_pre_trade(signal)
+        allowed, reason = await self.check_pre_trade(signal)
 
         if not allowed:
             self._log.info(
@@ -184,180 +193,240 @@ class RiskManager(BaseComponent):
                 reason=reason,
             )
 
+            rejected = RejectedSignal(
+                signal=signal,
+                rejection_reason=reason or "Unknown reason",
+            )
+
             await self._event_bus.publish(
                 f"risk.rejected.{signal.signal_id}",
                 {
                     "signal_id": signal.signal_id,
                     "reason": reason,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
-                }
+                },
             )
 
             return None
 
         # Create approved signal
         approved = ApprovedSignal(
-            signal_id=f"approved-{signal.signal_id}",
-            original_signal_id=signal.signal_id,
-            market_id=signal.market_id,
-            signal_type=signal.signal_type,
-            target_size_usd=signal.target_size_usd,
-            yes_price=signal.yes_price,
-            no_price=signal.no_price,
-            yes_token_id=signal.yes_token_id,
-            no_token_id=signal.no_token_id,
-            approved_at=datetime.now(timezone.utc),
+            signal=signal,
+            approved_size_usd=signal.target_size_usd,
         )
 
         self._log.info(
             "signal_approved",
-            signal_id=approved.signal_id,
-            original_id=signal.signal_id,
+            signal_id=signal.signal_id,
+            approved_size=str(approved.approved_size_usd),
         )
 
         # Publish approved signal
         await self._event_bus.publish(
-            f"risk.approved.{approved.signal_id}",
+            f"risk.approved.{signal.signal_id}",
             {
-                "signal_id": approved.signal_id,
-                "original_signal_id": signal.signal_id,
-                "market_id": approved.market_id,
-                "signal_type": approved.signal_type.value,
-                "target_size_usd": str(approved.target_size_usd),
-                "yes_price": str(approved.yes_price),
-                "no_price": str(approved.no_price),
-                "yes_token_id": approved.yes_token_id,
-                "no_token_id": approved.no_token_id,
+                "signal_id": signal.signal_id,
+                "market_id": signal.market_id,
+                "signal_type": signal.signal_type.value,
+                "approved_size_usd": str(approved.approved_size_usd),
+                "yes_price": str(signal.yes_price),
+                "no_price": str(signal.no_price),
                 "timestamp": approved.approved_at.isoformat(),
-            }
+            },
         )
 
         return approved
 
-    def record_fill(self, market_id: str, size: Decimal, is_hedged: bool) -> None:
+    def record_fill(self, fill: Fill) -> None:
         """Record a fill for exposure tracking.
 
         Args:
-            market_id: Market ID.
-            size: Fill size in USD.
-            is_hedged: Whether this is part of a hedged position.
+            fill: The fill to record.
         """
-        self._state.daily_trades += 1
-        self._state.daily_volume += size
+        self._daily_trades += 1
+        self._daily_volume += fill.cost
+        self._current_exposure += fill.cost
 
-        if not is_hedged:
-            self._state.unhedged_exposure += size
-
-        self._position_exposure[market_id] = self._position_exposure.get(market_id, Decimal("0")) + size
+        self._log.debug(
+            "fill_recorded",
+            order_id=fill.order_id,
+            market_id=fill.market_id,
+            cost=str(fill.cost),
+            current_exposure=str(self._current_exposure),
+        )
 
     def record_pnl(self, pnl: Decimal) -> None:
         """Record realized P&L.
 
         Args:
-            pnl: P&L amount (positive = profit).
+            pnl: P&L amount (positive = profit, negative = loss).
         """
-        self._state.daily_pnl += pnl
+        self._daily_pnl += pnl
 
-        # Update circuit breaker
-        self._update_circuit_breaker()
-
-    def _update_circuit_breaker(self) -> None:
-        """Update circuit breaker state based on P&L."""
-        loss = -self._state.daily_pnl
-        limit = self._limits.max_daily_loss
-
-        old_level = self._state.circuit_breaker_level
-
-        if loss >= limit:
-            self._state.circuit_breaker_level = 3  # TRIGGERED
-            self._state.circuit_breaker_until = datetime.now(timezone.utc)
-        elif loss >= limit * Decimal("0.75"):
-            self._state.circuit_breaker_level = 2  # CRITICAL
-        elif loss >= limit * Decimal("0.50"):
-            self._state.circuit_breaker_level = 1  # WARNING
-        else:
-            self._state.circuit_breaker_level = 0  # NORMAL
-
-        # Publish if changed
-        if self._state.circuit_breaker_level != old_level:
-            self._log.warning(
-                "circuit_breaker_changed",
-                old_level=old_level,
-                new_level=self._state.circuit_breaker_level,
-                daily_pnl=str(self._state.daily_pnl),
-            )
-
-    def _is_circuit_breaker_triggered(self) -> bool:
-        """Check if circuit breaker is triggered."""
-        if self._state.circuit_breaker_level < 3:
-            return False
-
-        # Check cooldown
-        if self._state.circuit_breaker_until:
-            from datetime import timedelta
-            cooldown = timedelta(minutes=self._limits.circuit_breaker_cooldown_minutes)
-            if datetime.now(timezone.utc) < self._state.circuit_breaker_until + cooldown:
-                return True
-
-        # Reset after cooldown
-        self._state.circuit_breaker_level = 0
-        self._state.circuit_breaker_until = None
-        return False
-
-    def reset_daily(self) -> None:
-        """Reset daily counters (called at midnight)."""
         self._log.info(
-            "resetting_daily_limits",
-            final_pnl=str(self._state.daily_pnl),
-            final_trades=self._state.daily_trades,
+            "pnl_recorded",
+            pnl=str(pnl),
+            daily_pnl=str(self._daily_pnl),
         )
 
-        self._state.daily_pnl = Decimal("0")
-        self._state.daily_volume = Decimal("0")
-        self._state.daily_trades = 0
-        self._state.unhedged_exposure = Decimal("0")
-        self._state.circuit_breaker_level = 0
-        self._state.circuit_breaker_until = None
-        self._state.last_reset = datetime.now(timezone.utc)
+        # Update circuit breaker based on loss
+        self._update_circuit_breaker_for_loss()
+
+    def record_failure(self) -> None:
+        """Record a trading failure for circuit breaker tracking.
+
+        Consecutive failures trigger circuit breaker state changes.
+        """
+        self._consecutive_failures += 1
+
+        old_state = self._circuit_breaker_state
+        new_state = self._compute_circuit_breaker_state()
+
+        if new_state != old_state:
+            self._circuit_breaker_state = new_state
+            if new_state == CircuitBreakerState.HALT:
+                self._circuit_breaker_triggered_at = datetime.now(timezone.utc)
+
+            self._log.warning(
+                "circuit_breaker_changed",
+                old_state=old_state.value,
+                new_state=new_state.value,
+                consecutive_failures=self._consecutive_failures,
+                daily_pnl=str(self._daily_pnl),
+            )
+
+    def record_success(self) -> None:
+        """Record a successful trade, resetting consecutive failure count."""
+        self._consecutive_failures = 0
+
+    def _compute_circuit_breaker_state(self) -> CircuitBreakerState:
+        """Compute circuit breaker state based on failures and loss."""
+        # Check failure-based thresholds
+        if self._consecutive_failures >= self._halt_failures:
+            return CircuitBreakerState.HALT
+        elif self._consecutive_failures >= self._warning_failures:
+            return CircuitBreakerState.WARNING
+
+        # Check loss-based thresholds
+        loss = -self._daily_pnl
+        if loss >= self._halt_loss:
+            return CircuitBreakerState.HALT
+        elif loss >= self._warning_loss:
+            return CircuitBreakerState.WARNING
+
+        return CircuitBreakerState.NORMAL
+
+    def _update_circuit_breaker_for_loss(self) -> None:
+        """Update circuit breaker state based on daily P&L."""
+        old_state = self._circuit_breaker_state
+        new_state = self._compute_circuit_breaker_state()
+
+        if new_state != old_state:
+            self._circuit_breaker_state = new_state
+            if new_state == CircuitBreakerState.HALT:
+                self._circuit_breaker_triggered_at = datetime.now(timezone.utc)
+
+            self._log.warning(
+                "circuit_breaker_changed",
+                old_state=old_state.value,
+                new_state=new_state.value,
+                daily_pnl=str(self._daily_pnl),
+            )
+
+    def _is_cooldown_expired(self) -> bool:
+        """Check if circuit breaker cooldown has expired."""
+        if self._circuit_breaker_triggered_at is None:
+            return True
+
+        from datetime import timedelta
+
+        cooldown = timedelta(minutes=self._cooldown_minutes)
+        return datetime.now(timezone.utc) >= self._circuit_breaker_triggered_at + cooldown
+
+    def reset_daily(self) -> None:
+        """Reset daily counters (called at midnight or on demand)."""
+        self._log.info(
+            "resetting_daily_limits",
+            final_pnl=str(self._daily_pnl),
+            final_trades=self._daily_trades,
+            final_volume=str(self._daily_volume),
+        )
+
+        self._daily_pnl = Decimal("0")
+        self._daily_volume = Decimal("0")
+        self._daily_trades = 0
+        self._current_exposure = Decimal("0")
+        self._unhedged_exposure = Decimal("0")
+        self._consecutive_failures = 0
+        self._circuit_breaker_state = CircuitBreakerState.NORMAL
+        self._circuit_breaker_triggered_at = None
+        self._last_reset = datetime.now(timezone.utc)
 
     @property
     def circuit_breaker_state(self) -> CircuitBreakerState:
         """Get current circuit breaker state."""
-        return CircuitBreakerState(
-            level=self._state.circuit_breaker_level,
-            triggered_at=self._state.circuit_breaker_until,
-            cooldown_minutes=self._limits.circuit_breaker_cooldown_minutes,
-        )
+        return self._circuit_breaker_state
+
+    @property
+    def current_exposure(self) -> Decimal:
+        """Get current total exposure."""
+        return self._current_exposure
+
+    @property
+    def daily_pnl(self) -> Decimal:
+        """Get current daily P&L."""
+        return self._daily_pnl
+
+    @property
+    def daily_trades(self) -> int:
+        """Get number of trades today."""
+        return self._daily_trades
 
     async def _on_signal(self, data: dict) -> None:
-        """Handle incoming trading signal."""
-        signal = TradingSignal(
-            signal_id=data["signal_id"],
-            strategy_name=data["strategy"],
-            market_id=data["market_id"],
-            signal_type=SignalType(data["signal_type"]),
-            target_size_usd=Decimal(str(data["target_size_usd"])),
-            yes_price=Decimal(str(data.get("yes_price", 0))),
-            no_price=Decimal(str(data.get("no_price", 0))),
-            yes_token_id=data.get("yes_token_id", ""),
-            no_token_id=data.get("no_token_id", ""),
-            confidence=data.get("confidence", 0.5),
-            metadata=data.get("metadata", {}),
-        )
+        """Handle incoming trading signal from event bus."""
+        try:
+            signal = TradingSignal(
+                signal_id=data["signal_id"],
+                strategy_name=data.get("strategy", ""),
+                market_id=data["market_id"],
+                signal_type=SignalType(data["signal_type"]),
+                target_size_usd=Decimal(str(data["target_size_usd"])),
+                yes_price=Decimal(str(data.get("yes_price", 0))),
+                no_price=Decimal(str(data.get("no_price", 0))),
+                confidence=data.get("confidence", 0.5),
+                metadata=data.get("metadata", {}),
+            )
 
-        await self.validate_signal(signal)
+            await self.validate_signal(signal)
+        except Exception as e:
+            self._log.error("signal_processing_error", error=str(e), data=data)
 
     async def _on_order_filled(self, data: dict) -> None:
-        """Handle order filled event."""
-        market_id = data.get("market_id", "")
-        total_cost = Decimal(str(data.get("total_cost", 0)))
+        """Handle order filled event from event bus."""
+        try:
+            from mercury.domain.order import Fill, OrderSide
+            import uuid
 
-        # Check if hedged (dual-leg)
-        is_hedged = data.get("yes_filled") and data.get("no_filled")
+            fill = Fill(
+                fill_id=data.get("fill_id", str(uuid.uuid4())),
+                order_id=data.get("order_id", ""),
+                market_id=data.get("market_id", ""),
+                token_id=data.get("token_id", ""),
+                side=OrderSide(data.get("side", "BUY")),
+                outcome=data.get("outcome", "YES"),
+                size=Decimal(str(data.get("size", 0))),
+                price=Decimal(str(data.get("price", 0))),
+                fee=Decimal(str(data.get("fee", 0))),
+            )
 
-        self.record_fill(market_id, total_cost, is_hedged)
+            self.record_fill(fill)
+        except Exception as e:
+            self._log.error("fill_processing_error", error=str(e), data=data)
 
     async def _on_position_closed(self, data: dict) -> None:
-        """Handle position closed event."""
-        pnl = Decimal(str(data.get("realized_pnl", 0)))
-        self.record_pnl(pnl)
+        """Handle position closed event from event bus."""
+        try:
+            pnl = Decimal(str(data.get("realized_pnl", 0)))
+            self.record_pnl(pnl)
+        except Exception as e:
+            self._log.error("position_closed_processing_error", error=str(e), data=data)

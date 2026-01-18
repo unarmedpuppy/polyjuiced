@@ -10,18 +10,26 @@ from enum import Enum
 from typing import Optional
 
 
-class CircuitBreakerLevel(str, Enum):
-    """Circuit breaker level indicating risk status."""
-    NORMAL = "NORMAL"       # Trading normally
-    WARNING = "WARNING"     # Near limits, extra caution
-    CRITICAL = "CRITICAL"   # Very close to limits
-    TRIGGERED = "TRIGGERED" # Trading halted
+class CircuitBreakerState(str, Enum):
+    """Circuit breaker state indicating trading status.
+
+    States progress from NORMAL -> WARNING -> CAUTION -> HALT
+    based on consecutive failures or daily loss limits.
+    """
+    NORMAL = "NORMAL"    # Trading normally, all systems go
+    WARNING = "WARNING"  # Near limits, extra caution advised
+    CAUTION = "CAUTION"  # Very close to limits, reduce activity
+    HALT = "HALT"        # Trading halted, circuit breaker triggered
+
+
+# Keep CircuitBreakerLevel as an alias for backwards compatibility
+CircuitBreakerLevel = CircuitBreakerState
 
 
 @dataclass
-class CircuitBreakerState:
-    """Current state of the circuit breaker."""
-    level: CircuitBreakerLevel = CircuitBreakerLevel.NORMAL
+class CircuitBreakerInfo:
+    """Detailed circuit breaker information including timing."""
+    state: CircuitBreakerState = CircuitBreakerState.NORMAL
     reason: str = ""
     triggered_at: Optional[datetime] = None
     cooldown_until: Optional[datetime] = None
@@ -29,10 +37,12 @@ class CircuitBreakerState:
     @property
     def is_trading_allowed(self) -> bool:
         """Check if trading is allowed in current state."""
-        if self.level == CircuitBreakerLevel.TRIGGERED:
+        if self.state == CircuitBreakerState.HALT:
             if self.cooldown_until and datetime.utcnow() < self.cooldown_until:
                 return False
-        return self.level != CircuitBreakerLevel.TRIGGERED
+            # If cooldown expired, allow trading
+            return self.cooldown_until is not None and datetime.utcnow() >= self.cooldown_until
+        return self.state != CircuitBreakerState.HALT
 
     @property
     def is_in_cooldown(self) -> bool:
