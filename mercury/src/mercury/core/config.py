@@ -232,3 +232,24 @@ class ConfigManager:
     def raw_data(self) -> dict[str, Any]:
         """Get raw configuration data (for debugging)."""
         return self._data.copy()
+
+    def get_retry_config(self, section: str = "retry") -> dict[str, Any]:
+        """Get retry configuration from the specified section.
+
+        Args:
+            section: Config section for retry settings (e.g., "retry", "retry.network").
+
+        Returns:
+            Dictionary with retry configuration ready for RetryConfig.from_dict().
+
+        Example:
+            config.get_retry_config()  # Returns global retry settings
+            config.get_retry_config("retry.network")  # Returns network-specific settings
+        """
+        return {
+            "max_attempts": self.get_int(f"{section}.max_attempts", 3),
+            "min_wait_seconds": self.get_float(f"{section}.min_wait_seconds", 1.0),
+            "max_wait_seconds": self.get_float(f"{section}.max_wait_seconds", 30.0),
+            "exponential_multiplier": self.get_float(f"{section}.exponential_multiplier", 2.0),
+            "jitter": self.get_bool(f"{section}.jitter", True),
+        }

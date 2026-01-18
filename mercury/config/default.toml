@@ -39,6 +39,29 @@ refresh_interval_seconds = 5
 rebalance_partial_fills = true
 default_timeout_seconds = 5.0
 price_buffer_cents = 1  # Add 1 cent for better fills
+max_concurrent = 3      # Max concurrent order executions
+max_queue_size = 100    # Max signals in execution queue
+queue_timeout_seconds = 60.0
+
+[retry]
+# Global retry settings for transient failures
+max_attempts = 3              # Max retry attempts including initial
+min_wait_seconds = 1.0        # Min wait between retries
+max_wait_seconds = 30.0       # Max wait between retries
+exponential_multiplier = 2.0  # Backoff multiplier
+jitter = true                 # Add randomness to wait times
+
+[retry.network]
+# Network-specific retry settings (higher tolerance)
+max_attempts = 5
+min_wait_seconds = 0.5
+max_wait_seconds = 20.0
+
+[retry.rate_limit]
+# Rate limit retry settings (longer backoff)
+max_attempts = 5
+min_wait_seconds = 2.0
+max_wait_seconds = 60.0
 
 [risk]
 max_daily_loss_usd = 100.0
