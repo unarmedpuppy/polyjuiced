@@ -158,6 +158,51 @@ class MetricsEmitter:
             registry=self._registry,
         )
 
+        # Execution latency breakdown histograms (target: sub-100ms total)
+        # Buckets optimized for low-latency trading: 1ms to 500ms
+        latency_buckets = [0.001, 0.005, 0.010, 0.025, 0.050, 0.075, 0.100, 0.150, 0.250, 0.500]
+
+        self._execution_queue_time = Histogram(
+            "mercury_execution_queue_time_seconds",
+            "Time spent in execution queue (signal received to execution start)",
+            buckets=latency_buckets,
+            registry=self._registry,
+        )
+
+        self._execution_submission_time = Histogram(
+            "mercury_execution_submission_time_seconds",
+            "Time to submit order to exchange (execution start to exchange ack)",
+            buckets=latency_buckets,
+            registry=self._registry,
+        )
+
+        self._execution_fill_time = Histogram(
+            "mercury_execution_fill_time_seconds",
+            "Time from submission to fill completion",
+            buckets=latency_buckets,
+            registry=self._registry,
+        )
+
+        self._execution_total_time = Histogram(
+            "mercury_execution_total_time_seconds",
+            "Total execution latency (signal received to order confirmed)",
+            buckets=latency_buckets,
+            registry=self._registry,
+        )
+
+        # Counters for latency target tracking
+        self._execution_within_target = Counter(
+            "mercury_execution_within_target_total",
+            "Executions completing within 100ms target",
+            registry=self._registry,
+        )
+
+        self._execution_exceeded_target = Counter(
+            "mercury_execution_exceeded_target_total",
+            "Executions exceeding 100ms target",
+            registry=self._registry,
+        )
+
     def record_trade(
         self,
         strategy: str,
@@ -297,6 +342,70 @@ class MetricsEmitter:
             channel: Event channel
         """
         self._event_bus_messages.labels(channel=channel).inc()
+
+    def record_execution_queue_time(self, queue_time_ms: float) -> None:
+        """Record time spent in execution queue.
+
+        Args:
+            queue_time_ms: Queue time in milliseconds
+        """
+        self._execution_queue_time.observe(queue_time_ms / 1000.0)
+
+    def record_execution_submission_time(self, submission_time_ms: float) -> None:
+        """Record time to submit order to exchange.
+
+        Args:
+            submission_time_ms: Submission time in milliseconds
+        """
+        self._execution_submission_time.observe(submission_time_ms / 1000.0)
+
+    def record_execution_fill_time(self, fill_time_ms: float) -> None:
+        """Record time from submission to fill.
+
+        Args:
+            fill_time_ms: Fill time in milliseconds
+        """
+        self._execution_fill_time.observe(fill_time_ms / 1000.0)
+
+    def record_execution_total_time(self, total_time_ms: float) -> None:
+        """Record total execution latency.
+
+        Args:
+            total_time_ms: Total latency in milliseconds
+        """
+        self._execution_total_time.observe(total_time_ms / 1000.0)
+
+        # Track target compliance
+        if total_time_ms < 100.0:
+            self._execution_within_target.inc()
+        else:
+            self._execution_exceeded_target.inc()
+
+    def record_execution_latency_breakdown(
+        self,
+        queue_time_ms: Optional[float],
+        submission_time_ms: Optional[float],
+        fill_time_ms: Optional[float],
+        total_time_ms: Optional[float],
+    ) -> None:
+        """Record complete execution latency breakdown.
+
+        Convenience method to record all latency components at once.
+
+        Args:
+            queue_time_ms: Time in queue (ms), or None if not available
+            submission_time_ms: Submission time (ms), or None if not available
+            fill_time_ms: Fill time (ms), or None if not available
+            total_time_ms: Total latency (ms), or None if not available
+        """
+        if queue_time_ms is not None:
+            self.record_execution_queue_time(queue_time_ms)
+        if submission_time_ms is not None:
+            self.record_execution_submission_time(submission_time_ms)
+        if fill_time_ms is not None:
+            self.record_execution_fill_time(fill_time_ms)
+        if total_time_ms is not None:
+            self.record_execution_total_time(total_time_ms)
 
     def get_metrics(self) -> str:
         """Get Prometheus metrics output.

@@ -1929,3 +1929,277 @@ class TestOpenOrderTracking:
             assert f"order-{status.value}" not in execution_engine._open_orders
 
         await execution_engine.stop()
+
+
+class TestExecutionLatency:
+    """Test execution latency tracking."""
+
+    @pytest.mark.asyncio
+    async def test_latency_tracked_for_queued_signal(self, execution_engine, mock_event_bus):
+        """Verify latency is tracked when signal goes through queue."""
+        await execution_engine.start()
+
+        # Wait for queue processor to start
+        await asyncio.sleep(0.1)
+
+        signal_data = {
+            "signal_id": "latency-test-signal",
+            "market_id": "test-market",
+            "signal_type": "ARBITRAGE",
+            "target_size_usd": "50.0",
+            "yes_price": "0.45",
+            "no_price": "0.53",
+            "yes_token_id": "yes-token",
+            "no_token_id": "no-token",
+            "priority": "high",
+        }
+
+        # Simulate receiving an approved signal
+        await execution_engine._on_approved_signal(signal_data)
+
+        # Give time for execution
+        await asyncio.sleep(0.3)
+
+        # Check latency was tracked
+        assert execution_engine.last_latency_ms is not None
+        assert execution_engine.last_latency is not None
+
+        latency = execution_engine.last_latency
+        assert latency.signal_id == "latency-test-signal"
+        assert latency.queue_time_ms is not None
+        assert latency.total_latency_ms is not None
+
+        await execution_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_latency_event_published(self, execution_engine, mock_event_bus):
+        """Verify execution.latency event is published."""
+        await execution_engine.start()
+        await asyncio.sleep(0.1)
+
+        signal_data = {
+            "signal_id": "latency-event-test",
+            "market_id": "test-market",
+            "signal_type": "ARBITRAGE",
+            "target_size_usd": "50.0",
+            "yes_price": "0.45",
+            "no_price": "0.53",
+            "yes_token_id": "yes-token",
+            "no_token_id": "no-token",
+        }
+
+        await execution_engine._on_approved_signal(signal_data)
+        await asyncio.sleep(0.3)
+
+        # Find the latency event
+        latency_calls = [
+            call for call in mock_event_bus.publish.call_args_list
+            if call[0][0] == "execution.latency"
+        ]
+        assert len(latency_calls) >= 1
+
+        event_data = latency_calls[0][0][1]
+        assert "signal_id" in event_data
+        assert "queue_time_ms" in event_data
+        assert "total_latency_ms" in event_data
+        assert "within_target" in event_data
+
+        await execution_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_latency_stats(self, execution_engine, mock_event_bus):
+        """Verify latency statistics are calculated."""
+        await execution_engine.start()
+        await asyncio.sleep(0.1)
+
+        # Execute multiple signals
+        for i in range(3):
+            signal_data = {
+                "signal_id": f"stats-test-{i}",
+                "market_id": "test-market",
+                "signal_type": "ARBITRAGE",
+                "target_size_usd": "50.0",
+                "yes_price": "0.45",
+                "no_price": "0.53",
+                "yes_token_id": "yes-token",
+                "no_token_id": "no-token",
+            }
+            await execution_engine._on_approved_signal(signal_data)
+            await asyncio.sleep(0.2)
+
+        stats = execution_engine.get_latency_stats()
+
+        assert stats["history_size"] == 3
+        assert stats["avg_total_ms"] is not None
+        assert stats["avg_queue_ms"] is not None
+        assert "within_target_count" in stats
+        assert "exceeded_target_count" in stats
+
+        await execution_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_latency_history(self, execution_engine, mock_event_bus):
+        """Verify latency history is stored."""
+        await execution_engine.start()
+        await asyncio.sleep(0.1)
+
+        # Execute a signal
+        signal_data = {
+            "signal_id": "history-test",
+            "market_id": "test-market",
+            "signal_type": "ARBITRAGE",
+            "target_size_usd": "50.0",
+            "yes_price": "0.45",
+            "no_price": "0.53",
+            "yes_token_id": "yes-token",
+            "no_token_id": "no-token",
+        }
+        await execution_engine._on_approved_signal(signal_data)
+        await asyncio.sleep(0.3)
+
+        history = execution_engine.get_latency_history(limit=5)
+
+        assert len(history) == 1
+        assert history[0]["signal_id"] == "history-test"
+        assert "queue_time_ms" in history[0]
+        assert "total_latency_ms" in history[0]
+
+        await execution_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_queue_signal_tracks_received_at(self, execution_engine, mock_event_bus):
+        """Verify queue_signal properly tracks signal_received_at."""
+        await execution_engine.start()
+
+        from datetime import datetime, timezone, timedelta
+
+        # Create a signal received timestamp in the past
+        signal_received = datetime.now(timezone.utc) - timedelta(milliseconds=50)
+
+        signal_data = {"signal_id": "received-at-test", "market_id": "test"}
+
+        await execution_engine.queue_signal(
+            "received-at-test",
+            signal_data,
+            signal_received_at=signal_received,
+        )
+
+        queued_signal = execution_engine._queue_items.get("received-at-test")
+        assert queued_signal is not None
+        assert queued_signal.signal_received_at == signal_received
+        assert queued_signal.latency is not None
+        assert queued_signal.latency.signal_received_at == signal_received
+        assert queued_signal.latency.queue_entered_at is not None
+        # Queue entered should be after signal received
+        assert queued_signal.latency.queue_entered_at >= signal_received
+
+        await execution_engine.stop()
+
+
+class TestExecutionLatencyDataclass:
+    """Test ExecutionLatency domain model."""
+
+    def test_queue_time_calculation(self):
+        """Verify queue_time_ms is calculated correctly."""
+        from mercury.domain.order import ExecutionLatency
+        from datetime import datetime, timezone, timedelta
+
+        queue_entered = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        queue_exited = datetime(2024, 1, 1, 12, 0, 0, 50000, tzinfo=timezone.utc)  # 50ms later
+
+        latency = ExecutionLatency(
+            signal_id="test",
+            queue_entered_at=queue_entered,
+            queue_exited_at=queue_exited,
+        )
+
+        assert latency.queue_time_ms == 50.0
+
+    def test_submission_time_calculation(self):
+        """Verify submission_time_ms is calculated correctly."""
+        from mercury.domain.order import ExecutionLatency
+        from datetime import datetime, timezone
+
+        submission_started = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        submission_completed = datetime(2024, 1, 1, 12, 0, 0, 30000, tzinfo=timezone.utc)  # 30ms later
+
+        latency = ExecutionLatency(
+            signal_id="test",
+            submission_started_at=submission_started,
+            submission_completed_at=submission_completed,
+        )
+
+        assert latency.submission_time_ms == 30.0
+
+    def test_total_latency_calculation(self):
+        """Verify total_latency_ms is calculated correctly."""
+        from mercury.domain.order import ExecutionLatency
+        from datetime import datetime, timezone
+
+        signal_received = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        fill_completed = datetime(2024, 1, 1, 12, 0, 0, 80000, tzinfo=timezone.utc)  # 80ms later
+
+        latency = ExecutionLatency(
+            signal_id="test",
+            signal_received_at=signal_received,
+            fill_completed_at=fill_completed,
+        )
+
+        assert latency.total_latency_ms == 80.0
+        assert latency.is_within_target is True  # Under 100ms
+
+    def test_within_target_exceeded(self):
+        """Verify is_within_target returns False for > 100ms."""
+        from mercury.domain.order import ExecutionLatency
+        from datetime import datetime, timezone
+
+        signal_received = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        fill_completed = datetime(2024, 1, 1, 12, 0, 0, 150000, tzinfo=timezone.utc)  # 150ms later
+
+        latency = ExecutionLatency(
+            signal_id="test",
+            signal_received_at=signal_received,
+            fill_completed_at=fill_completed,
+        )
+
+        assert latency.total_latency_ms == 150.0
+        assert latency.is_within_target is False
+
+    def test_to_dict(self):
+        """Verify to_dict produces expected structure."""
+        from mercury.domain.order import ExecutionLatency
+        from datetime import datetime, timezone
+
+        signal_received = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        queue_entered = datetime(2024, 1, 1, 12, 0, 0, 10000, tzinfo=timezone.utc)
+        queue_exited = datetime(2024, 1, 1, 12, 0, 0, 20000, tzinfo=timezone.utc)
+        fill_completed = datetime(2024, 1, 1, 12, 0, 0, 50000, tzinfo=timezone.utc)
+
+        latency = ExecutionLatency(
+            signal_id="test-signal",
+            order_id="test-order",
+            signal_received_at=signal_received,
+            queue_entered_at=queue_entered,
+            queue_exited_at=queue_exited,
+            fill_completed_at=fill_completed,
+        )
+
+        result = latency.to_dict()
+
+        assert result["signal_id"] == "test-signal"
+        assert result["order_id"] == "test-order"
+        assert result["queue_time_ms"] == 10.0
+        assert result["total_latency_ms"] == 50.0
+        assert result["within_target"] is True
+
+    def test_none_values_handled(self):
+        """Verify None values are handled gracefully."""
+        from mercury.domain.order import ExecutionLatency
+
+        latency = ExecutionLatency(signal_id="test")
+
+        assert latency.queue_time_ms is None
+        assert latency.submission_time_ms is None
+        assert latency.fill_time_ms is None
+        assert latency.total_latency_ms is None
+        assert latency.is_within_target is False  # None total means not within target

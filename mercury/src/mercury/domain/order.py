@@ -213,3 +213,96 @@ class Position:
         payout = hedged_size * Decimal("1")
         cost = (hedged_size * self.yes_avg_price) + (hedged_size * self.no_avg_price)
         return payout - cost
+
+
+@dataclass
+class ExecutionLatency:
+    """Tracks execution latency breakdown for order lifecycle.
+
+    Provides detailed timing metrics from signal received to order confirmed.
+    Target is sub-100ms total latency for optimal execution.
+
+    Attributes:
+        signal_id: The signal that triggered this execution.
+        order_id: The order being tracked (if created).
+        signal_received_at: When the signal was received for execution.
+        queue_entered_at: When the signal entered the execution queue.
+        queue_exited_at: When the signal left the queue and execution started.
+        submission_started_at: When order submission to exchange began.
+        submission_completed_at: When exchange acknowledged the order.
+        fill_completed_at: When the order was filled (or terminal state reached).
+    """
+
+    signal_id: str
+    order_id: Optional[str] = None
+    signal_received_at: Optional[datetime] = None
+    queue_entered_at: Optional[datetime] = None
+    queue_exited_at: Optional[datetime] = None
+    submission_started_at: Optional[datetime] = None
+    submission_completed_at: Optional[datetime] = None
+    fill_completed_at: Optional[datetime] = None
+
+    @property
+    def queue_time_ms(self) -> Optional[float]:
+        """Time spent waiting in the execution queue (ms).
+
+        Measured from queue_entered_at to queue_exited_at.
+        """
+        if self.queue_entered_at and self.queue_exited_at:
+            delta = (self.queue_exited_at - self.queue_entered_at).total_seconds()
+            return delta * 1000.0
+        return None
+
+    @property
+    def submission_time_ms(self) -> Optional[float]:
+        """Time spent submitting order to exchange (ms).
+
+        Measured from submission_started_at to submission_completed_at.
+        """
+        if self.submission_started_at and self.submission_completed_at:
+            delta = (self.submission_completed_at - self.submission_started_at).total_seconds()
+            return delta * 1000.0
+        return None
+
+    @property
+    def fill_time_ms(self) -> Optional[float]:
+        """Time from submission to fill (ms).
+
+        Measured from submission_completed_at to fill_completed_at.
+        """
+        if self.submission_completed_at and self.fill_completed_at:
+            delta = (self.fill_completed_at - self.submission_completed_at).total_seconds()
+            return delta * 1000.0
+        return None
+
+    @property
+    def total_latency_ms(self) -> Optional[float]:
+        """Total execution latency from signal to fill (ms).
+
+        Measured from signal_received_at to fill_completed_at.
+        Target is sub-100ms.
+        """
+        if self.signal_received_at and self.fill_completed_at:
+            delta = (self.fill_completed_at - self.signal_received_at).total_seconds()
+            return delta * 1000.0
+        return None
+
+    @property
+    def is_within_target(self) -> bool:
+        """Check if total latency is within 100ms target."""
+        total = self.total_latency_ms
+        return total is not None and total < 100.0
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for event publishing."""
+        return {
+            "signal_id": self.signal_id,
+            "order_id": self.order_id,
+            "queue_time_ms": self.queue_time_ms,
+            "submission_time_ms": self.submission_time_ms,
+            "fill_time_ms": self.fill_time_ms,
+            "total_latency_ms": self.total_latency_ms,
+            "within_target": self.is_within_target,
+            "signal_received_at": self.signal_received_at.isoformat() if self.signal_received_at else None,
+            "fill_completed_at": self.fill_completed_at.isoformat() if self.fill_completed_at else None,
+        }

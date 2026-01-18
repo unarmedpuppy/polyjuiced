@@ -34,6 +34,7 @@ from mercury.domain.order import (
     Fill,
     Position,
     PositionStatus,
+    ExecutionLatency,
 )
 from mercury.domain.signal import ApprovedSignal, SignalType, SignalPriority
 from mercury.integrations.polymarket.clob import CLOBClient, InsufficientLiquidityError
@@ -75,6 +76,10 @@ class QueuedSignal:
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     error: Optional[str] = None
+    # Latency tracking - when signal was first received (before queuing)
+    signal_received_at: Optional[datetime] = None
+    # Latency tracker for full breakdown
+    latency: Optional[ExecutionLatency] = None
 
     def __lt__(self, other: "QueuedSignal") -> bool:
         """Compare for priority queue ordering.
@@ -129,6 +134,8 @@ class ExecutionResult:
     guaranteed_pnl: Decimal = Decimal("0")
     execution_time_ms: Optional[float] = None
     error: Optional[str] = None
+    # Detailed latency breakdown
+    latency: Optional[ExecutionLatency] = None
 
 
 class ExecutionEngine(BaseComponent):
@@ -224,6 +231,11 @@ class ExecutionEngine(BaseComponent):
         self._total_executed = 0
         self._total_failed = 0
         self._total_expired = 0
+
+        # Latency tracking
+        self._last_latency: Optional[ExecutionLatency] = None
+        self._latency_history: list[ExecutionLatency] = []
+        self._max_latency_history = 100  # Keep last 100 latency records
 
     async def _do_start(self) -> None:
         """Component-specific startup logic."""
@@ -1345,6 +1357,9 @@ class ExecutionEngine(BaseComponent):
 
     async def _on_approved_signal(self, data: dict) -> None:
         """Handle approved signal from RiskManager by queueing for execution."""
+        # Mark signal received time for latency tracking
+        signal_received_at = datetime.now(timezone.utc)
+
         signal_id = data.get("signal_id", str(uuid.uuid4()))
 
         # Get priority from signal data, default to MEDIUM
@@ -1354,14 +1369,15 @@ class ExecutionEngine(BaseComponent):
         except (ValueError, AttributeError):
             priority = SignalPriority.MEDIUM
 
-        # Queue the signal for execution
-        await self.queue_signal(signal_id, data, priority)
+        # Queue the signal for execution with latency tracking
+        await self.queue_signal(signal_id, data, priority, signal_received_at)
 
     async def queue_signal(
         self,
         signal_id: str,
         signal_data: dict[str, Any],
         priority: SignalPriority = SignalPriority.MEDIUM,
+        signal_received_at: Optional[datetime] = None,
     ) -> bool:
         """Add a signal to the execution queue.
 
@@ -1369,6 +1385,7 @@ class ExecutionEngine(BaseComponent):
             signal_id: Unique signal identifier.
             signal_data: Signal data dictionary.
             priority: Execution priority.
+            signal_received_at: When the signal was first received (for latency tracking).
 
         Returns:
             True if queued successfully, False if queue is full.
@@ -1377,10 +1394,23 @@ class ExecutionEngine(BaseComponent):
             self._log.warning("signal_already_queued", signal_id=signal_id)
             return False
 
+        # Track when signal was received and when it entered the queue
+        now = datetime.now(timezone.utc)
+        received_at = signal_received_at or now
+
+        # Initialize latency tracker
+        latency = ExecutionLatency(
+            signal_id=signal_id,
+            signal_received_at=received_at,
+            queue_entered_at=now,
+        )
+
         queued_signal = QueuedSignal(
             signal_id=signal_id,
             signal_data=signal_data,
             priority=priority,
+            signal_received_at=received_at,
+            latency=latency,
         )
 
         try:
@@ -1400,6 +1430,7 @@ class ExecutionEngine(BaseComponent):
                 "priority": priority.value,
                 "queue_size": self._queue.qsize(),
                 "queued_at": queued_signal.queued_at.isoformat(),
+                "signal_received_at": received_at.isoformat(),
             })
 
             return True
@@ -1501,21 +1532,28 @@ class ExecutionEngine(BaseComponent):
             pass  # task_done called too many times
 
     async def _execute_queued_signal(self, queued_signal: QueuedSignal) -> ExecutionResult:
-        """Execute a signal from the queue."""
+        """Execute a signal from the queue with detailed latency tracking."""
         queued_signal.status = QueuedSignalStatus.EXECUTING
         queued_signal.started_at = datetime.now(timezone.utc)
+
+        # Update latency tracker - queue exit time
+        if queued_signal.latency:
+            queued_signal.latency.queue_exited_at = queued_signal.started_at
+
+        queue_time_ms = (queued_signal.started_at - queued_signal.queued_at).total_seconds() * 1000
 
         self._log.info(
             "executing_queued_signal",
             signal_id=queued_signal.signal_id,
             priority=queued_signal.priority.value,
-            wait_time_ms=(queued_signal.started_at - queued_signal.queued_at).total_seconds() * 1000,
+            queue_time_ms=queue_time_ms,
         )
 
         await self._event_bus.publish("execution.queue.started", {
             "signal_id": queued_signal.signal_id,
             "priority": queued_signal.priority.value,
             "active_executions": len(self._active_executions),
+            "queue_time_ms": queue_time_ms,
         })
 
         try:
@@ -1523,7 +1561,8 @@ class ExecutionEngine(BaseComponent):
             data = queued_signal.signal_data
             signal = self._build_approved_signal(data)
 
-            result = await self.execute(signal)
+            # Execute with latency tracking
+            result = await self._execute_with_latency_tracking(signal, queued_signal.latency)
 
             if result.success:
                 queued_signal.status = QueuedSignalStatus.COMPLETED
@@ -1534,6 +1573,11 @@ class ExecutionEngine(BaseComponent):
                 self._total_failed += 1
 
             queued_signal.completed_at = datetime.now(timezone.utc)
+
+            # Publish latency metrics event
+            if result.latency:
+                await self._publish_latency_event(result.latency)
+
             return result
 
         except Exception as e:
@@ -1552,6 +1596,78 @@ class ExecutionEngine(BaseComponent):
                 success=False,
                 signal_id=queued_signal.signal_id,
                 error=str(e),
+            )
+
+    async def _execute_with_latency_tracking(
+        self,
+        signal: ExecutionSignal,
+        latency: Optional[ExecutionLatency],
+    ) -> ExecutionResult:
+        """Execute signal with detailed latency tracking.
+
+        Args:
+            signal: The signal to execute.
+            latency: Optional latency tracker (may be None for direct execute() calls).
+
+        Returns:
+            ExecutionResult with latency breakdown.
+        """
+        # Track submission start
+        submission_start = datetime.now(timezone.utc)
+        if latency:
+            latency.submission_started_at = submission_start
+
+        # Execute the signal
+        result = await self.execute(signal)
+
+        # Track submission completed (after execution returns)
+        submission_completed = datetime.now(timezone.utc)
+        if latency:
+            latency.submission_completed_at = submission_completed
+            latency.fill_completed_at = submission_completed  # Fill happens within execute()
+            latency.order_id = result.trade_id
+
+        # Attach latency to result
+        result.latency = latency
+
+        # Log latency breakdown
+        if latency:
+            self._log.info(
+                "execution_latency",
+                signal_id=signal.signal_id,
+                queue_time_ms=latency.queue_time_ms,
+                submission_time_ms=latency.submission_time_ms,
+                total_latency_ms=latency.total_latency_ms,
+                within_target=latency.is_within_target,
+            )
+
+        return result
+
+    async def _publish_latency_event(self, latency: ExecutionLatency) -> None:
+        """Publish execution latency metrics to EventBus.
+
+        Args:
+            latency: The latency breakdown to publish.
+        """
+        # Store for retrieval
+        self._last_latency = latency
+        self._latency_history.append(latency)
+
+        # Trim history if needed
+        if len(self._latency_history) > self._max_latency_history:
+            self._latency_history = self._latency_history[-self._max_latency_history:]
+
+        event_data = latency.to_dict()
+
+        await self._event_bus.publish("execution.latency", event_data)
+
+        # Log if target exceeded
+        if not latency.is_within_target:
+            self._log.warning(
+                "execution_latency_exceeded_target",
+                signal_id=latency.signal_id,
+                total_latency_ms=latency.total_latency_ms,
+                target_ms=100.0,
             )
 
     def _build_approved_signal(self, data: dict[str, Any]) -> "ExecutionSignal":
@@ -1827,6 +1943,69 @@ class ExecutionEngine(BaseComponent):
 
     @property
     def last_latency_ms(self) -> Optional[float]:
-        """Get the latency of the most recent execution (for testing)."""
-        # This is tracked in ExecutionResult, not stored separately
+        """Get the total latency of the most recent execution (ms)."""
+        if self._last_latency:
+            return self._last_latency.total_latency_ms
         return None
+
+    @property
+    def last_latency(self) -> Optional[ExecutionLatency]:
+        """Get the full latency breakdown of the most recent execution."""
+        return self._last_latency
+
+    def get_latency_stats(self) -> dict[str, Any]:
+        """Get execution latency statistics.
+
+        Returns:
+            Dictionary with latency metrics including:
+            - last_total_ms: Most recent total latency
+            - avg_total_ms: Average total latency
+            - avg_queue_ms: Average queue time
+            - avg_submission_ms: Average submission time
+            - avg_fill_ms: Average fill time
+            - within_target_count: Executions within 100ms target
+            - exceeded_target_count: Executions exceeding target
+            - history_size: Number of tracked executions
+        """
+        if not self._latency_history:
+            return {
+                "last_total_ms": None,
+                "avg_total_ms": None,
+                "avg_queue_ms": None,
+                "avg_submission_ms": None,
+                "avg_fill_ms": None,
+                "within_target_count": 0,
+                "exceeded_target_count": 0,
+                "history_size": 0,
+            }
+
+        # Collect non-None values for averaging
+        total_times = [l.total_latency_ms for l in self._latency_history if l.total_latency_ms is not None]
+        queue_times = [l.queue_time_ms for l in self._latency_history if l.queue_time_ms is not None]
+        submission_times = [l.submission_time_ms for l in self._latency_history if l.submission_time_ms is not None]
+        fill_times = [l.fill_time_ms for l in self._latency_history if l.fill_time_ms is not None]
+
+        within_target = sum(1 for l in self._latency_history if l.is_within_target)
+        exceeded_target = len(self._latency_history) - within_target
+
+        return {
+            "last_total_ms": self._last_latency.total_latency_ms if self._last_latency else None,
+            "avg_total_ms": sum(total_times) / len(total_times) if total_times else None,
+            "avg_queue_ms": sum(queue_times) / len(queue_times) if queue_times else None,
+            "avg_submission_ms": sum(submission_times) / len(submission_times) if submission_times else None,
+            "avg_fill_ms": sum(fill_times) / len(fill_times) if fill_times else None,
+            "within_target_count": within_target,
+            "exceeded_target_count": exceeded_target,
+            "history_size": len(self._latency_history),
+        }
+
+    def get_latency_history(self, limit: int = 10) -> list[dict[str, Any]]:
+        """Get recent latency history.
+
+        Args:
+            limit: Maximum number of records to return.
+
+        Returns:
+            List of latency breakdown dictionaries, most recent first.
+        """
+        return [l.to_dict() for l in reversed(self._latency_history[-limit:])]
