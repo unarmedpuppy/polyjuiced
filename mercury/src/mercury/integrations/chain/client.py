@@ -357,3 +357,157 @@ class PolygonClient:
         self._ensure_connected()
         wei = await self._run_sync(lambda: self._w3.eth.gas_price)
         return Decimal(str(wei)) / Decimal("1e9")  # Wei to Gwei
+
+    async def get_matic_balance(self) -> Decimal:
+        """Get native MATIC balance for the wallet.
+
+        MATIC is required for gas payments on Polygon.
+
+        Returns:
+            MATIC balance as Decimal (in MATIC, not Wei).
+        """
+        self._ensure_connected()
+        wei = await self._run_sync(
+            lambda: self._w3.eth.get_balance(self._account.address)
+        )
+        return Decimal(str(wei)) / Decimal("1e18")  # Wei to MATIC
+
+    async def estimate_gas(self, tx: dict) -> int:
+        """Estimate gas for a transaction.
+
+        Args:
+            tx: Transaction dict with 'to', 'data', etc.
+
+        Returns:
+            Estimated gas units.
+        """
+        self._ensure_connected()
+
+        # Ensure 'from' is set
+        if "from" not in tx:
+            tx = {**tx, "from": self._account.address}
+
+        return await self._run_sync(lambda: self._w3.eth.estimate_gas(tx))
+
+    async def send_transaction(
+        self,
+        to: str,
+        value: int = 0,
+        data: bytes = b"",
+        gas: Optional[int] = None,
+        gas_price: Optional[int] = None,
+        nonce: Optional[int] = None,
+    ) -> TxReceipt:
+        """Send a generic transaction.
+
+        Args:
+            to: Recipient address.
+            value: Amount of MATIC to send (in Wei).
+            data: Transaction data (for contract calls).
+            gas: Gas limit. If None, will be estimated.
+            gas_price: Gas price in Wei. If None, uses current gas price.
+            nonce: Transaction nonce. If None, fetched from chain.
+
+        Returns:
+            TxReceipt with transaction details.
+        """
+        self._ensure_connected()
+
+        from web3 import Web3
+
+        to_checksum = Web3.to_checksum_address(to)
+
+        # Get nonce if not provided
+        if nonce is None:
+            nonce = await self._run_sync(
+                lambda: self._w3.eth.get_transaction_count(self._account.address)
+            )
+
+        # Get gas price if not provided
+        if gas_price is None:
+            gas_price = await self._run_sync(lambda: self._w3.eth.gas_price)
+
+        # Build transaction
+        tx = {
+            "from": self._account.address,
+            "to": to_checksum,
+            "value": value,
+            "nonce": nonce,
+            "gasPrice": gas_price,
+            "chainId": 137,  # Polygon mainnet
+        }
+
+        if data:
+            tx["data"] = data
+
+        # Estimate gas if not provided
+        if gas is None:
+            try:
+                gas_estimate = await self._run_sync(
+                    lambda: self._w3.eth.estimate_gas(tx)
+                )
+                gas = int(gas_estimate * 1.2)  # 20% buffer
+            except Exception as e:
+                self._log.warning("gas_estimate_failed", error=str(e))
+                gas = 21000  # Default for simple transfers
+
+        tx["gas"] = gas
+
+        self._log.info(
+            "sending_transaction",
+            to=to_checksum,
+            value=value,
+            gas=gas,
+        )
+
+        # Sign and send
+        signed = await self._run_sync(
+            lambda: self._w3.eth.account.sign_transaction(tx, self._private_key)
+        )
+
+        tx_hash = await self._run_sync(
+            lambda: self._w3.eth.send_raw_transaction(signed.rawTransaction)
+        )
+
+        self._log.info("tx_submitted", tx_hash=tx_hash.hex())
+
+        # Wait for receipt
+        receipt = await self._run_sync(
+            lambda: self._w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+        )
+
+        result = TxReceipt(
+            tx_hash=tx_hash.hex(),
+            block_number=receipt["blockNumber"],
+            gas_used=receipt["gasUsed"],
+            status=receipt["status"] == 1,
+        )
+
+        self._log.info(
+            "tx_complete",
+            tx_hash=result.tx_hash,
+            status="success" if result.status else "failed",
+            gas_used=result.gas_used,
+        )
+
+        return result
+
+    async def get_nonce(self) -> int:
+        """Get current nonce for the wallet.
+
+        Returns:
+            Current transaction count (nonce).
+        """
+        self._ensure_connected()
+        return await self._run_sync(
+            lambda: self._w3.eth.get_transaction_count(self._account.address)
+        )
+
+    async def get_chain_id(self) -> int:
+        """Get the chain ID.
+
+        Returns:
+            Chain ID (137 for Polygon mainnet).
+        """
+        self._ensure_connected()
+        return await self._run_sync(lambda: self._w3.eth.chain_id)
