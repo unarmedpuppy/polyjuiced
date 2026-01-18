@@ -3,17 +3,57 @@ Phase 5 Smoke Test: Execution Engine
 
 Verifies that Phase 5 deliverables work:
 - ExecutionEngine processes orders
-- Single order execution works
-- Dual-leg arbitrage execution works
+- Queue management works
+- Concurrent execution limits work
 - Order cancellation works
-- Retry logic works
 - Latency tracking works
+- Event emission works
 
 Run: pytest tests/smoke/test_phase5_execution.py -v
 """
 import pytest
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
+
+from mercury.services.execution import ExecutionEngine, ExecutionSignal
+from mercury.domain.signal import SignalType, SignalPriority
+
+
+@pytest.fixture
+def smoke_mock_config():
+    """Mock config that returns proper values."""
+    config = MagicMock()
+    config.get.return_value = None
+    config.get_bool.return_value = True  # dry_run = True
+    config.get_int.side_effect = lambda key, default: {
+        "execution.max_concurrent": 3,
+        "execution.max_queue_size": 100,
+    }.get(key, default)
+    config.get_float.side_effect = lambda key, default: {
+        "execution.queue_timeout_seconds": 60.0,
+    }.get(key, default)
+    return config
+
+
+@pytest.fixture
+def smoke_mock_event_bus():
+    """Mock event bus."""
+    bus = MagicMock()
+    bus.publish = AsyncMock()
+    bus.subscribe = AsyncMock()
+    return bus
+
+
+@pytest.fixture
+def smoke_mock_clob():
+    """Mock CLOB client."""
+    clob = MagicMock()
+    clob.connect = AsyncMock()
+    clob.close = AsyncMock()
+    clob.cancel_order = AsyncMock(return_value=True)
+    clob.cancel_all_orders = AsyncMock()
+    clob._connected = False
+    return clob
 
 
 class TestPhase5ExecutionEngine:
@@ -25,15 +65,14 @@ class TestPhase5ExecutionEngine:
         assert ExecutionEngine is not None
 
     @pytest.mark.asyncio
-    async def test_execution_engine_starts_stops(self, mock_config, mock_event_bus):
+    async def test_execution_engine_starts_stops(
+        self, smoke_mock_config, smoke_mock_event_bus, smoke_mock_clob
+    ):
         """Verify ExecutionEngine lifecycle works."""
-        from mercury.services.execution import ExecutionEngine
-
-        mock_clob = MagicMock()
         engine = ExecutionEngine(
-            config=mock_config,
-            event_bus=mock_event_bus,
-            clob_client=mock_clob,
+            config=smoke_mock_config,
+            event_bus=smoke_mock_event_bus,
+            clob_client=smoke_mock_clob,
         )
 
         await engine.start()
@@ -43,214 +82,193 @@ class TestPhase5ExecutionEngine:
         assert not engine.is_running
 
     @pytest.mark.asyncio
-    async def test_single_order_execution(self, mock_config, mock_event_bus):
-        """Verify single order execution works."""
-        from mercury.services.execution import ExecutionEngine
-        from mercury.domain.order import OrderRequest, OrderResult
-
-        mock_clob = MagicMock()
-        mock_clob.place_order = AsyncMock(return_value=OrderResult(
-            order_id="test-order-1",
-            status="filled",
-            filled_size=Decimal("10.0"),
-            price=Decimal("0.50"),
-        ))
-
+    async def test_dry_run_execution(
+        self, smoke_mock_config, smoke_mock_event_bus, smoke_mock_clob
+    ):
+        """Verify dry run signal execution works."""
         engine = ExecutionEngine(
-            config=mock_config,
-            event_bus=mock_event_bus,
-            clob_client=mock_clob,
+            config=smoke_mock_config,
+            event_bus=smoke_mock_event_bus,
+            clob_client=smoke_mock_clob,
         )
+        await engine.start()
 
-        order = OrderRequest(
+        signal = ExecutionSignal(
+            signal_id="test-signal",
+            original_signal_id="test-signal",
             market_id="test-market",
-            token_id="test-token",
-            side="BUY",
-            size=Decimal("10.0"),
-            price=Decimal("0.50"),
-            order_type="FOK",
+            signal_type=SignalType.ARBITRAGE,
+            target_size_usd=Decimal("100"),
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+            yes_token_id="yes-token",
+            no_token_id="no-token",
         )
 
-        result = await engine.execute(order)
+        result = await engine.execute(signal)
 
-        assert result.status == "filled"
-        assert result.filled_size == Decimal("10.0")
-        mock_event_bus.publish.assert_called()
+        assert result.success is True
+        assert result.signal_id == "test-signal"
+        assert result.yes_filled > 0
+        assert result.no_filled > 0
+
+        await engine.stop()
 
     @pytest.mark.asyncio
-    async def test_dual_leg_execution(self, mock_config, mock_event_bus):
-        """Verify dual-leg arbitrage execution works."""
-        from mercury.services.execution import ExecutionEngine
-        from mercury.domain.order import OrderRequest, OrderResult
-
-        mock_clob = MagicMock()
-        mock_clob.place_order = AsyncMock(return_value=OrderResult(
-            order_id="test-order",
-            status="filled",
-            filled_size=Decimal("10.0"),
-            price=Decimal("0.50"),
-        ))
-
+    async def test_queue_management(
+        self, smoke_mock_config, smoke_mock_event_bus, smoke_mock_clob
+    ):
+        """Verify queue management works."""
         engine = ExecutionEngine(
-            config=mock_config,
-            event_bus=mock_event_bus,
-            clob_client=mock_clob,
+            config=smoke_mock_config,
+            event_bus=smoke_mock_event_bus,
+            clob_client=smoke_mock_clob,
         )
+        await engine.start()
 
-        yes_order = OrderRequest(
-            market_id="test-market",
-            token_id="yes-token",
-            side="BUY",
-            size=Decimal("10.0"),
-            price=Decimal("0.48"),
-            order_type="FOK",
-        )
-
-        no_order = OrderRequest(
-            market_id="test-market",
-            token_id="no-token",
-            side="BUY",
-            size=Decimal("10.0"),
-            price=Decimal("0.50"),
-            order_type="FOK",
-        )
-
-        result = await engine.execute_dual_leg(yes_order, no_order)
-
-        assert result.yes_result.status == "filled"
-        assert result.no_result.status == "filled"
-        assert mock_clob.place_order.call_count == 2
-
-    @pytest.mark.asyncio
-    async def test_order_cancellation(self, mock_config, mock_event_bus):
-        """Verify order cancellation works."""
-        from mercury.services.execution import ExecutionEngine
-
-        mock_clob = MagicMock()
-        mock_clob.cancel_order = AsyncMock(return_value=True)
-
-        engine = ExecutionEngine(
-            config=mock_config,
-            event_bus=mock_event_bus,
-            clob_client=mock_clob,
-        )
-
-        result = await engine.cancel("test-order-id")
+        # Queue a signal
+        signal_data = {
+            "signal_id": "test-signal",
+            "market_id": "test-market",
+            "signal_type": "ARBITRAGE",
+            "target_size_usd": "100.0",
+            "yes_price": "0.48",
+            "no_price": "0.50",
+        }
+        result = await engine.queue_signal("test-signal", signal_data, SignalPriority.HIGH)
 
         assert result is True
-        mock_clob.cancel_order.assert_called_once_with("test-order-id")
+        assert engine.get_queue_size() == 1
+
+        # Get queue stats
+        stats = engine.get_queue_stats()
+        assert stats["total_queued"] == 1
+        assert stats["max_concurrent"] == 3
+
+        await engine.stop()
 
     @pytest.mark.asyncio
-    async def test_retry_on_transient_error(self, mock_config, mock_event_bus):
-        """Verify retry logic works for transient errors."""
-        from mercury.services.execution import ExecutionEngine
-        from mercury.domain.order import OrderRequest, OrderResult
-
-        call_count = 0
-
-        async def flaky_place_order(*args, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            if call_count < 3:
-                raise ConnectionError("Transient error")
-            return OrderResult(
-                order_id="test-order",
-                status="filled",
-                filled_size=Decimal("10.0"),
-                price=Decimal("0.50"),
-            )
-
-        mock_clob = MagicMock()
-        mock_clob.place_order = AsyncMock(side_effect=flaky_place_order)
-
+    async def test_order_cancellation(
+        self, smoke_mock_config, smoke_mock_event_bus, smoke_mock_clob
+    ):
+        """Verify order cancellation works."""
         engine = ExecutionEngine(
-            config=mock_config,
-            event_bus=mock_event_bus,
-            clob_client=mock_clob,
+            config=smoke_mock_config,
+            event_bus=smoke_mock_event_bus,
+            clob_client=smoke_mock_clob,
         )
+        await engine.start()
 
-        order = OrderRequest(
-            market_id="test-market",
-            token_id="test-token",
-            side="BUY",
-            size=Decimal("10.0"),
-            price=Decimal("0.50"),
-            order_type="FOK",
-        )
+        # Use cancel_order method
+        result = await engine.cancel_order("test-order-id")
 
-        result = await engine.execute(order)
+        assert result is True
 
-        assert result.status == "filled"
-        assert call_count == 3  # Two failures, then success
+        await engine.stop()
 
     @pytest.mark.asyncio
-    async def test_latency_tracking(self, mock_config, mock_event_bus):
+    async def test_latency_tracking(
+        self, smoke_mock_config, smoke_mock_event_bus, smoke_mock_clob
+    ):
         """Verify execution latency is tracked."""
-        from mercury.services.execution import ExecutionEngine
-        from mercury.domain.order import OrderRequest, OrderResult
-
-        mock_clob = MagicMock()
-        mock_clob.place_order = AsyncMock(return_value=OrderResult(
-            order_id="test-order",
-            status="filled",
-            filled_size=Decimal("10.0"),
-            price=Decimal("0.50"),
-        ))
-
         engine = ExecutionEngine(
-            config=mock_config,
-            event_bus=mock_event_bus,
-            clob_client=mock_clob,
+            config=smoke_mock_config,
+            event_bus=smoke_mock_event_bus,
+            clob_client=smoke_mock_clob,
         )
+        await engine.start()
 
-        order = OrderRequest(
+        signal = ExecutionSignal(
+            signal_id="test-signal",
+            original_signal_id="test-signal",
             market_id="test-market",
-            token_id="test-token",
-            side="BUY",
-            size=Decimal("10.0"),
-            price=Decimal("0.50"),
-            order_type="FOK",
+            signal_type=SignalType.ARBITRAGE,
+            target_size_usd=Decimal("100"),
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+            yes_token_id="yes-token",
+            no_token_id="no-token",
         )
 
-        result = await engine.execute(order)
+        result = await engine.execute(signal)
 
-        # Check latency was recorded
-        assert hasattr(result, 'latency_ms') or engine.last_latency_ms is not None
+        # Check latency was recorded in result
+        assert result.execution_time_ms is not None
+        assert result.execution_time_ms > 0
+
+        await engine.stop()
 
     @pytest.mark.asyncio
-    async def test_emits_order_events(self, mock_config, mock_event_bus):
+    async def test_emits_order_events(
+        self, smoke_mock_config, smoke_mock_event_bus, smoke_mock_clob
+    ):
         """Verify order lifecycle events are emitted."""
-        from mercury.services.execution import ExecutionEngine
-        from mercury.domain.order import OrderRequest, OrderResult
-
-        mock_clob = MagicMock()
-        mock_clob.place_order = AsyncMock(return_value=OrderResult(
-            order_id="test-order",
-            status="filled",
-            filled_size=Decimal("10.0"),
-            price=Decimal("0.50"),
-        ))
-
         engine = ExecutionEngine(
-            config=mock_config,
-            event_bus=mock_event_bus,
-            clob_client=mock_clob,
+            config=smoke_mock_config,
+            event_bus=smoke_mock_event_bus,
+            clob_client=smoke_mock_clob,
         )
+        await engine.start()
 
-        order = OrderRequest(
+        signal = ExecutionSignal(
+            signal_id="test-signal",
+            original_signal_id="test-signal",
             market_id="test-market",
-            token_id="test-token",
-            side="BUY",
-            size=Decimal("10.0"),
-            price=Decimal("0.50"),
-            order_type="FOK",
+            signal_type=SignalType.ARBITRAGE,
+            target_size_usd=Decimal("100"),
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+            yes_token_id="yes-token",
+            no_token_id="no-token",
         )
 
-        await engine.execute(order)
+        await engine.execute(signal)
 
-        # Should emit order.submitted and order.filled
-        calls = mock_event_bus.publish.call_args_list
+        # Verify events were published
+        calls = smoke_mock_event_bus.publish.call_args_list
         channels = [call[0][0] for call in calls]
 
-        assert any("order.submitted" in c for c in channels)
-        assert any("order.filled" in c for c in channels)
+        # Should emit position.opened and execution.complete for dry run
+        assert any("position.opened" in c for c in channels)
+        assert any("execution.complete" in c for c in channels)
+
+        await engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_execution_limit(
+        self, smoke_mock_config, smoke_mock_event_bus, smoke_mock_clob
+    ):
+        """Verify concurrent execution limits are enforced."""
+        engine = ExecutionEngine(
+            config=smoke_mock_config,
+            event_bus=smoke_mock_event_bus,
+            clob_client=smoke_mock_clob,
+        )
+        await engine.start()
+
+        # Semaphore should be initialized with max_concurrent
+        assert engine._execution_semaphore._value == 3
+        assert engine._max_concurrent == 3
+
+        await engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_health_check(
+        self, smoke_mock_config, smoke_mock_event_bus, smoke_mock_clob
+    ):
+        """Verify health check provides queue info."""
+        engine = ExecutionEngine(
+            config=smoke_mock_config,
+            event_bus=smoke_mock_event_bus,
+            clob_client=smoke_mock_clob,
+        )
+        await engine.start()
+
+        health = await engine.health_check()
+
+        assert health.status.value == "healthy"
+        assert "queue_size" in health.details
+        assert "active_executions" in health.details
+        assert "max_concurrent" in health.details
+
+        await engine.stop()

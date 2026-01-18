@@ -184,6 +184,21 @@ class ConfigManager:
             return default
         return int(value)
 
+    def get_float(self, key: str, default: float = 0.0) -> float:
+        """Get configuration value as float.
+
+        Args:
+            key: Dot-notation key
+            default: Default float value
+
+        Returns:
+            Float value
+        """
+        value = self.get(key)
+        if value is None:
+            return default
+        return float(value)
+
     def get_list(self, key: str, default: Optional[list[Any]] = None) -> list[Any]:
         """Get configuration value as list.
 

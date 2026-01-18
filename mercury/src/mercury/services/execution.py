@@ -5,15 +5,18 @@ This service:
 - Handles dual-leg arbitrage execution
 - Manages order lifecycle (submit, fill, cancel)
 - Tracks execution latency and slippage
+- Manages order queue with priority
+- Limits concurrent executions
 """
 
 import asyncio
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Optional
+from enum import Enum
+from typing import Any, Optional
 
 import structlog
 
@@ -21,7 +24,7 @@ from mercury.core.config import ConfigManager
 from mercury.core.events import EventBus
 from mercury.core.lifecycle import BaseComponent, HealthCheckResult, HealthStatus
 from mercury.domain.order import OrderRequest, Position, PositionStatus
-from mercury.domain.signal import ApprovedSignal, SignalType
+from mercury.domain.signal import ApprovedSignal, SignalType, SignalPriority
 from mercury.integrations.polymarket.clob import CLOBClient, InsufficientLiquidityError
 from mercury.integrations.polymarket.types import (
     DualLegOrderResult,
@@ -32,6 +35,73 @@ from mercury.integrations.polymarket.types import (
 )
 
 log = structlog.get_logger()
+
+
+class QueuedSignalStatus(str, Enum):
+    """Status of a queued signal."""
+
+    PENDING = "pending"
+    EXECUTING = "executing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    EXPIRED = "expired"
+    CANCELLED = "cancelled"
+
+
+@dataclass
+class QueuedSignal:
+    """A signal waiting in the execution queue.
+
+    Signals are prioritized by priority level (CRITICAL > HIGH > MEDIUM > LOW)
+    and then by queued time (FIFO within priority).
+    """
+
+    signal_id: str
+    signal_data: dict[str, Any]
+    priority: SignalPriority
+    status: QueuedSignalStatus = QueuedSignalStatus.PENDING
+    queued_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    error: Optional[str] = None
+
+    def __lt__(self, other: "QueuedSignal") -> bool:
+        """Compare for priority queue ordering.
+
+        Higher priority signals come first, then earlier queued signals.
+        """
+        priority_order = {
+            SignalPriority.CRITICAL: 0,
+            SignalPriority.HIGH: 1,
+            SignalPriority.MEDIUM: 2,
+            SignalPriority.LOW: 3,
+        }
+        self_priority = priority_order.get(self.priority, 2)
+        other_priority = priority_order.get(other.priority, 2)
+
+        if self_priority != other_priority:
+            return self_priority < other_priority
+        return self.queued_at < other.queued_at
+
+
+@dataclass
+class ExecutionSignal:
+    """Signal data for execution.
+
+    This is a flattened version of ApprovedSignal for internal use,
+    since the domain ApprovedSignal wraps a TradingSignal.
+    """
+
+    signal_id: str
+    original_signal_id: str
+    market_id: str
+    signal_type: SignalType
+    target_size_usd: Decimal
+    yes_price: Decimal
+    no_price: Decimal
+    yes_token_id: str
+    no_token_id: str
+    approved_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 @dataclass
@@ -55,9 +125,11 @@ class ExecutionEngine(BaseComponent):
 
     This service:
     1. Listens for approved signals from RiskManager
-    2. Executes orders via CLOBClient
-    3. Handles dual-leg arbitrage atomically
-    4. Publishes execution results to EventBus
+    2. Queues signals for execution with priority ordering
+    3. Manages concurrent execution limits
+    4. Executes orders via CLOBClient
+    5. Handles dual-leg arbitrage atomically
+    6. Publishes execution results to EventBus
 
     Event channels subscribed:
     - risk.approved.* - Approved signals to execute
@@ -68,7 +140,14 @@ class ExecutionEngine(BaseComponent):
     - order.rejected - Order rejected
     - position.opened - New position created
     - execution.complete - Execution finished
+    - execution.queue.added - Signal added to queue
+    - execution.queue.started - Signal execution started
     """
+
+    # Default configuration values
+    DEFAULT_MAX_CONCURRENT = 3
+    DEFAULT_MAX_QUEUE_SIZE = 100
+    DEFAULT_QUEUE_TIMEOUT_SECONDS = 60.0
 
     def __init__(
         self,
@@ -104,15 +183,49 @@ class ExecutionEngine(BaseComponent):
         self._dry_run = config.get_bool("mercury.dry_run", True)
         self._rebalance_enabled = config.get_bool("execution.rebalance_partial_fills", True)
 
+        # Queue configuration
+        self._max_concurrent = config.get_int(
+            "execution.max_concurrent", self.DEFAULT_MAX_CONCURRENT
+        )
+        self._max_queue_size = config.get_int(
+            "execution.max_queue_size", self.DEFAULT_MAX_QUEUE_SIZE
+        )
+        self._queue_timeout = config.get_float(
+            "execution.queue_timeout_seconds", self.DEFAULT_QUEUE_TIMEOUT_SECONDS
+        )
+
         # State
         self._pending_orders: dict[str, OrderResult] = {}
         self._should_run = False
 
-    async def start(self) -> None:
-        """Start the execution engine."""
+        # Queue management
+        self._queue: asyncio.PriorityQueue[QueuedSignal] = asyncio.PriorityQueue(
+            maxsize=self._max_queue_size
+        )
+        self._queue_items: dict[str, QueuedSignal] = {}  # Track queued items by ID
+        self._active_executions: dict[str, asyncio.Task] = {}  # Currently executing
+        self._execution_semaphore: Optional[asyncio.Semaphore] = None
+        self._queue_processor_task: Optional[asyncio.Task] = None
+
+        # Metrics
+        self._total_queued = 0
+        self._total_executed = 0
+        self._total_failed = 0
+        self._total_expired = 0
+
+    async def _do_start(self) -> None:
+        """Component-specific startup logic."""
         self._start_time = time.time()
         self._should_run = True
-        self._log.info("starting_execution_engine", dry_run=self._dry_run)
+        self._log.info(
+            "starting_execution_engine",
+            dry_run=self._dry_run,
+            max_concurrent=self._max_concurrent,
+            max_queue_size=self._max_queue_size,
+        )
+
+        # Initialize semaphore for concurrent execution limits
+        self._execution_semaphore = asyncio.Semaphore(self._max_concurrent)
 
         # Connect to CLOB
         if not self._dry_run:
@@ -121,11 +234,39 @@ class ExecutionEngine(BaseComponent):
         # Subscribe to approved signals
         await self._event_bus.subscribe("risk.approved.*", self._on_approved_signal)
 
+        # Start queue processor
+        self._queue_processor_task = asyncio.create_task(self._process_queue())
+
         self._log.info("execution_engine_started")
 
-    async def stop(self) -> None:
-        """Stop the execution engine."""
+    async def _do_stop(self) -> None:
+        """Component-specific shutdown logic."""
         self._should_run = False
+        self._log.info("stopping_execution_engine")
+
+        # Stop queue processor
+        if self._queue_processor_task and not self._queue_processor_task.done():
+            self._queue_processor_task.cancel()
+            try:
+                await self._queue_processor_task
+            except asyncio.CancelledError:
+                pass
+
+        # Wait for active executions to complete (with timeout)
+        if self._active_executions:
+            self._log.info(
+                "waiting_for_active_executions",
+                count=len(self._active_executions),
+            )
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*self._active_executions.values(), return_exceptions=True),
+                    timeout=30.0,
+                )
+            except asyncio.TimeoutError:
+                self._log.warning("active_executions_timeout")
+                for task in self._active_executions.values():
+                    task.cancel()
 
         # Cancel pending orders
         if not self._dry_run and self._pending_orders:
@@ -135,29 +276,60 @@ class ExecutionEngine(BaseComponent):
         # Close CLOB connection
         await self._clob.close()
 
-        self._log.info("execution_engine_stopped")
+        self._log.info(
+            "execution_engine_stopped",
+            total_queued=self._total_queued,
+            total_executed=self._total_executed,
+            total_failed=self._total_failed,
+        )
 
-    async def health_check(self) -> HealthCheckResult:
-        """Check execution engine health."""
+    async def _do_health_check(self) -> HealthCheckResult:
+        """Component-specific health check."""
+        queue_size = self._queue.qsize()
+        active_count = len(self._active_executions)
+
+        details = {
+            "pending_orders": len(self._pending_orders),
+            "queue_size": queue_size,
+            "active_executions": active_count,
+            "max_concurrent": self._max_concurrent,
+            "max_queue_size": self._max_queue_size,
+            "total_queued": self._total_queued,
+            "total_executed": self._total_executed,
+            "total_failed": self._total_failed,
+            "total_expired": self._total_expired,
+            "dry_run": self._dry_run,
+        }
+
         if self._dry_run:
             return HealthCheckResult(
                 status=HealthStatus.HEALTHY,
                 message="Running in dry-run mode",
+                details=details,
             )
 
         if not self._clob._connected:
             return HealthCheckResult(
                 status=HealthStatus.UNHEALTHY,
                 message="CLOB client not connected",
+                details=details,
+            )
+
+        # Check for queue saturation
+        if queue_size >= self._max_queue_size * 0.9:
+            return HealthCheckResult(
+                status=HealthStatus.DEGRADED,
+                message=f"Queue nearly full ({queue_size}/{self._max_queue_size})",
+                details=details,
             )
 
         return HealthCheckResult(
             status=HealthStatus.HEALTHY,
             message="Connected and ready",
-            details={"pending_orders": len(self._pending_orders)},
+            details=details,
         )
 
-    async def execute(self, signal: ApprovedSignal) -> ExecutionResult:
+    async def execute(self, signal: ExecutionSignal) -> ExecutionResult:
         """Execute an approved trading signal.
 
         Args:
@@ -213,7 +385,7 @@ class ExecutionEngine(BaseComponent):
 
     async def _execute_dry_run(
         self,
-        signal: ApprovedSignal,
+        signal: ExecutionSignal,
         trade_id: str,
         position_id: str,
     ) -> ExecutionResult:
@@ -257,7 +429,7 @@ class ExecutionEngine(BaseComponent):
 
     async def _execute_dual_leg(
         self,
-        signal: ApprovedSignal,
+        signal: ExecutionSignal,
         trade_id: str,
         position_id: str,
     ) -> ExecutionResult:
@@ -331,7 +503,7 @@ class ExecutionEngine(BaseComponent):
 
     async def _execute_single_leg(
         self,
-        signal: ApprovedSignal,
+        signal: ExecutionSignal,
         trade_id: str,
         position_id: str,
     ) -> ExecutionResult:
@@ -397,7 +569,7 @@ class ExecutionEngine(BaseComponent):
     async def _handle_partial_fill(
         self,
         result: DualLegOrderResult,
-        signal: ApprovedSignal,
+        signal: ExecutionSignal,
     ) -> None:
         """Handle partial fill by attempting rebalance."""
         if result.yes_result.filled_size > 0 and result.no_result.filled_size == 0:
@@ -423,9 +595,219 @@ class ExecutionEngine(BaseComponent):
             self._log.info("rebalance_result", action=rebalance.get("action"))
 
     async def _on_approved_signal(self, data: dict) -> None:
-        """Handle approved signal from RiskManager."""
-        # Reconstruct ApprovedSignal from event data
-        signal = ApprovedSignal(
+        """Handle approved signal from RiskManager by queueing for execution."""
+        signal_id = data.get("signal_id", str(uuid.uuid4()))
+
+        # Get priority from signal data, default to MEDIUM
+        priority_str = data.get("priority", "medium")
+        try:
+            priority = SignalPriority(priority_str.lower())
+        except (ValueError, AttributeError):
+            priority = SignalPriority.MEDIUM
+
+        # Queue the signal for execution
+        await self.queue_signal(signal_id, data, priority)
+
+    async def queue_signal(
+        self,
+        signal_id: str,
+        signal_data: dict[str, Any],
+        priority: SignalPriority = SignalPriority.MEDIUM,
+    ) -> bool:
+        """Add a signal to the execution queue.
+
+        Args:
+            signal_id: Unique signal identifier.
+            signal_data: Signal data dictionary.
+            priority: Execution priority.
+
+        Returns:
+            True if queued successfully, False if queue is full.
+        """
+        if signal_id in self._queue_items:
+            self._log.warning("signal_already_queued", signal_id=signal_id)
+            return False
+
+        queued_signal = QueuedSignal(
+            signal_id=signal_id,
+            signal_data=signal_data,
+            priority=priority,
+        )
+
+        try:
+            self._queue.put_nowait(queued_signal)
+            self._queue_items[signal_id] = queued_signal
+            self._total_queued += 1
+
+            self._log.info(
+                "signal_queued",
+                signal_id=signal_id,
+                priority=priority.value,
+                queue_size=self._queue.qsize(),
+            )
+
+            await self._event_bus.publish("execution.queue.added", {
+                "signal_id": signal_id,
+                "priority": priority.value,
+                "queue_size": self._queue.qsize(),
+                "queued_at": queued_signal.queued_at.isoformat(),
+            })
+
+            return True
+
+        except asyncio.QueueFull:
+            self._log.error(
+                "queue_full",
+                signal_id=signal_id,
+                max_size=self._max_queue_size,
+            )
+            await self._event_bus.publish("execution.queue.rejected", {
+                "signal_id": signal_id,
+                "reason": "queue_full",
+            })
+            return False
+
+    async def _process_queue(self) -> None:
+        """Background task that processes the execution queue.
+
+        Continuously pulls signals from the queue and executes them,
+        respecting the concurrent execution limit.
+        """
+        self._log.info("queue_processor_started")
+
+        while self._should_run:
+            try:
+                # Wait for a signal from the queue (with timeout for checking should_run)
+                try:
+                    queued_signal = await asyncio.wait_for(
+                        self._queue.get(),
+                        timeout=1.0,
+                    )
+                except asyncio.TimeoutError:
+                    # Check for expired signals periodically
+                    await self._cleanup_expired_signals()
+                    continue
+
+                # Check if signal has expired
+                if self._is_signal_expired(queued_signal):
+                    self._log.warning(
+                        "signal_expired_in_queue",
+                        signal_id=queued_signal.signal_id,
+                        queued_at=queued_signal.queued_at.isoformat(),
+                    )
+                    queued_signal.status = QueuedSignalStatus.EXPIRED
+                    self._total_expired += 1
+                    self._queue_items.pop(queued_signal.signal_id, None)
+                    self._queue.task_done()
+                    continue
+
+                # Acquire semaphore to limit concurrent executions
+                await self._execution_semaphore.acquire()
+
+                # Start execution task
+                task = asyncio.create_task(
+                    self._execute_queued_signal(queued_signal)
+                )
+                self._active_executions[queued_signal.signal_id] = task
+
+                # Add callback to release semaphore when done
+                task.add_done_callback(
+                    lambda t, sig_id=queued_signal.signal_id: self._on_execution_complete(sig_id)
+                )
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self._log.error("queue_processor_error", error=str(e))
+                await asyncio.sleep(0.1)  # Brief pause on error
+
+        self._log.info("queue_processor_stopped")
+
+    def _is_signal_expired(self, queued_signal: QueuedSignal) -> bool:
+        """Check if a queued signal has expired."""
+        age_seconds = (datetime.now(timezone.utc) - queued_signal.queued_at).total_seconds()
+        return age_seconds > self._queue_timeout
+
+    async def _cleanup_expired_signals(self) -> None:
+        """Remove expired signals from tracking."""
+        expired_ids = []
+        for signal_id, queued_signal in self._queue_items.items():
+            if queued_signal.status == QueuedSignalStatus.PENDING and self._is_signal_expired(queued_signal):
+                expired_ids.append(signal_id)
+
+        for signal_id in expired_ids:
+            self._queue_items.pop(signal_id, None)
+            self._total_expired += 1
+            self._log.debug("cleaned_expired_signal", signal_id=signal_id)
+
+    def _on_execution_complete(self, signal_id: str) -> None:
+        """Callback when an execution task completes."""
+        self._active_executions.pop(signal_id, None)
+        self._queue_items.pop(signal_id, None)
+        if self._execution_semaphore:
+            self._execution_semaphore.release()
+        try:
+            self._queue.task_done()
+        except ValueError:
+            pass  # task_done called too many times
+
+    async def _execute_queued_signal(self, queued_signal: QueuedSignal) -> ExecutionResult:
+        """Execute a signal from the queue."""
+        queued_signal.status = QueuedSignalStatus.EXECUTING
+        queued_signal.started_at = datetime.now(timezone.utc)
+
+        self._log.info(
+            "executing_queued_signal",
+            signal_id=queued_signal.signal_id,
+            priority=queued_signal.priority.value,
+            wait_time_ms=(queued_signal.started_at - queued_signal.queued_at).total_seconds() * 1000,
+        )
+
+        await self._event_bus.publish("execution.queue.started", {
+            "signal_id": queued_signal.signal_id,
+            "priority": queued_signal.priority.value,
+            "active_executions": len(self._active_executions),
+        })
+
+        try:
+            # Reconstruct ApprovedSignal from event data
+            data = queued_signal.signal_data
+            signal = self._build_approved_signal(data)
+
+            result = await self.execute(signal)
+
+            if result.success:
+                queued_signal.status = QueuedSignalStatus.COMPLETED
+                self._total_executed += 1
+            else:
+                queued_signal.status = QueuedSignalStatus.FAILED
+                queued_signal.error = result.error
+                self._total_failed += 1
+
+            queued_signal.completed_at = datetime.now(timezone.utc)
+            return result
+
+        except Exception as e:
+            queued_signal.status = QueuedSignalStatus.FAILED
+            queued_signal.error = str(e)
+            queued_signal.completed_at = datetime.now(timezone.utc)
+            self._total_failed += 1
+
+            self._log.error(
+                "queued_execution_failed",
+                signal_id=queued_signal.signal_id,
+                error=str(e),
+            )
+
+            return ExecutionResult(
+                success=False,
+                signal_id=queued_signal.signal_id,
+                error=str(e),
+            )
+
+    def _build_approved_signal(self, data: dict[str, Any]) -> "ExecutionSignal":
+        """Build an ExecutionSignal from event data."""
+        return ExecutionSignal(
             signal_id=data["signal_id"],
             original_signal_id=data.get("original_signal_id", data["signal_id"]),
             market_id=data["market_id"],
@@ -437,8 +819,6 @@ class ExecutionEngine(BaseComponent):
             no_token_id=data.get("no_token_id", ""),
             approved_at=datetime.now(timezone.utc),
         )
-
-        await self.execute(signal)
 
     async def cancel_order(self, order_id: str) -> bool:
         """Cancel an open order.
@@ -458,3 +838,91 @@ class ExecutionEngine(BaseComponent):
     def get_open_orders(self) -> list[OrderResult]:
         """Get all pending orders."""
         return list(self._pending_orders.values())
+
+    # =========================================================================
+    # Queue Management Public Methods
+    # =========================================================================
+
+    def get_queue_size(self) -> int:
+        """Get the current number of signals in the queue."""
+        return self._queue.qsize()
+
+    def get_active_execution_count(self) -> int:
+        """Get the number of currently executing signals."""
+        return len(self._active_executions)
+
+    def get_queue_stats(self) -> dict[str, Any]:
+        """Get comprehensive queue statistics.
+
+        Returns:
+            Dictionary with queue metrics.
+        """
+        return {
+            "queue_size": self._queue.qsize(),
+            "active_executions": len(self._active_executions),
+            "max_concurrent": self._max_concurrent,
+            "max_queue_size": self._max_queue_size,
+            "queue_timeout_seconds": self._queue_timeout,
+            "total_queued": self._total_queued,
+            "total_executed": self._total_executed,
+            "total_failed": self._total_failed,
+            "total_expired": self._total_expired,
+        }
+
+    def get_queued_signals(self) -> list[dict[str, Any]]:
+        """Get information about all queued signals.
+
+        Returns:
+            List of dictionaries with signal info.
+        """
+        return [
+            {
+                "signal_id": qs.signal_id,
+                "priority": qs.priority.value,
+                "status": qs.status.value,
+                "queued_at": qs.queued_at.isoformat(),
+                "age_seconds": (datetime.now(timezone.utc) - qs.queued_at).total_seconds(),
+            }
+            for qs in self._queue_items.values()
+        ]
+
+    async def cancel_queued_signal(self, signal_id: str) -> bool:
+        """Cancel a queued signal before execution.
+
+        Args:
+            signal_id: The signal ID to cancel.
+
+        Returns:
+            True if cancelled, False if not found or already executing.
+        """
+        queued_signal = self._queue_items.get(signal_id)
+        if not queued_signal:
+            return False
+
+        if queued_signal.status != QueuedSignalStatus.PENDING:
+            self._log.warning(
+                "cannot_cancel_signal",
+                signal_id=signal_id,
+                status=queued_signal.status.value,
+            )
+            return False
+
+        queued_signal.status = QueuedSignalStatus.CANCELLED
+        self._queue_items.pop(signal_id, None)
+
+        self._log.info("signal_cancelled", signal_id=signal_id)
+        await self._event_bus.publish("execution.queue.cancelled", {
+            "signal_id": signal_id,
+        })
+
+        return True
+
+    def is_queue_full(self) -> bool:
+        """Check if the queue is at capacity."""
+        return self._queue.qsize() >= self._max_queue_size
+
+    @property
+    def last_latency_ms(self) -> Optional[float]:
+        """Get the latency of the most recent execution (for testing)."""
+        # This is tracked in ExecutionResult, not stored separately
+        return None
