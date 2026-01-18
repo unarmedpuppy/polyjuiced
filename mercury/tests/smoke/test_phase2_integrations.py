@@ -24,9 +24,13 @@ class TestPhase2IntegrationLayer:
     def test_polymarket_types_importable(self):
         """Verify Polymarket types can be imported."""
         from mercury.integrations.polymarket.types import (
+            BalanceInfo,
+            CLOBOrderBook,
             DualLegOrderResult,
             Market15Min,
             MarketInfo,
+            MarketStatus,
+            OpenOrder,
             OrderBookData,
             OrderBookLevel,
             OrderBookSnapshot,
@@ -36,14 +40,18 @@ class TestPhase2IntegrationLayer:
             PolymarketSettings,
             PositionInfo,
             TimeInForce,
+            TokenPair,
             TokenPrice,
             TokenSide,
+            TradeInfo,
             WebSocketMessage,
         )
 
         assert PolymarketSettings is not None
         assert MarketInfo is not None
         assert OrderBookData is not None
+        assert TokenPair is not None
+        assert CLOBOrderBook is not None
 
     def test_polymarket_settings_creation(self):
         """Verify PolymarketSettings can be created."""
@@ -357,3 +365,114 @@ class TestPhase2UnitTests:
 
         assert market.combined_price == Decimal("0.98")
         assert market.spread_cents == Decimal("2")  # 2 cents
+
+    def test_token_pair_lookup(self):
+        """Verify TokenPair lookup methods work."""
+        from mercury.integrations.polymarket.types import TokenPair, TokenSide
+
+        pair = TokenPair(
+            condition_id="test_condition",
+            yes_token_id="yes_123",
+            no_token_id="no_456",
+            question="Will it rain tomorrow?",
+        )
+
+        # Test get_token_id
+        assert pair.get_token_id(TokenSide.YES) == "yes_123"
+        assert pair.get_token_id(TokenSide.NO) == "no_456"
+
+        # Test get_side
+        assert pair.get_side("yes_123") == TokenSide.YES
+        assert pair.get_side("no_456") == TokenSide.NO
+        assert pair.get_side("unknown") is None
+
+    def test_balance_info_properties(self):
+        """Verify BalanceInfo computed properties."""
+        from mercury.integrations.polymarket.types import BalanceInfo
+
+        # Case 1: More balance than allowance
+        balance1 = BalanceInfo(
+            balance=Decimal("100.00"),
+            allowance=Decimal("50.00"),
+        )
+        assert balance1.has_allowance is True
+        assert balance1.available_for_trading == Decimal("50.00")
+
+        # Case 2: More allowance than balance
+        balance2 = BalanceInfo(
+            balance=Decimal("30.00"),
+            allowance=Decimal("100.00"),
+        )
+        assert balance2.available_for_trading == Decimal("30.00")
+
+        # Case 3: No allowance
+        balance3 = BalanceInfo(
+            balance=Decimal("100.00"),
+            allowance=Decimal("0"),
+        )
+        assert balance3.has_allowance is False
+        assert balance3.available_for_trading == Decimal("0")
+
+    def test_trade_info_cost_calculation(self):
+        """Verify TradeInfo cost calculations."""
+        from datetime import datetime, timezone
+
+        from mercury.integrations.polymarket.types import OrderSide, TradeInfo
+
+        trade = TradeInfo(
+            trade_id="trade_1",
+            token_id="token_123",
+            market_id="market_abc",
+            side=OrderSide.BUY,
+            price=Decimal("0.50"),
+            size=Decimal("100"),
+            fee=Decimal("0.25"),
+            timestamp=datetime.now(timezone.utc),
+        )
+
+        assert trade.total_cost == Decimal("50.25")  # 50 + 0.25
+        assert trade.net_proceeds == Decimal("49.75")  # 50 - 0.25
+
+    def test_open_order_fill_tracking(self):
+        """Verify OpenOrder fill tracking properties."""
+        from datetime import datetime, timezone
+
+        from mercury.integrations.polymarket.types import (
+            OpenOrder,
+            OrderSide,
+            TimeInForce,
+        )
+
+        order = OpenOrder(
+            order_id="order_1",
+            token_id="token_123",
+            market_id="market_abc",
+            side=OrderSide.BUY,
+            price=Decimal("0.50"),
+            original_size=Decimal("100"),
+            remaining_size=Decimal("60"),
+            time_in_force=TimeInForce.GTC,
+            created_at=datetime.now(timezone.utc),
+            filled_size=Decimal("40"),
+        )
+
+        assert order.is_partially_filled is True
+        assert order.fill_percentage == Decimal("40")  # 40%
+
+    def test_clob_order_book_is_alias(self):
+        """Verify CLOBOrderBook is an alias for OrderBookData."""
+        from mercury.integrations.polymarket.types import (
+            CLOBOrderBook,
+            OrderBookData,
+        )
+
+        assert CLOBOrderBook is OrderBookData
+
+    def test_market_status_enum(self):
+        """Verify MarketStatus enum values."""
+        from mercury.integrations.polymarket.types import MarketStatus
+
+        assert MarketStatus.ACTIVE == "active"
+        assert MarketStatus.PAUSED == "paused"
+        assert MarketStatus.CLOSED == "closed"
+        assert MarketStatus.RESOLVED == "resolved"

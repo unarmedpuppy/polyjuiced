@@ -430,3 +430,148 @@ class PositionInfo:
     def cost_basis(self) -> Decimal:
         """Total cost paid for this position."""
         return self.size * self.average_price
+
+
+@dataclass(frozen=True)
+class TokenPair:
+    """A YES/NO token pair for a binary market.
+
+    Represents the two complementary tokens in a Polymarket binary market.
+    Used for tracking token IDs together and for dual-leg trading.
+    """
+
+    condition_id: str
+    yes_token_id: str
+    no_token_id: str
+
+    # Optional metadata
+    question: Optional[str] = None
+    slug: Optional[str] = None
+
+    def get_token_id(self, side: TokenSide) -> str:
+        """Get token ID for a given side.
+
+        Args:
+            side: YES or NO side.
+
+        Returns:
+            The corresponding token ID.
+        """
+        return self.yes_token_id if side == TokenSide.YES else self.no_token_id
+
+    def get_side(self, token_id: str) -> Optional[TokenSide]:
+        """Get side for a given token ID.
+
+        Args:
+            token_id: Token ID to look up.
+
+        Returns:
+            TokenSide if found, None if token ID doesn't match.
+        """
+        if token_id == self.yes_token_id:
+            return TokenSide.YES
+        elif token_id == self.no_token_id:
+            return TokenSide.NO
+        return None
+
+
+@dataclass(frozen=True)
+class BalanceInfo:
+    """USDC balance information from CLOB API.
+
+    Polymarket uses USDC with 6 decimal places on Polygon.
+    """
+
+    balance: Decimal
+    allowance: Decimal
+
+    @property
+    def has_allowance(self) -> bool:
+        """Whether there's sufficient allowance for trading."""
+        return self.allowance > Decimal("0")
+
+    @property
+    def available_for_trading(self) -> Decimal:
+        """Amount available for trading (min of balance and allowance)."""
+        return min(self.balance, self.allowance)
+
+
+@dataclass(frozen=True)
+class TradeInfo:
+    """Information about an executed trade from CLOB API.
+
+    Represents a single trade execution (fill).
+    """
+
+    trade_id: str
+    token_id: str
+    market_id: str
+    side: OrderSide
+    price: Decimal
+    size: Decimal
+    fee: Decimal
+    timestamp: datetime
+
+    # Order that generated this trade
+    order_id: Optional[str] = None
+
+    # Counterparty info (if available)
+    maker_address: Optional[str] = None
+    taker_address: Optional[str] = None
+
+    @property
+    def total_cost(self) -> Decimal:
+        """Total cost including fees."""
+        return (self.price * self.size) + self.fee
+
+    @property
+    def net_proceeds(self) -> Decimal:
+        """Net proceeds after fees (for sells)."""
+        return (self.price * self.size) - self.fee
+
+
+class MarketStatus(str, Enum):
+    """Status of a market on Polymarket."""
+
+    ACTIVE = "active"       # Trading is open
+    PAUSED = "paused"       # Trading temporarily paused
+    CLOSED = "closed"       # Trading closed, awaiting resolution
+    RESOLVED = "resolved"   # Market has been resolved
+
+
+@dataclass(frozen=True)
+class OpenOrder:
+    """An open (live) order on the CLOB.
+
+    Represents an order that has been placed but not yet filled or cancelled.
+    """
+
+    order_id: str
+    token_id: str
+    market_id: str
+    side: OrderSide
+    price: Decimal
+    original_size: Decimal
+    remaining_size: Decimal
+    time_in_force: TimeInForce
+    created_at: datetime
+
+    # Execution tracking
+    filled_size: Decimal = Decimal("0")
+
+    @property
+    def is_partially_filled(self) -> bool:
+        """Whether order has been partially filled."""
+        return self.filled_size > Decimal("0") and self.remaining_size > Decimal("0")
+
+    @property
+    def fill_percentage(self) -> Decimal:
+        """Percentage of order that has been filled."""
+        if self.original_size == Decimal("0"):
+            return Decimal("0")
+        return (self.filled_size / self.original_size) * Decimal("100")
+
+
+# Type alias for CLOB order book response
+# This is equivalent to OrderBookData but named to match CLOB API terminology
+CLOBOrderBook = OrderBookData

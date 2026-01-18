@@ -2,9 +2,13 @@
 # CLOB client, Gamma API, and WebSocket streaming
 
 from mercury.integrations.polymarket.types import (
+    BalanceInfo,
+    CLOBOrderBook,
     DualLegOrderResult,
     Market15Min,
     MarketInfo,
+    MarketStatus,
+    OpenOrder,
     OrderBookData,
     OrderBookLevel,
     OrderBookSnapshot,
@@ -14,8 +18,10 @@ from mercury.integrations.polymarket.types import (
     PolymarketSettings,
     PositionInfo,
     TimeInForce,
+    TokenPair,
     TokenPrice,
     TokenSide,
+    TradeInfo,
     WebSocketMessage,
 )
 
@@ -37,20 +43,27 @@ __all__ = [
     "OrderStatus",
     "TimeInForce",
     "TokenSide",
+    "MarketStatus",
     # Settings
     "PolymarketSettings",
     # Market data types
     "MarketInfo",
     "Market15Min",
+    "TokenPair",
     "OrderBookLevel",
     "OrderBookData",
     "OrderBookSnapshot",
+    "CLOBOrderBook",
     "TokenPrice",
     "WebSocketMessage",
     # Order types
     "OrderResult",
     "DualLegOrderResult",
+    "OpenOrder",
+    "TradeInfo",
+    # Account types
     "PositionInfo",
+    "BalanceInfo",
     # CLOB Client
     "CLOBClient",
     # Errors
