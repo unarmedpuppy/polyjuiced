@@ -1,13 +1,19 @@
 name: Build and Deploy
 
+# DISABLED: Mercury rebuild in progress. Re-enable when mercury/Dockerfile exists.
+# See: agents/plans/clean-slate-rebuild-plan.md
+
 on:
-  push:
-    branches: [main, master]
-    tags: ['v*']
-  workflow_dispatch:
+  # Temporarily disabled - uncomment when Mercury is ready
+  # push:
+  #   branches: [main, master]
+  #   tags: ['v*']
+  workflow_dispatch:  # Keep manual trigger for testing
 
 jobs:
   build:
+    # Skip until Mercury Dockerfile is created (Phase 1 task)
+    if: false
     uses: unarmedpuppy/workflows/.gitea/workflows/docker-build.yml@main
     with:
       image_name: library/polyjuiced
