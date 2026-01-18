@@ -43,8 +43,8 @@ class OrderBookLevel:
 
 
 @dataclass
-class OrderBook:
-    """Order book state for a token."""
+class TokenOrderBook:
+    """Order book state for a single token (YES or NO side)."""
     token_id: str
     timestamp: datetime
     bids: list[OrderBookLevel] = field(default_factory=list)
@@ -73,6 +73,50 @@ class OrderBook:
         if self.best_bid is not None and self.best_ask is not None:
             return self.best_ask - self.best_bid
         return None
+
+
+@dataclass
+class OrderBook:
+    """Combined order book state for a binary market (YES + NO sides)."""
+    market_id: str
+    yes_bids: list[OrderBookLevel] = field(default_factory=list)
+    yes_asks: list[OrderBookLevel] = field(default_factory=list)
+    no_bids: list[OrderBookLevel] = field(default_factory=list)
+    no_asks: list[OrderBookLevel] = field(default_factory=list)
+    timestamp: Optional[datetime] = None
+
+    @property
+    def yes_best_bid(self) -> Optional[Decimal]:
+        """Get best YES bid price."""
+        return self.yes_bids[0].price if self.yes_bids else None
+
+    @property
+    def yes_best_ask(self) -> Optional[Decimal]:
+        """Get best YES ask price."""
+        return self.yes_asks[0].price if self.yes_asks else None
+
+    @property
+    def no_best_bid(self) -> Optional[Decimal]:
+        """Get best NO bid price."""
+        return self.no_bids[0].price if self.no_bids else None
+
+    @property
+    def no_best_ask(self) -> Optional[Decimal]:
+        """Get best NO ask price."""
+        return self.no_asks[0].price if self.no_asks else None
+
+    @property
+    def combined_ask(self) -> Optional[Decimal]:
+        """Get combined ask price (yes_ask + no_ask) for arbitrage detection."""
+        if self.yes_best_ask is not None and self.no_best_ask is not None:
+            return self.yes_best_ask + self.no_best_ask
+        return None
+
+    @property
+    def has_arbitrage_opportunity(self) -> bool:
+        """Check if combined ask < 1 (arbitrage opportunity)."""
+        combined = self.combined_ask
+        return combined is not None and combined < Decimal("1")
 
 
 @dataclass
