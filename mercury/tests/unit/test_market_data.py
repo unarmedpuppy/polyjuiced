@@ -267,6 +267,39 @@ class TestStalenessDetection:
 
         assert service.is_market_stale("test") is True
 
+    def test_is_market_stale_returns_false_when_fresh(self, service):
+        """Test that is_market_stale returns False when data is fresh."""
+        state = MarketState(
+            market_id="test",
+            yes_token_id="yes",
+            no_token_id="no",
+        )
+        service._markets["test"] = state
+        service._last_update["test"] = time.time()  # Just updated
+        service._stale_threshold = Decimal("10.0")
+
+        assert service.is_market_stale("test") is False
+
+    def test_is_market_stale_returns_true_when_expired(self, service):
+        """Test that is_market_stale returns True when threshold exceeded."""
+        state = MarketState(
+            market_id="test",
+            yes_token_id="yes",
+            no_token_id="no",
+        )
+        service._markets["test"] = state
+        service._last_update["test"] = time.time() - 15  # 15 seconds ago
+        service._stale_threshold = Decimal("10.0")  # 10 second threshold
+
+        assert service.is_market_stale("test") is True
+
+    def test_default_stale_threshold_is_10_seconds(self, service):
+        """Test that default staleness threshold is 10 seconds."""
+        # The fixture sets up a mock config that returns Decimal("30.0")
+        # But the DEFAULT constant should be 10.0
+        from mercury.services.market_data import DEFAULT_STALE_THRESHOLD_SECONDS
+        assert DEFAULT_STALE_THRESHOLD_SECONDS == 10.0
+
     @pytest.mark.asyncio
     async def test_check_staleness_publishes_alert(self, service, mock_event_bus):
         """Test that _check_staleness publishes stale alerts."""
@@ -291,6 +324,143 @@ class TestStalenessDetection:
                 stale_call = call
                 break
         assert stale_call is not None
+
+    @pytest.mark.asyncio
+    async def test_check_staleness_publishes_only_once_per_transition(self, service, mock_event_bus):
+        """Test that stale events are only published once per transition."""
+        # Set up a stale market
+        state = MarketState(
+            market_id="test",
+            yes_token_id="yes",
+            no_token_id="no",
+        )
+        service._markets["test"] = state
+        service._last_update["test"] = time.time() - 100  # Very old
+        service._stale_threshold = Decimal("10.0")
+
+        # First check should publish stale event
+        await service._check_staleness()
+        assert state.is_marked_stale is True
+
+        stale_calls_count = sum(1 for call in mock_event_bus.publish.call_args_list
+                                if "market.stale" in call[0][0])
+        assert stale_calls_count == 1
+
+        # Reset mock to count new calls
+        mock_event_bus.publish.reset_mock()
+
+        # Second check should NOT publish another stale event
+        await service._check_staleness()
+        stale_calls_count = sum(1 for call in mock_event_bus.publish.call_args_list
+                                if "market.stale" in call[0][0])
+        assert stale_calls_count == 0
+
+    @pytest.mark.asyncio
+    async def test_check_staleness_publishes_fresh_event_on_recovery(self, service, mock_event_bus):
+        """Test that fresh event is published when market recovers from stale."""
+        # Set up a market that's currently marked as stale
+        state = MarketState(
+            market_id="test",
+            yes_token_id="yes",
+            no_token_id="no",
+            is_marked_stale=True,  # Previously marked stale
+        )
+        service._markets["test"] = state
+        service._last_update["test"] = time.time()  # Just updated - now fresh
+        service._stale_threshold = Decimal("10.0")
+
+        await service._check_staleness()
+
+        # Should have published fresh event
+        assert state.is_marked_stale is False
+        fresh_calls = [call for call in mock_event_bus.publish.call_args_list
+                       if "market.fresh" in call[0][0]]
+        assert len(fresh_calls) == 1
+        assert fresh_calls[0][0][0] == "market.fresh.test"
+
+    @pytest.mark.asyncio
+    async def test_stale_event_includes_threshold_info(self, service, mock_event_bus):
+        """Test that stale event includes threshold information."""
+        state = MarketState(
+            market_id="test",
+            yes_token_id="yes",
+            no_token_id="no",
+        )
+        service._markets["test"] = state
+        service._last_update["test"] = time.time() - 100
+        service._stale_threshold = Decimal("10.0")
+
+        await service._check_staleness()
+
+        # Find the stale event data
+        stale_calls = [call for call in mock_event_bus.publish.call_args_list
+                       if "market.stale" in call[0][0]]
+        assert len(stale_calls) == 1
+        event_data = stale_calls[0][0][1]
+        assert event_data["market_id"] == "test"
+        assert event_data["threshold_seconds"] == 10.0
+        assert "timestamp" in event_data
+
+    def test_get_stale_markets_returns_empty_set_initially(self, service):
+        """Test that get_stale_markets returns empty set when no markets subscribed."""
+        assert service.get_stale_markets() == set()
+
+    def test_get_stale_markets_returns_stale_market_ids(self, service):
+        """Test that get_stale_markets returns IDs of stale markets."""
+        # Set up one fresh and one stale market
+        service._markets["fresh"] = MarketState(
+            market_id="fresh",
+            yes_token_id="yes1",
+            no_token_id="no1",
+        )
+        service._last_update["fresh"] = time.time()
+
+        service._markets["stale"] = MarketState(
+            market_id="stale",
+            yes_token_id="yes2",
+            no_token_id="no2",
+        )
+        service._last_update["stale"] = time.time() - 100
+
+        service._stale_threshold = Decimal("10.0")
+
+        stale_markets = service.get_stale_markets()
+        assert stale_markets == {"stale"}
+
+    def test_get_market_age_returns_none_for_unknown(self, service):
+        """Test that get_market_age returns None for unknown markets."""
+        assert service.get_market_age("unknown") is None
+
+    def test_get_market_age_returns_none_when_never_updated(self, service):
+        """Test that get_market_age returns None when market has no updates."""
+        state = MarketState(
+            market_id="test",
+            yes_token_id="yes",
+            no_token_id="no",
+        )
+        service._markets["test"] = state
+        # No entry in _last_update
+
+        assert service.get_market_age("test") is None
+
+    def test_get_market_age_returns_correct_age(self, service):
+        """Test that get_market_age returns correct age in seconds."""
+        state = MarketState(
+            market_id="test",
+            yes_token_id="yes",
+            no_token_id="no",
+        )
+        service._markets["test"] = state
+        service._last_update["test"] = time.time() - 5.0  # 5 seconds ago
+
+        age = service.get_market_age("test")
+        assert age is not None
+        assert 4.9 <= age <= 5.5  # Allow small timing variance
+
+    def test_stale_threshold_seconds_property(self, service):
+        """Test that stale_threshold_seconds property returns configured value."""
+        service._stale_threshold = Decimal("15.0")
+        assert service.stale_threshold_seconds == 15.0
 
 
 class TestEventPublishing:

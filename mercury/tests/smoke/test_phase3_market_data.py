@@ -75,6 +75,7 @@ class TestPhase3MarketDataService:
 
         service = MarketDataService.__new__(MarketDataService)
         service._order_books = {}
+        service._markets = {}  # Required for new staleness tracking
 
         book = OrderBook(
             market_id="test",
@@ -92,20 +93,29 @@ class TestPhase3MarketDataService:
     @pytest.mark.asyncio
     async def test_staleness_detection(self, mock_config, mock_event_bus):
         """Verify stale market detection works."""
-        from mercury.services.market_data import MarketDataService
-        import asyncio
+        from mercury.services.market_data import MarketDataService, MarketState
 
         mock_config.get.return_value = 0.1  # 100ms staleness threshold for test
+        mock_config.get_decimal.return_value = Decimal("0.1")  # Also set the Decimal version
 
         service = MarketDataService(config=mock_config, event_bus=mock_event_bus)
-        service._last_update = {"test": 0}  # Very old timestamp
+        # Set up a market with old last_update so it's detected as stale
+        service._markets["test"] = MarketState(
+            market_id="test",
+            yes_token_id="yes",
+            no_token_id="no",
+        )
+        service._last_update["test"] = 0  # Very old timestamp (epoch)
 
         await service._check_staleness()
 
         # Should have published stale event
         mock_event_bus.publish.assert_called()
-        call_args = mock_event_bus.publish.call_args
-        assert "stale" in call_args[0][0]
+        # Find the stale event
+        stale_calls = [call for call in mock_event_bus.publish.call_args_list
+                       if "market.stale" in call[0][0]]
+        assert len(stale_calls) > 0
+        assert "test" in stale_calls[0][0][0]
 
     def test_market_finder_importable(self):
         """Verify MarketFinder can be imported."""

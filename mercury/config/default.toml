@@ -32,7 +32,7 @@ enabled = true
 port = 9090
 
 [market_data]
-stale_threshold_seconds = 30
+stale_threshold_seconds = 10  # Default 10s staleness detection
 refresh_interval_seconds = 5
 
 [execution]

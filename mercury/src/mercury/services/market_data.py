@@ -40,7 +40,7 @@ if TYPE_CHECKING:
 log = structlog.get_logger()
 
 # Default configuration values
-DEFAULT_STALE_THRESHOLD_SECONDS = 30.0
+DEFAULT_STALE_THRESHOLD_SECONDS = 10.0  # Task requires 10s default
 DEFAULT_REFRESH_INTERVAL_SECONDS = 5.0
 DEFAULT_MAX_MARKETS = 100
 DEFAULT_ORDER_BOOK_DEPTH = 10
@@ -67,6 +67,9 @@ class MarketState:
 
     last_yes_update: float = 0
     last_no_update: float = 0
+
+    # Staleness tracking - tracks whether we've already published a stale event
+    is_marked_stale: bool = False
 
     def __post_init__(self) -> None:
         """Initialize the market order book."""
@@ -195,6 +198,15 @@ class MarketDataService(BaseComponent):
     def subscribed_markets(self) -> Set[str]:
         """Set of market IDs currently subscribed."""
         return set(self._markets.keys())
+
+    @property
+    def stale_threshold_seconds(self) -> float:
+        """Get the staleness threshold in seconds.
+
+        Markets without updates for longer than this are considered stale.
+        Default is 10 seconds.
+        """
+        return float(self._stale_threshold)
 
     async def start(self) -> None:
         """Start the market data service."""
@@ -544,6 +556,10 @@ class MarketDataService(BaseComponent):
     def is_market_stale(self, market_id: str) -> bool:
         """Check if a market's data is stale.
 
+        Strategies should use this method to check if they should pause trading
+        on a market. A market is considered stale if no updates have been
+        received within the configured threshold (default 10 seconds).
+
         Args:
             market_id: Market's condition ID.
 
@@ -553,39 +569,109 @@ class MarketDataService(BaseComponent):
         if market_id not in self._markets:
             return True
 
-        return self._is_stale(self._markets[market_id])
+        state = self._markets[market_id]
+        last_update_time = self._last_update.get(market_id, 0)
+
+        if last_update_time == 0:
+            return True
+
+        age = time.time() - last_update_time
+        return age > float(self._stale_threshold)
+
+    def get_stale_markets(self) -> Set[str]:
+        """Get the set of market IDs that are currently stale.
+
+        Useful for strategies to quickly check all stale markets.
+
+        Returns:
+            Set of market IDs with stale data.
+        """
+        stale = set()
+        for market_id in self._markets:
+            if self.is_market_stale(market_id):
+                stale.add(market_id)
+        return stale
+
+    def get_market_age(self, market_id: str) -> Optional[float]:
+        """Get the age (in seconds) since last update for a market.
+
+        Args:
+            market_id: Market's condition ID.
+
+        Returns:
+            Seconds since last update, or None if market not subscribed.
+        """
+        if market_id not in self._markets:
+            return None
+
+        last_update_time = self._last_update.get(market_id, 0)
+        if last_update_time == 0:
+            return None
+
+        return time.time() - last_update_time
 
     def _is_stale(self, state: MarketState) -> bool:
-        """Check if a market state is stale."""
-        if state.last_update == 0:
+        """Check if a market state is stale (internal helper)."""
+        last_update_time = self._last_update.get(state.market_id, 0)
+        if last_update_time == 0:
             return True
-        age = time.time() - state.last_update
+        age = time.time() - last_update_time
         return age > float(self._stale_threshold)
 
     async def _check_staleness(self) -> None:
-        """Check all markets for stale data and publish alerts."""
-        # Check all markets in _last_update for staleness
-        for market_id, last_update_time in list(self._last_update.items()):
-            # Skip if this market doesn't exist in _markets (unless testing)
-            # Use very old timestamp (0) as stale by definition
+        """Check all markets for stale data and publish alerts.
+
+        This method implements state-machine logic for staleness:
+        - When a market transitions from fresh -> stale: publish market.stale.{market_id}
+        - When a market transitions from stale -> fresh: publish market.fresh.{market_id}
+        - No repeated events for markets that remain in the same state
+        """
+        now = time.time()
+        threshold = float(self._stale_threshold)
+
+        for market_id, state in list(self._markets.items()):
+            last_update_time = self._last_update.get(market_id, 0)
+
+            # Calculate age
             if last_update_time == 0:
                 age = float("inf")
             else:
-                age = time.time() - last_update_time
+                age = now - last_update_time
 
-            if age > float(self._stale_threshold):
+            is_stale_now = age > threshold
+
+            # Transition: fresh -> stale
+            if is_stale_now and not state.is_marked_stale:
+                state.is_marked_stale = True
                 self._log.warning(
-                    "stale_market_detected",
+                    "market_became_stale",
                     market_id=market_id,
                     age_seconds=age if age != float("inf") else -1,
+                    threshold_seconds=threshold,
                 )
-
-                # Publish stale alert
                 await self._event_bus.publish(
                     f"market.stale.{market_id}",
                     {
                         "market_id": market_id,
                         "age_seconds": age if age != float("inf") else -1,
+                        "threshold_seconds": threshold,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+
+            # Transition: stale -> fresh
+            elif not is_stale_now and state.is_marked_stale:
+                state.is_marked_stale = False
+                self._log.info(
+                    "market_became_fresh",
+                    market_id=market_id,
+                    age_seconds=age,
+                )
+                await self._event_bus.publish(
+                    f"market.fresh.{market_id}",
+                    {
+                        "market_id": market_id,
+                        "age_seconds": age,
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     }
                 )
