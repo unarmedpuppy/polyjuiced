@@ -8,6 +8,9 @@ Tests cover:
 - Best prices retrieval
 - Staleness detection
 - Event publishing
+- New InMemoryOrderBook integration
+- Depth queries
+- Incremental updates
 """
 import asyncio
 import time
@@ -17,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from mercury.domain.market import OrderBook, OrderBookLevel
+from mercury.domain.orderbook import InMemoryOrderBook, MarketOrderBook
 from mercury.services.market_data import MarketDataService, MarketState
 
 
@@ -406,4 +410,273 @@ class TestMarketCount:
 
         # Each market has 2 tokens (yes + no)
         assert service.connected_tokens == 2
+        await service.stop()
+
+
+class TestInMemoryOrderBookIntegration:
+    """Tests for InMemoryOrderBook integration in MarketDataService."""
+
+    @pytest.mark.asyncio
+    async def test_market_state_creates_market_order_book(self, service):
+        """Test that MarketState initializes MarketOrderBook."""
+        await service.start()
+        await service.subscribe_market(
+            "test-market",
+            yes_token_id="yes-token",
+            no_token_id="no-token"
+        )
+
+        state = service._markets.get("test-market")
+        assert state is not None
+        assert state.market_book is not None
+        assert state.market_book.yes_book.token_id == "yes-token"
+        assert state.market_book.no_book.token_id == "no-token"
+        await service.stop()
+
+    @pytest.mark.asyncio
+    async def test_get_market_order_book(self, service):
+        """Test get_market_order_book returns the MarketOrderBook."""
+        await service.start()
+        await service.subscribe_market("test-market")
+
+        market_book = service.get_market_order_book("test-market")
+        assert market_book is not None
+        assert isinstance(market_book, MarketOrderBook)
+        assert market_book.market_id == "test-market"
+        await service.stop()
+
+    @pytest.mark.asyncio
+    async def test_get_market_order_book_returns_none_for_unknown(self, service):
+        """Test get_market_order_book returns None for unknown market."""
+        assert service.get_market_order_book("unknown") is None
+
+    @pytest.mark.asyncio
+    async def test_get_yes_order_book(self, service):
+        """Test get_yes_order_book returns YES token book."""
+        await service.start()
+        await service.subscribe_market("test-market")
+
+        yes_book = service.get_yes_order_book("test-market")
+        assert yes_book is not None
+        assert isinstance(yes_book, InMemoryOrderBook)
+        await service.stop()
+
+    @pytest.mark.asyncio
+    async def test_get_no_order_book(self, service):
+        """Test get_no_order_book returns NO token book."""
+        await service.start()
+        await service.subscribe_market("test-market")
+
+        no_book = service.get_no_order_book("test-market")
+        assert no_book is not None
+        assert isinstance(no_book, InMemoryOrderBook)
+        await service.stop()
+
+
+class TestDepthQueries:
+    """Tests for order book depth queries."""
+
+    @pytest.mark.asyncio
+    async def test_get_depth_with_data(self, service):
+        """Test get_depth returns depth information when data available."""
+        await service.start()
+        await service.subscribe_market("test-market")
+
+        # Populate the order book
+        state = service._markets["test-market"]
+        state.market_book.yes_book.update_bid(Decimal("0.45"), Decimal("100"))
+        state.market_book.yes_book.update_ask(Decimal("0.55"), Decimal("100"))
+        state.market_book.no_book.update_bid(Decimal("0.48"), Decimal("100"))
+        state.market_book.no_book.update_ask(Decimal("0.52"), Decimal("100"))
+
+        depth = service.get_depth("test-market", levels=5)
+
+        assert depth is not None
+        assert depth["market_id"] == "test-market"
+        assert len(depth["yes_bids"]) == 1
+        assert len(depth["yes_asks"]) == 1
+        assert depth["yes_bids"][0]["price"] == "0.45"
+        assert depth["yes_asks"][0]["price"] == "0.55"
+        await service.stop()
+
+    @pytest.mark.asyncio
+    async def test_get_depth_returns_none_for_unknown(self, service):
+        """Test get_depth returns None for unknown market."""
+        assert service.get_depth("unknown") is None
+
+
+class TestArbitrageInfo:
+    """Tests for arbitrage information retrieval."""
+
+    @pytest.mark.asyncio
+    async def test_get_arbitrage_info_with_opportunity(self, service):
+        """Test get_arbitrage_info when arbitrage exists."""
+        await service.start()
+        await service.subscribe_market("test-market")
+
+        # Set up an arbitrage opportunity (combined ask < 1.0)
+        state = service._markets["test-market"]
+        state.market_book.yes_book.update_ask(Decimal("0.48"), Decimal("100"))
+        state.market_book.no_book.update_ask(Decimal("0.48"), Decimal("100"))
+        # Combined = 0.96, spread = 0.04
+
+        arb_info = service.get_arbitrage_info("test-market")
+
+        assert arb_info is not None
+        assert arb_info["has_arbitrage"] is True
+        assert arb_info["combined_ask"] == "0.96"
+        assert arb_info["arbitrage_spread"] == "0.04"
+        # Decimal("0.04") * 100 = Decimal("4.00")
+        assert Decimal(arb_info["arbitrage_spread_cents"]) == Decimal("4")
+        await service.stop()
+
+    @pytest.mark.asyncio
+    async def test_get_arbitrage_info_no_opportunity(self, service):
+        """Test get_arbitrage_info when no arbitrage."""
+        await service.start()
+        await service.subscribe_market("test-market")
+
+        # No arbitrage (combined ask > 1.0)
+        state = service._markets["test-market"]
+        state.market_book.yes_book.update_ask(Decimal("0.55"), Decimal("100"))
+        state.market_book.no_book.update_ask(Decimal("0.55"), Decimal("100"))
+        # Combined = 1.10
+
+        arb_info = service.get_arbitrage_info("test-market")
+
+        assert arb_info is not None
+        assert arb_info["has_arbitrage"] is False
+        await service.stop()
+
+    @pytest.mark.asyncio
+    async def test_get_arbitrage_info_returns_none_for_unknown(self, service):
+        """Test get_arbitrage_info returns None for unknown market."""
+        assert service.get_arbitrage_info("unknown") is None
+
+
+class TestPriceUpdateWithInMemoryBook:
+    """Tests for price updates updating InMemoryOrderBook."""
+
+    @pytest.mark.asyncio
+    async def test_price_update_updates_in_memory_book(self, service):
+        """Test that price updates update the InMemoryOrderBook."""
+        await service.start()
+        await service.subscribe_market(
+            "test-market",
+            yes_token_id="yes-token",
+            no_token_id="no-token"
+        )
+
+        # Simulate price update for YES token
+        await service._on_price_update("yes-token", {
+            "bid": "0.45",
+            "ask": "0.55",
+        })
+
+        market_book = service.get_market_order_book("test-market")
+        assert market_book.yes_best_bid == Decimal("0.45")
+        assert market_book.yes_best_ask == Decimal("0.55")
+        await service.stop()
+
+    @pytest.mark.asyncio
+    async def test_price_update_for_no_token(self, service):
+        """Test that price updates for NO token work correctly."""
+        await service.start()
+        await service.subscribe_market(
+            "test-market",
+            yes_token_id="yes-token",
+            no_token_id="no-token"
+        )
+
+        # Simulate price update for NO token
+        await service._on_price_update("no-token", {
+            "bid": "0.48",
+            "ask": "0.52",
+        })
+
+        market_book = service.get_market_order_book("test-market")
+        assert market_book.no_best_bid == Decimal("0.48")
+        assert market_book.no_best_ask == Decimal("0.52")
+        await service.stop()
+
+
+class TestBookUpdateWithInMemoryBook:
+    """Tests for full book updates with InMemoryOrderBook."""
+
+    @pytest.mark.asyncio
+    async def test_book_update_applies_snapshot(self, service):
+        """Test that book updates apply snapshot to InMemoryOrderBook."""
+        await service.start()
+        await service.subscribe_market(
+            "test-market",
+            yes_token_id="yes-token",
+            no_token_id="no-token"
+        )
+
+        # Simulate full book update with depth
+        await service._on_book_update("yes-token", {
+            "bids": [
+                {"price": "0.45", "size": "100"},
+                {"price": "0.44", "size": "200"},
+            ],
+            "asks": [
+                {"price": "0.55", "size": "100"},
+                {"price": "0.56", "size": "200"},
+            ],
+        })
+
+        market_book = service.get_market_order_book("test-market")
+        assert market_book.yes_best_bid == Decimal("0.45")
+        assert market_book.yes_best_ask == Decimal("0.55")
+
+        # Check depth
+        depth = market_book.yes_book.bid_depth(5)
+        assert len(depth) == 2
+        assert depth[0].price == Decimal("0.45")
+        assert depth[1].price == Decimal("0.44")
+        await service.stop()
+
+    @pytest.mark.asyncio
+    async def test_book_update_with_best_bid_ask_only(self, service):
+        """Test book update with only best_bid/best_ask format."""
+        await service.start()
+        await service.subscribe_market(
+            "test-market",
+            yes_token_id="yes-token",
+            no_token_id="no-token"
+        )
+
+        await service._on_book_update("yes-token", {
+            "best_bid": "0.47",
+            "best_ask": "0.53",
+        })
+
+        market_book = service.get_market_order_book("test-market")
+        assert market_book.yes_best_bid == Decimal("0.47")
+        assert market_book.yes_best_ask == Decimal("0.53")
+        await service.stop()
+
+
+class TestBestPricesWithInMemoryBook:
+    """Tests for best prices using InMemoryOrderBook."""
+
+    @pytest.mark.asyncio
+    async def test_get_best_prices_uses_in_memory_book(self, service):
+        """Test that get_best_prices uses the InMemoryOrderBook."""
+        await service.start()
+        await service.subscribe_market(
+            "test-market",
+            yes_token_id="yes-token",
+            no_token_id="no-token"
+        )
+
+        # Update the in-memory book directly
+        state = service._markets["test-market"]
+        state.market_book.yes_book.update_bid(Decimal("0.46"), Decimal("100"))
+        state.market_book.yes_book.update_ask(Decimal("0.54"), Decimal("100"))
+
+        prices = service.get_best_prices("test-market")
+
+        assert prices is not None
+        assert prices == (Decimal("0.46"), Decimal("0.54"))
         await service.stop()

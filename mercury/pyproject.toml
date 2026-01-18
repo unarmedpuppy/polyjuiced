@@ -23,6 +23,8 @@ dependencies = [
     "websockets>=12.0",
     "py-clob-client>=0.15.0",
     "web3>=6.0.0",
+    # Phase 3: Market data (order book state)
+    "sortedcontainers>=2.4.0",
 ]
 
 [project.optional-dependencies]

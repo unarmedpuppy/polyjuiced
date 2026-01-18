@@ -2,9 +2,14 @@
 
 This service:
 - Subscribes to WebSocket market data
-- Maintains current order book state for each market
+- Maintains current order book state for each market using efficient in-memory structures
+- Handles incremental updates and full snapshots from WebSocket
 - Detects stale/missing data
 - Publishes order book snapshots to EventBus
+
+The service uses InMemoryOrderBook and MarketOrderBook from the domain layer
+for efficient order book state management with O(log n) updates and O(1) best
+price lookups.
 """
 
 import asyncio
@@ -20,6 +25,7 @@ from mercury.core.config import ConfigManager
 from mercury.core.events import EventBus
 from mercury.core.lifecycle import BaseComponent, HealthCheckResult, HealthStatus
 from mercury.domain.market import OrderBook, OrderBookLevel
+from mercury.domain.orderbook import InMemoryOrderBook, MarketOrderBook
 from mercury.integrations.polymarket.types import (
     OrderBookData,
     OrderBookLevel as PolymarketOrderBookLevel,
@@ -37,21 +43,39 @@ log = structlog.get_logger()
 DEFAULT_STALE_THRESHOLD_SECONDS = 30.0
 DEFAULT_REFRESH_INTERVAL_SECONDS = 5.0
 DEFAULT_MAX_MARKETS = 100
+DEFAULT_ORDER_BOOK_DEPTH = 10
 
 
 @dataclass
 class MarketState:
-    """Internal state for a tracked market."""
+    """Internal state for a tracked market.
+
+    Uses the new InMemoryOrderBook structure for efficient order book management.
+    Maintains both the new in-memory books and legacy OrderBookData for compatibility.
+    """
 
     market_id: str
     yes_token_id: str
     no_token_id: str
 
+    # New efficient order book state
+    market_book: Optional[MarketOrderBook] = None
+
+    # Legacy compatibility fields
     yes_book: Optional[OrderBookData] = None
     no_book: Optional[OrderBookData] = None
 
     last_yes_update: float = 0
     last_no_update: float = 0
+
+    def __post_init__(self) -> None:
+        """Initialize the market order book."""
+        if self.market_book is None:
+            self.market_book = MarketOrderBook.create(
+                market_id=self.market_id,
+                yes_token_id=self.yes_token_id,
+                no_token_id=self.no_token_id,
+            )
 
     @property
     def last_update(self) -> float:
@@ -380,6 +404,47 @@ class MarketDataService(BaseComponent):
         """
         return self._order_books.get(market_id)
 
+    def get_market_order_book(self, market_id: str) -> Optional[MarketOrderBook]:
+        """Get the efficient in-memory market order book.
+
+        This is the preferred method for accessing order book state as it
+        provides O(1) best price lookups and O(log n) updates.
+
+        Args:
+            market_id: Market's condition ID.
+
+        Returns:
+            MarketOrderBook or None if market not subscribed.
+        """
+        state = self._markets.get(market_id)
+        if state is None or state.market_book is None:
+            return None
+        return state.market_book
+
+    def get_yes_order_book(self, market_id: str) -> Optional[InMemoryOrderBook]:
+        """Get the YES token order book.
+
+        Args:
+            market_id: Market's condition ID.
+
+        Returns:
+            InMemoryOrderBook for YES token or None.
+        """
+        market_book = self.get_market_order_book(market_id)
+        return market_book.yes_book if market_book else None
+
+    def get_no_order_book(self, market_id: str) -> Optional[InMemoryOrderBook]:
+        """Get the NO token order book.
+
+        Args:
+            market_id: Market's condition ID.
+
+        Returns:
+            InMemoryOrderBook for NO token or None.
+        """
+        market_book = self.get_market_order_book(market_id)
+        return market_book.no_book if market_book else None
+
     def get_best_prices(self, market_id: str) -> Optional[tuple[Decimal, Decimal]]:
         """Get best bid/ask for YES side.
 
@@ -389,6 +454,16 @@ class MarketDataService(BaseComponent):
         Returns:
             Tuple of (yes_bid, yes_ask) or None.
         """
+        # Use the efficient in-memory order book if available
+        market_book = self.get_market_order_book(market_id)
+        if market_book is not None:
+            yes_bid = market_book.yes_best_bid
+            yes_ask = market_book.yes_best_ask
+            if yes_bid is not None and yes_ask is not None:
+                return (yes_bid, yes_ask)
+            return None
+
+        # Fall back to legacy order book
         book = self._order_books.get(market_id)
         if book is None:
             return None
@@ -400,6 +475,71 @@ class MarketDataService(BaseComponent):
             return None
 
         return (yes_bid, yes_ask)
+
+    def get_depth(
+        self,
+        market_id: str,
+        levels: int = DEFAULT_ORDER_BOOK_DEPTH,
+    ) -> Optional[dict]:
+        """Get order book depth for a market.
+
+        Args:
+            market_id: Market's condition ID.
+            levels: Number of price levels to return.
+
+        Returns:
+            Dictionary with depth information or None if not available.
+        """
+        market_book = self.get_market_order_book(market_id)
+        if market_book is None:
+            return None
+
+        return {
+            "market_id": market_id,
+            "yes_bids": [
+                {"price": str(l.price), "size": str(l.size)}
+                for l in market_book.yes_book.bid_depth(levels)
+            ],
+            "yes_asks": [
+                {"price": str(l.price), "size": str(l.size)}
+                for l in market_book.yes_book.ask_depth(levels)
+            ],
+            "no_bids": [
+                {"price": str(l.price), "size": str(l.size)}
+                for l in market_book.no_book.bid_depth(levels)
+            ],
+            "no_asks": [
+                {"price": str(l.price), "size": str(l.size)}
+                for l in market_book.no_book.ask_depth(levels)
+            ],
+            "yes_total_bid_size": str(market_book.yes_book.total_bid_size(levels)),
+            "yes_total_ask_size": str(market_book.yes_book.total_ask_size(levels)),
+            "no_total_bid_size": str(market_book.no_book.total_bid_size(levels)),
+            "no_total_ask_size": str(market_book.no_book.total_ask_size(levels)),
+        }
+
+    def get_arbitrage_info(self, market_id: str) -> Optional[dict]:
+        """Get arbitrage information for a market.
+
+        Args:
+            market_id: Market's condition ID.
+
+        Returns:
+            Dictionary with arbitrage info or None.
+        """
+        market_book = self.get_market_order_book(market_id)
+        if market_book is None:
+            return None
+
+        return {
+            "market_id": market_id,
+            "yes_best_ask": str(market_book.yes_best_ask) if market_book.yes_best_ask else None,
+            "no_best_ask": str(market_book.no_best_ask) if market_book.no_best_ask else None,
+            "combined_ask": str(market_book.combined_ask) if market_book.combined_ask else None,
+            "arbitrage_spread": str(market_book.arbitrage_spread) if market_book.arbitrage_spread else None,
+            "arbitrage_spread_cents": str(market_book.arbitrage_spread_cents) if market_book.arbitrage_spread_cents else None,
+            "has_arbitrage": market_book.has_arbitrage,
+        }
 
     def is_market_stale(self, market_id: str) -> bool:
         """Check if a market's data is stale.
@@ -460,7 +600,12 @@ class MarketDataService(BaseComponent):
             await self.subscribe_market(market_id, yes_token, no_token)
 
     async def _on_price_update(self, token_id: str, data: dict) -> None:
-        """Handle price update from WebSocket via EventBus."""
+        """Handle price update from WebSocket via EventBus.
+
+        Updates both the legacy OrderBookData and the new InMemoryOrderBook.
+        Price updates typically only include best bid/ask, so we update
+        only those levels with a default size of 1.
+        """
         market_id = self._token_to_market.get(token_id)
         if not market_id:
             return
@@ -473,21 +618,45 @@ class MarketDataService(BaseComponent):
         bid = Decimal(data["bid"]) if data.get("bid") else None
         ask = Decimal(data["ask"]) if data.get("ask") else None
 
-        # Update appropriate book
+        # Default size for price-only updates
+        default_size = Decimal("1")
+
+        # Update the new InMemoryOrderBook (incremental update)
+        if state.market_book is not None:
+            if token_id == state.yes_token_id:
+                if bid is not None:
+                    state.market_book.yes_book.update_bid(bid, default_size)
+                if ask is not None:
+                    state.market_book.yes_book.update_ask(ask, default_size)
+            else:
+                if bid is not None:
+                    state.market_book.no_book.update_bid(bid, default_size)
+                if ask is not None:
+                    state.market_book.no_book.update_ask(ask, default_size)
+
+        # Update legacy OrderBookData (for compatibility)
         if token_id == state.yes_token_id:
             if state.yes_book:
                 # Update existing book with new prices
                 new_bids = state.yes_book.bids
                 new_asks = state.yes_book.asks
                 if bid is not None:
-                    new_bids = (PolymarketOrderBookLevel(price=bid, size=Decimal("1")),)
+                    new_bids = (PolymarketOrderBookLevel(price=bid, size=default_size),)
                 if ask is not None:
-                    new_asks = (PolymarketOrderBookLevel(price=ask, size=Decimal("1")),)
+                    new_asks = (PolymarketOrderBookLevel(price=ask, size=default_size),)
                 state.yes_book = OrderBookData(
                     token_id=token_id,
                     timestamp=datetime.now(timezone.utc),
                     bids=new_bids,
                     asks=new_asks,
+                )
+            else:
+                # Initialize book if it doesn't exist
+                state.yes_book = OrderBookData(
+                    token_id=token_id,
+                    timestamp=datetime.now(timezone.utc),
+                    bids=(PolymarketOrderBookLevel(price=bid, size=default_size),) if bid else (),
+                    asks=(PolymarketOrderBookLevel(price=ask, size=default_size),) if ask else (),
                 )
             state.last_yes_update = now
         else:
@@ -495,14 +664,22 @@ class MarketDataService(BaseComponent):
                 new_bids = state.no_book.bids
                 new_asks = state.no_book.asks
                 if bid is not None:
-                    new_bids = (PolymarketOrderBookLevel(price=bid, size=Decimal("1")),)
+                    new_bids = (PolymarketOrderBookLevel(price=bid, size=default_size),)
                 if ask is not None:
-                    new_asks = (PolymarketOrderBookLevel(price=ask, size=Decimal("1")),)
+                    new_asks = (PolymarketOrderBookLevel(price=ask, size=default_size),)
                 state.no_book = OrderBookData(
                     token_id=token_id,
                     timestamp=datetime.now(timezone.utc),
                     bids=new_bids,
                     asks=new_asks,
+                )
+            else:
+                # Initialize book if it doesn't exist
+                state.no_book = OrderBookData(
+                    token_id=token_id,
+                    timestamp=datetime.now(timezone.utc),
+                    bids=(PolymarketOrderBookLevel(price=bid, size=default_size),) if bid else (),
+                    asks=(PolymarketOrderBookLevel(price=ask, size=default_size),) if ask else (),
                 )
             state.last_no_update = now
 
@@ -516,7 +693,11 @@ class MarketDataService(BaseComponent):
         await self._publish_snapshot(state)
 
     async def _on_book_update(self, token_id: str, data: dict) -> None:
-        """Handle full book update from WebSocket via EventBus."""
+        """Handle full book update from WebSocket via EventBus.
+
+        Full book updates can include multiple price levels. This method
+        applies the update as a snapshot, replacing all levels for the token.
+        """
         market_id = self._token_to_market.get(token_id)
         if not market_id:
             return
@@ -528,14 +709,69 @@ class MarketDataService(BaseComponent):
         now = time.time()
 
         # Parse bids and asks from event data
+        # Handle both simple best_bid/best_ask format and full depth format
+        bids_data = data.get("bids", [])
+        asks_data = data.get("asks", [])
+
+        # If no full depth, check for best bid/ask
         bid = Decimal(data["best_bid"]) if data.get("best_bid") else None
         ask = Decimal(data["best_ask"]) if data.get("best_ask") else None
+
+        # Parse full depth levels if available
+        parsed_bids: list[tuple[Decimal, Decimal]] = []
+        parsed_asks: list[tuple[Decimal, Decimal]] = []
+
+        for level in bids_data:
+            if isinstance(level, dict):
+                price = Decimal(str(level.get("price", 0)))
+                size = Decimal(str(level.get("size", 0)))
+            elif isinstance(level, (list, tuple)) and len(level) >= 2:
+                price = Decimal(str(level[0]))
+                size = Decimal(str(level[1]))
+            else:
+                continue
+            if size > 0:
+                parsed_bids.append((price, size))
+
+        for level in asks_data:
+            if isinstance(level, dict):
+                price = Decimal(str(level.get("price", 0)))
+                size = Decimal(str(level.get("size", 0)))
+            elif isinstance(level, (list, tuple)) and len(level) >= 2:
+                price = Decimal(str(level[0]))
+                size = Decimal(str(level[1]))
+            else:
+                continue
+            if size > 0:
+                parsed_asks.append((price, size))
+
+        # If no full depth, use best bid/ask with default size
+        default_size = Decimal("1")
+        if not parsed_bids and bid is not None:
+            parsed_bids = [(bid, default_size)]
+        if not parsed_asks and ask is not None:
+            parsed_asks = [(ask, default_size)]
+
+        # Update the new InMemoryOrderBook with full snapshot
+        if state.market_book is not None:
+            if token_id == state.yes_token_id:
+                state.market_book.yes_book.apply_snapshot(parsed_bids, parsed_asks)
+            else:
+                state.market_book.no_book.apply_snapshot(parsed_bids, parsed_asks)
+
+        # Build legacy OrderBookData
+        legacy_bids = tuple(
+            PolymarketOrderBookLevel(price=p, size=s) for p, s in parsed_bids
+        )
+        legacy_asks = tuple(
+            PolymarketOrderBookLevel(price=p, size=s) for p, s in parsed_asks
+        )
 
         book = OrderBookData(
             token_id=token_id,
             timestamp=datetime.now(timezone.utc),
-            bids=(PolymarketOrderBookLevel(price=bid, size=Decimal("1")),) if bid else (),
-            asks=(PolymarketOrderBookLevel(price=ask, size=Decimal("1")),) if ask else (),
+            bids=legacy_bids,
+            asks=legacy_asks,
         )
 
         # Update appropriate side
