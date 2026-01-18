@@ -719,6 +719,450 @@ class TestPositionOperations:
 
         await store.close()
 
+    @pytest.mark.asyncio
+    async def test_position_cost_basis(self, tmp_path):
+        """Test Position cost_basis property."""
+        from mercury.services.state_store import Position
+
+        position = Position(
+            position_id="cost-basis-test",
+            market_id="test-market",
+            strategy="gabagool",
+            side="YES",
+            size=Decimal("100.0"),
+            entry_price=Decimal("0.45"),
+        )
+
+        assert position.cost_basis == Decimal("45.0")
+
+    @pytest.mark.asyncio
+    async def test_position_market_value(self, tmp_path):
+        """Test Position market_value property."""
+        from mercury.services.state_store import Position
+
+        # Without current price
+        position = Position(
+            position_id="market-value-test",
+            market_id="test-market",
+            strategy="gabagool",
+            side="YES",
+            size=Decimal("100.0"),
+            entry_price=Decimal("0.45"),
+        )
+
+        assert position.market_value is None
+
+        # With current price
+        position.current_price = Decimal("0.55")
+        assert position.market_value == Decimal("55.0")
+
+    @pytest.mark.asyncio
+    async def test_position_calculate_unrealized_pnl_yes(self, tmp_path):
+        """Test Position unrealized P&L calculation for YES position."""
+        from mercury.services.state_store import Position
+
+        position = Position(
+            position_id="pnl-test-yes",
+            market_id="test-market",
+            strategy="gabagool",
+            side="YES",
+            size=Decimal("100.0"),
+            entry_price=Decimal("0.45"),
+        )
+
+        # Price increased - profit
+        pnl = position.calculate_unrealized_pnl(Decimal("0.55"))
+        assert pnl == Decimal("10.0")  # (0.55 - 0.45) * 100
+
+        # Price decreased - loss
+        pnl = position.calculate_unrealized_pnl(Decimal("0.35"))
+        assert pnl == Decimal("-10.0")  # (0.35 - 0.45) * 100
+
+    @pytest.mark.asyncio
+    async def test_position_calculate_unrealized_pnl_no(self, tmp_path):
+        """Test Position unrealized P&L calculation for NO position."""
+        from mercury.services.state_store import Position
+
+        position = Position(
+            position_id="pnl-test-no",
+            market_id="test-market",
+            strategy="gabagool",
+            side="NO",
+            size=Decimal("100.0"),
+            entry_price=Decimal("0.45"),
+        )
+
+        # Price decreased - profit for NO position
+        pnl = position.calculate_unrealized_pnl(Decimal("0.35"))
+        assert pnl == Decimal("10.0")  # (0.45 - 0.35) * 100
+
+        # Price increased - loss for NO position
+        pnl = position.calculate_unrealized_pnl(Decimal("0.55"))
+        assert pnl == Decimal("-10.0")  # (0.45 - 0.55) * 100
+
+    @pytest.mark.asyncio
+    async def test_save_position_with_unrealized_pnl(self, tmp_path):
+        """Test saving position with unrealized P&L tracking."""
+        from mercury.services.state_store import StateStore, Position
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        position = Position(
+            position_id="pnl-track-test",
+            market_id="test-market",
+            strategy="gabagool",
+            side="YES",
+            size=Decimal("100.0"),
+            entry_price=Decimal("0.45"),
+            unrealized_pnl=Decimal("5.0"),
+            current_price=Decimal("0.50"),
+        )
+
+        await store.save_position(position)
+
+        retrieved = await store.get_position("pnl-track-test")
+
+        assert retrieved is not None
+        assert retrieved.unrealized_pnl == Decimal("5.0")
+        assert retrieved.current_price == Decimal("0.50")
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_update_position_unrealized_pnl(self, tmp_path):
+        """Test updating position unrealized P&L."""
+        from mercury.services.state_store import StateStore, Position
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        # Create a position
+        position = Position(
+            position_id="update-pnl-test",
+            market_id="test-market",
+            strategy="gabagool",
+            side="YES",
+            size=Decimal("100.0"),
+            entry_price=Decimal("0.45"),
+        )
+        await store.save_position(position)
+
+        # Update with current price - P&L should be calculated
+        await store.update_position_unrealized_pnl(
+            position_id="update-pnl-test",
+            current_price=Decimal("0.55"),
+        )
+
+        retrieved = await store.get_position("update-pnl-test")
+        assert retrieved.current_price == Decimal("0.55")
+        assert retrieved.unrealized_pnl == Decimal("10.0")  # (0.55 - 0.45) * 100
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_update_position_unrealized_pnl_with_explicit_pnl(self, tmp_path):
+        """Test updating position with explicit unrealized P&L value."""
+        from mercury.services.state_store import StateStore, Position
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        # Create a position
+        position = Position(
+            position_id="explicit-pnl-test",
+            market_id="test-market",
+            strategy="gabagool",
+            side="YES",
+            size=Decimal("100.0"),
+            entry_price=Decimal("0.45"),
+        )
+        await store.save_position(position)
+
+        # Update with explicit P&L value
+        await store.update_position_unrealized_pnl(
+            position_id="explicit-pnl-test",
+            current_price=Decimal("0.55"),
+            unrealized_pnl=Decimal("12.50"),  # Custom value (e.g., after fees)
+        )
+
+        retrieved = await store.get_position("explicit-pnl-test")
+        assert retrieved.current_price == Decimal("0.55")
+        assert retrieved.unrealized_pnl == Decimal("12.50")
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_get_positions_with_filters(self, tmp_path):
+        """Test getting positions with various filters."""
+        from mercury.services.state_store import StateStore, Position
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        # Create multiple positions with different attributes
+        positions = [
+            Position(
+                position_id="pos-1",
+                market_id="market-A",
+                strategy="gabagool",
+                side="YES",
+                size=Decimal("10.0"),
+                entry_price=Decimal("0.50"),
+                status="open",
+            ),
+            Position(
+                position_id="pos-2",
+                market_id="market-A",
+                strategy="altro",
+                side="NO",
+                size=Decimal("20.0"),
+                entry_price=Decimal("0.40"),
+                status="open",
+            ),
+            Position(
+                position_id="pos-3",
+                market_id="market-B",
+                strategy="gabagool",
+                side="YES",
+                size=Decimal("15.0"),
+                entry_price=Decimal("0.55"),
+                status="closed",
+            ),
+            Position(
+                position_id="pos-4",
+                market_id="market-B",
+                strategy="altro",
+                side="NO",
+                size=Decimal("25.0"),
+                entry_price=Decimal("0.35"),
+                status="open",
+            ),
+        ]
+
+        for pos in positions:
+            await store.save_position(pos)
+
+        # Filter by status
+        open_positions = await store.get_positions(status="open")
+        assert len(open_positions) == 3
+
+        # Filter by market
+        market_a_positions = await store.get_positions(market_id="market-A")
+        assert len(market_a_positions) == 2
+
+        # Filter by strategy
+        gabagool_positions = await store.get_positions(strategy="gabagool")
+        assert len(gabagool_positions) == 2
+
+        # Filter by side
+        yes_positions = await store.get_positions(side="YES")
+        assert len(yes_positions) == 2
+
+        # Combined filters
+        open_yes_positions = await store.get_positions(status="open", side="YES")
+        assert len(open_yes_positions) == 1
+        assert open_yes_positions[0].position_id == "pos-1"
+
+        # Filter by market and status
+        market_b_open = await store.get_positions(market_id="market-B", status="open")
+        assert len(market_b_open) == 1
+        assert market_b_open[0].position_id == "pos-4"
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_get_position_summary(self, tmp_path):
+        """Test position summary statistics."""
+        from mercury.services.state_store import StateStore, Position
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        # Create positions with various states
+        positions = [
+            Position(
+                position_id="sum-1",
+                market_id="market-A",
+                strategy="gabagool",
+                side="YES",
+                size=Decimal("100.0"),
+                entry_price=Decimal("0.50"),
+                status="open",
+                unrealized_pnl=Decimal("10.0"),
+            ),
+            Position(
+                position_id="sum-2",
+                market_id="market-B",
+                strategy="gabagool",
+                side="NO",
+                size=Decimal("50.0"),
+                entry_price=Decimal("0.40"),
+                status="open",
+                unrealized_pnl=Decimal("-5.0"),
+            ),
+            Position(
+                position_id="sum-3",
+                market_id="market-C",
+                strategy="gabagool",
+                side="YES",
+                size=Decimal("75.0"),
+                entry_price=Decimal("0.60"),
+                status="closed",
+                realized_pnl=Decimal("15.0"),
+            ),
+        ]
+
+        for pos in positions:
+            await store.save_position(pos)
+
+        summary = await store.get_position_summary()
+
+        assert summary["total_positions"] == 3
+        assert summary["open_positions"] == 2
+        assert summary["closed_positions"] == 1
+        assert summary["total_unrealized_pnl"] == Decimal("5.0")  # 10 + (-5)
+        assert summary["total_realized_pnl"] == Decimal("15.0")
+        # Exposure: 100*0.50 + 50*0.40 = 50 + 20 = 70
+        assert summary["total_exposure"] == Decimal("70.0")
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_get_position_summary_empty(self, tmp_path):
+        """Test position summary with no positions."""
+        from mercury.services.state_store import StateStore
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        summary = await store.get_position_summary()
+
+        assert summary["total_positions"] == 0
+        assert summary["open_positions"] == 0
+        assert summary["closed_positions"] == 0
+        assert summary["total_unrealized_pnl"] == Decimal("0")
+        assert summary["total_realized_pnl"] == Decimal("0")
+        assert summary["total_exposure"] == Decimal("0")
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_get_open_positions_with_strategy_filter(self, tmp_path):
+        """Test getting open positions filtered by strategy."""
+        from mercury.services.state_store import StateStore, Position
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        # Create positions with different strategies
+        for i, strategy in enumerate(["gabagool", "gabagool", "altro"]):
+            position = Position(
+                position_id=f"strat-pos-{i}",
+                market_id="test-market",
+                strategy=strategy,
+                side="YES",
+                size=Decimal("10.0"),
+                entry_price=Decimal("0.50"),
+                status="open",
+            )
+            await store.save_position(position)
+
+        # Filter by strategy
+        gabagool_positions = await store.get_open_positions(strategy="gabagool")
+        assert len(gabagool_positions) == 2
+
+        altro_positions = await store.get_open_positions(strategy="altro")
+        assert len(altro_positions) == 1
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_get_position_returns_none_for_missing(self, tmp_path):
+        """Test get_position returns None for non-existent position."""
+        from mercury.services.state_store import StateStore
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        result = await store.get_position("non-existent-position")
+
+        assert result is None
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_position_lifecycle_full(self, tmp_path):
+        """Test full position lifecycle: open -> update P&L -> close."""
+        from mercury.services.state_store import StateStore, Position, PositionResult
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        # 1. Open position
+        position = Position(
+            position_id="lifecycle-test",
+            market_id="test-market",
+            strategy="gabagool",
+            side="YES",
+            size=Decimal("100.0"),
+            entry_price=Decimal("0.45"),
+        )
+        await store.save_position(position)
+
+        # Verify open
+        retrieved = await store.get_position("lifecycle-test")
+        assert retrieved.status == "open"
+        assert retrieved.cost_basis == Decimal("45.0")
+
+        # 2. Update unrealized P&L as price moves
+        await store.update_position_unrealized_pnl(
+            position_id="lifecycle-test",
+            current_price=Decimal("0.50"),
+        )
+
+        retrieved = await store.get_position("lifecycle-test")
+        assert retrieved.unrealized_pnl == Decimal("5.0")
+
+        # 3. Price moves further
+        await store.update_position_unrealized_pnl(
+            position_id="lifecycle-test",
+            current_price=Decimal("0.60"),
+        )
+
+        retrieved = await store.get_position("lifecycle-test")
+        assert retrieved.unrealized_pnl == Decimal("15.0")
+
+        # 4. Close position
+        result = PositionResult(
+            exit_price=Decimal("0.60"),
+            realized_pnl=Decimal("15.0"),
+            closed_at=datetime.now(timezone.utc),
+        )
+        await store.close_position("lifecycle-test", result)
+
+        # Verify closed
+        retrieved = await store.get_position("lifecycle-test")
+        assert retrieved.status == "closed"
+        assert retrieved.realized_pnl == Decimal("15.0")
+        assert retrieved.exit_price == Decimal("0.60")
+
+        # Verify summary updated
+        summary = await store.get_position_summary()
+        assert summary["closed_positions"] == 1
+        assert summary["total_realized_pnl"] == Decimal("15.0")
+
+        await store.close()
+
 
 class TestSettlementQueue:
     """Test settlement queue operations."""

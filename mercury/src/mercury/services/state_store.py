@@ -95,6 +95,8 @@ CREATE TABLE IF NOT EXISTS positions (
     closed_at TIMESTAMP,
     exit_price REAL,
     realized_pnl REAL,
+    unrealized_pnl REAL,
+    current_price REAL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -325,12 +327,17 @@ class Trade:
 
 @dataclass
 class Position:
-    """A position in a market."""
+    """A position in a market.
+
+    Tracks entry price, size, and both unrealized and realized P&L.
+    Unrealized P&L is calculated externally and updated periodically
+    based on current market prices.
+    """
 
     position_id: str
     market_id: str
     strategy: str
-    side: str
+    side: str  # "YES" or "NO"
     size: Decimal
     entry_price: Decimal
     opened_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -338,6 +345,37 @@ class Position:
     closed_at: Optional[datetime] = None
     exit_price: Optional[Decimal] = None
     realized_pnl: Optional[Decimal] = None
+    unrealized_pnl: Optional[Decimal] = None
+    current_price: Optional[Decimal] = None  # Last known market price
+
+    @property
+    def cost_basis(self) -> Decimal:
+        """Get total cost basis of the position."""
+        return self.size * self.entry_price
+
+    @property
+    def market_value(self) -> Optional[Decimal]:
+        """Get current market value if current price is known."""
+        if self.current_price is None:
+            return None
+        return self.size * self.current_price
+
+    def calculate_unrealized_pnl(self, current_price: Decimal) -> Decimal:
+        """Calculate unrealized P&L at a given price.
+
+        For YES positions: profit = (current_price - entry_price) * size
+        For NO positions: profit = (entry_price - current_price) * size
+
+        Args:
+            current_price: Current market price.
+
+        Returns:
+            Unrealized profit/loss.
+        """
+        if self.side.upper() == "YES":
+            return (current_price - self.entry_price) * self.size
+        else:
+            return (self.entry_price - current_price) * self.size
 
 
 @dataclass
@@ -1027,15 +1065,22 @@ class StateStore:
     # ============ Position Operations ============
 
     async def save_position(self, position: Position) -> None:
-        """Save a position."""
+        """Save a position.
+
+        Persists all position fields including entry price, size, and P&L tracking.
+
+        Args:
+            position: Position to save.
+        """
         conn = await self._pool.acquire()
         async with self._pool.lock:
             await conn.execute(
                 """
                 INSERT OR REPLACE INTO positions
                 (position_id, market_id, strategy, side, size, entry_price,
-                 status, opened_at, closed_at, exit_price, realized_pnl, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 status, opened_at, closed_at, exit_price, realized_pnl,
+                 unrealized_pnl, current_price, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     position.position_id,
@@ -1049,6 +1094,8 @@ class StateStore:
                     position.closed_at,
                     float(position.exit_price) if position.exit_price else None,
                     float(position.realized_pnl) if position.realized_pnl else None,
+                    float(position.unrealized_pnl) if position.unrealized_pnl else None,
+                    float(position.current_price) if position.current_price else None,
                     datetime.now(timezone.utc),
                 ),
             )
@@ -1058,6 +1105,8 @@ class StateStore:
             "position_saved",
             position_id=position.position_id,
             status=position.status,
+            size=str(position.size),
+            entry_price=str(position.entry_price),
         )
 
     async def get_position(self, position_id: str) -> Optional[Position]:
@@ -1149,8 +1198,168 @@ class StateStore:
             realized_pnl=str(result.realized_pnl),
         )
 
+    async def update_position_unrealized_pnl(
+        self,
+        position_id: str,
+        current_price: Decimal,
+        unrealized_pnl: Optional[Decimal] = None,
+    ) -> None:
+        """Update a position's unrealized P&L based on current price.
+
+        This method should be called periodically to update position valuations
+        based on current market prices. If unrealized_pnl is not provided, it
+        will be calculated automatically based on the position's side and
+        entry price.
+
+        Args:
+            position_id: Position to update.
+            current_price: Current market price.
+            unrealized_pnl: Pre-calculated unrealized P&L (optional).
+        """
+        conn = await self._pool.acquire()
+
+        # If unrealized_pnl not provided, calculate it
+        if unrealized_pnl is None:
+            position = await self.get_position(position_id)
+            if position:
+                unrealized_pnl = position.calculate_unrealized_pnl(current_price)
+            else:
+                self._log.warning(
+                    "position_not_found_for_pnl_update",
+                    position_id=position_id,
+                )
+                return
+
+        async with self._pool.lock:
+            await conn.execute(
+                """
+                UPDATE positions
+                SET unrealized_pnl = ?,
+                    current_price = ?,
+                    updated_at = ?
+                WHERE position_id = ?
+                """,
+                (
+                    float(unrealized_pnl),
+                    float(current_price),
+                    datetime.now(timezone.utc),
+                    position_id,
+                ),
+            )
+            await conn.commit()
+
+        self._log.debug(
+            "position_unrealized_pnl_updated",
+            position_id=position_id,
+            current_price=str(current_price),
+            unrealized_pnl=str(unrealized_pnl),
+        )
+
+    async def get_positions(
+        self,
+        status: Optional[str] = None,
+        market_id: Optional[str] = None,
+        strategy: Optional[str] = None,
+        side: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[Position]:
+        """Get positions with optional filters.
+
+        Args:
+            status: Filter by status ('open', 'closed', etc.).
+            market_id: Filter by market ID.
+            strategy: Filter by strategy name.
+            side: Filter by side ('YES' or 'NO').
+            limit: Maximum number of positions to return.
+
+        Returns:
+            List of positions ordered by opened_at descending.
+        """
+        conn = await self._pool.acquire()
+
+        query = "SELECT * FROM positions WHERE 1=1"
+        params: list[Any] = []
+
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+
+        if market_id:
+            query += " AND market_id = ?"
+            params.append(market_id)
+
+        if strategy:
+            query += " AND strategy = ?"
+            params.append(strategy)
+
+        if side:
+            query += " AND side = ?"
+            params.append(side)
+
+        query += " ORDER BY opened_at DESC LIMIT ?"
+        params.append(limit)
+
+        positions = []
+        async with conn.execute(query, params) as cursor:
+            async for row in cursor:
+                positions.append(self._row_to_position(row))
+
+        return positions
+
+    async def get_position_summary(self) -> dict[str, Any]:
+        """Get summary statistics for all positions.
+
+        Returns:
+            Dict with position statistics including:
+            - total_positions: Total number of positions
+            - open_positions: Number of open positions
+            - closed_positions: Number of closed positions
+            - total_unrealized_pnl: Sum of unrealized P&L for open positions
+            - total_realized_pnl: Sum of realized P&L for closed positions
+            - total_exposure: Sum of cost basis for open positions
+        """
+        conn = await self._pool.acquire()
+
+        async with conn.execute(
+            """
+            SELECT
+                COUNT(*) as total_positions,
+                SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) as open_positions,
+                SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END) as closed_positions,
+                COALESCE(SUM(CASE WHEN status = 'open' THEN unrealized_pnl ELSE 0 END), 0) as total_unrealized_pnl,
+                COALESCE(SUM(CASE WHEN status = 'closed' THEN realized_pnl ELSE 0 END), 0) as total_realized_pnl,
+                COALESCE(SUM(CASE WHEN status = 'open' THEN size * entry_price ELSE 0 END), 0) as total_exposure
+            FROM positions
+            """
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return {
+                    "total_positions": row["total_positions"] or 0,
+                    "open_positions": row["open_positions"] or 0,
+                    "closed_positions": row["closed_positions"] or 0,
+                    "total_unrealized_pnl": Decimal(str(row["total_unrealized_pnl"])),
+                    "total_realized_pnl": Decimal(str(row["total_realized_pnl"])),
+                    "total_exposure": Decimal(str(row["total_exposure"])),
+                }
+            return {
+                "total_positions": 0,
+                "open_positions": 0,
+                "closed_positions": 0,
+                "total_unrealized_pnl": Decimal("0"),
+                "total_realized_pnl": Decimal("0"),
+                "total_exposure": Decimal("0"),
+            }
+
     def _row_to_position(self, row: aiosqlite.Row) -> Position:
         """Convert a database row to Position."""
+        # Helper to safely get value from row (sqlite3.Row doesn't have .get())
+        def get_val(key: str, default=None):
+            try:
+                return row[key] if row[key] is not None else default
+            except (KeyError, IndexError):
+                return default
+
         return Position(
             position_id=row["position_id"],
             market_id=row["market_id"],
@@ -1163,6 +1372,8 @@ class StateStore:
             closed_at=row["closed_at"] if isinstance(row["closed_at"], datetime) else datetime.fromisoformat(row["closed_at"]) if row["closed_at"] else None,
             exit_price=Decimal(str(row["exit_price"])) if row["exit_price"] else None,
             realized_pnl=Decimal(str(row["realized_pnl"])) if row["realized_pnl"] else None,
+            unrealized_pnl=Decimal(str(get_val("unrealized_pnl"))) if get_val("unrealized_pnl") else None,
+            current_price=Decimal(str(get_val("current_price"))) if get_val("current_price") else None,
         )
 
     # ============ Settlement Queue ============
