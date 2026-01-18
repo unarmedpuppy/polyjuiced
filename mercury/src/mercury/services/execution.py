@@ -207,6 +207,7 @@ class ExecutionEngine(BaseComponent):
 
         # State
         self._pending_orders: dict[str, OrderResult] = {}
+        self._open_orders: dict[str, Order] = {}  # Track open orders by order_id
         self._should_run = False
 
         # Queue management
@@ -743,6 +744,23 @@ class ExecutionEngine(BaseComponent):
             event_data["error"] = error
 
         await self._event_bus.publish(event_type, event_data)
+
+        # Track open orders
+        if event_type == "order.submitted" or order.status in (
+            DomainOrderStatus.SUBMITTED,
+            DomainOrderStatus.OPEN,
+            DomainOrderStatus.PARTIALLY_FILLED,
+        ):
+            self._open_orders[order.order_id] = order
+
+        # Remove from tracking on terminal states
+        if order.status in (
+            DomainOrderStatus.FILLED,
+            DomainOrderStatus.CANCELLED,
+            DomainOrderStatus.REJECTED,
+            DomainOrderStatus.EXPIRED,
+        ):
+            self._open_orders.pop(order.order_id, None)
 
         self._log.debug(
             "order_event_emitted",
@@ -1554,21 +1572,176 @@ class ExecutionEngine(BaseComponent):
     async def cancel_order(self, order_id: str) -> bool:
         """Cancel an open order.
 
+        Cancels an order tracked by this execution engine. Updates the order
+        status to CANCELLED and emits an order.cancelled event.
+
         Args:
-            order_id: The order to cancel.
+            order_id: The order ID to cancel.
 
         Returns:
-            True if cancelled.
+            True if cancelled successfully, False if cancel failed or order not found.
+
+        Event channels published:
+            - order.cancelled: Order was successfully cancelled
+            - order.cancel_failed: Order cancellation failed (with error details)
         """
+        self._log.info("cancel_order_requested", order_id=order_id)
+
+        # Check if order is tracked
+        order = self._open_orders.get(order_id)
+
         if self._dry_run:
+            # In dry-run mode, simulate successful cancellation
             self._log.info("dry_run_cancel", order_id=order_id)
+
+            if order:
+                order.status = DomainOrderStatus.CANCELLED
+                order.updated_at = datetime.now(timezone.utc)
+                await self._emit_order_event("order.cancelled", order)
+            else:
+                # Create synthetic order for event emission
+                await self._event_bus.publish("order.cancelled", {
+                    "order_id": order_id,
+                    "status": "cancelled",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "reason": "dry_run_cancel",
+                })
+
             return True
 
-        return await self._clob.cancel_order(order_id)
+        # Attempt to cancel on exchange
+        try:
+            success = await self._clob.cancel_order(order_id)
 
-    def get_open_orders(self) -> list[OrderResult]:
-        """Get all pending orders."""
-        return list(self._pending_orders.values())
+            if success:
+                self._log.info("order_cancelled", order_id=order_id)
+
+                if order:
+                    order.status = DomainOrderStatus.CANCELLED
+                    order.updated_at = datetime.now(timezone.utc)
+                    await self._emit_order_event("order.cancelled", order)
+                else:
+                    # Order not tracked locally but cancelled on exchange
+                    await self._event_bus.publish("order.cancelled", {
+                        "order_id": order_id,
+                        "status": "cancelled",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+
+                return True
+            else:
+                self._log.warning("cancel_failed", order_id=order_id, reason="exchange_rejected")
+                await self._event_bus.publish("order.cancel_failed", {
+                    "order_id": order_id,
+                    "reason": "exchange_rejected",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+                return False
+
+        except Exception as e:
+            self._log.error("cancel_error", order_id=order_id, error=str(e))
+            await self._event_bus.publish("order.cancel_failed", {
+                "order_id": order_id,
+                "reason": str(e),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+            return False
+
+    async def cancel_all(self) -> dict[str, Any]:
+        """Cancel all open orders.
+
+        Attempts to cancel all orders tracked by this execution engine.
+        Returns a summary of the cancellation results.
+
+        Returns:
+            Dictionary with:
+                - total: Total number of orders attempted
+                - cancelled: Number of orders successfully cancelled
+                - failed: Number of orders that failed to cancel
+                - errors: List of error details for failed cancellations
+
+        Event channels published:
+            - order.cancelled: For each successfully cancelled order
+            - order.cancel_failed: For each failed cancellation
+            - order.cancel_all.completed: Summary of bulk cancellation
+        """
+        self._log.info(
+            "cancel_all_requested",
+            open_orders_count=len(self._open_orders),
+        )
+
+        results = {
+            "total": 0,
+            "cancelled": 0,
+            "failed": 0,
+            "errors": [],
+        }
+
+        if not self._open_orders:
+            self._log.info("cancel_all_no_orders")
+            await self._event_bus.publish("order.cancel_all.completed", results)
+            return results
+
+        # Get a snapshot of order IDs to cancel
+        order_ids_to_cancel = list(self._open_orders.keys())
+        results["total"] = len(order_ids_to_cancel)
+
+        # Cancel each order
+        for order_id in order_ids_to_cancel:
+            try:
+                success = await self.cancel_order(order_id)
+                if success:
+                    results["cancelled"] += 1
+                else:
+                    results["failed"] += 1
+                    results["errors"].append({
+                        "order_id": order_id,
+                        "error": "cancel_rejected",
+                    })
+            except Exception as e:
+                results["failed"] += 1
+                results["errors"].append({
+                    "order_id": order_id,
+                    "error": str(e),
+                })
+                self._log.error("cancel_all_error", order_id=order_id, error=str(e))
+
+        self._log.info(
+            "cancel_all_completed",
+            total=results["total"],
+            cancelled=results["cancelled"],
+            failed=results["failed"],
+        )
+
+        await self._event_bus.publish("order.cancel_all.completed", results)
+        return results
+
+    def get_open_orders(self) -> list[Order]:
+        """Get all open orders tracked by this execution engine.
+
+        Returns:
+            List of Order objects that are currently open.
+        """
+        return list(self._open_orders.values())
+
+    def get_open_order(self, order_id: str) -> Optional[Order]:
+        """Get a specific open order by ID.
+
+        Args:
+            order_id: The order ID to look up.
+
+        Returns:
+            The Order if found and open, None otherwise.
+        """
+        return self._open_orders.get(order_id)
+
+    def get_open_order_count(self) -> int:
+        """Get the count of currently open orders.
+
+        Returns:
+            Number of open orders.
+        """
+        return len(self._open_orders)
 
     # =========================================================================
     # Queue Management Public Methods

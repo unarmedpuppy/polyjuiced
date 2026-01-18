@@ -1472,3 +1472,460 @@ class TestDualLegResult:
         )
         assert failed_result.success is False
         assert failed_result.error_message == "Something failed"
+
+
+class TestOrderCancellation:
+    """Test order cancellation functionality."""
+
+    @pytest.mark.asyncio
+    async def test_cancel_order_dry_run_untracked(self, execution_engine, mock_event_bus):
+        """Verify cancel_order works in dry-run mode for untracked orders."""
+        await execution_engine.start()
+
+        result = await execution_engine.cancel_order("unknown-order-id")
+
+        assert result is True
+
+        # Verify cancelled event was published
+        cancelled_calls = [
+            call for call in mock_event_bus.publish.call_args_list
+            if call[0][0] == "order.cancelled"
+        ]
+        assert len(cancelled_calls) == 1
+        event_data = cancelled_calls[0][0][1]
+        assert event_data["order_id"] == "unknown-order-id"
+        assert event_data["status"] == "cancelled"
+        assert "reason" in event_data
+        assert event_data["reason"] == "dry_run_cancel"
+
+        await execution_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_cancel_order_dry_run_tracked(self, execution_engine, mock_event_bus):
+        """Verify cancel_order updates tracked order status in dry-run mode."""
+        await execution_engine.start()
+
+        # First create an order so it gets tracked
+        request = OrderRequest(
+            market_id="test-market",
+            token_id="test-token",
+            side=OrderSide.BUY,
+            outcome="YES",
+            size=Decimal("10.0"),
+            price=Decimal("0.5"),
+            order_type=OrderType.GTC,
+        )
+
+        # Execute order - it will be filled in dry-run mode
+        result = await execution_engine.execute_order(request)
+        order_id = result.order.order_id
+
+        # In dry-run mode, the order gets filled immediately, so won't be in open orders
+        # Let's manually add an open order for testing
+        from mercury.domain.order import Order, OrderStatus
+        open_order = Order(
+            order_id="test-open-order",
+            market_id="test-market",
+            token_id="test-token",
+            side=OrderSide.BUY,
+            outcome="YES",
+            requested_size=Decimal("10.0"),
+            filled_size=Decimal("0"),
+            price=Decimal("0.5"),
+            status=OrderStatus.OPEN,
+        )
+        execution_engine._open_orders["test-open-order"] = open_order
+
+        # Now cancel the tracked order
+        mock_event_bus.publish.reset_mock()
+        cancel_result = await execution_engine.cancel_order("test-open-order")
+
+        assert cancel_result is True
+        assert open_order.status == OrderStatus.CANCELLED
+        assert "test-open-order" not in execution_engine._open_orders
+
+        await execution_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_cancel_order_non_dry_run_success(self, mock_config, mock_event_bus, mock_clob):
+        """Verify cancel_order calls CLOB and emits event on success."""
+        mock_config.get_bool.side_effect = lambda key, default: {
+            "mercury.dry_run": False,
+            "execution.rebalance_partial_fills": True,
+        }.get(key, default)
+
+        mock_clob.cancel_order = AsyncMock(return_value=True)
+        mock_clob._connected = True
+
+        engine = ExecutionEngine(
+            config=mock_config,
+            event_bus=mock_event_bus,
+            clob_client=mock_clob,
+        )
+        await engine.start()
+
+        result = await engine.cancel_order("order-to-cancel")
+
+        assert result is True
+        mock_clob.cancel_order.assert_called_once_with("order-to-cancel")
+
+        # Verify cancelled event was published
+        cancelled_calls = [
+            call for call in mock_event_bus.publish.call_args_list
+            if call[0][0] == "order.cancelled"
+        ]
+        assert len(cancelled_calls) == 1
+        assert cancelled_calls[0][0][1]["order_id"] == "order-to-cancel"
+
+        await engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_cancel_order_non_dry_run_failure(self, mock_config, mock_event_bus, mock_clob):
+        """Verify cancel_order handles CLOB rejection gracefully."""
+        mock_config.get_bool.side_effect = lambda key, default: {
+            "mercury.dry_run": False,
+            "execution.rebalance_partial_fills": True,
+        }.get(key, default)
+
+        mock_clob.cancel_order = AsyncMock(return_value=False)
+        mock_clob._connected = True
+
+        engine = ExecutionEngine(
+            config=mock_config,
+            event_bus=mock_event_bus,
+            clob_client=mock_clob,
+        )
+        await engine.start()
+
+        result = await engine.cancel_order("order-to-cancel")
+
+        assert result is False
+
+        # Verify cancel_failed event was published
+        failed_calls = [
+            call for call in mock_event_bus.publish.call_args_list
+            if call[0][0] == "order.cancel_failed"
+        ]
+        assert len(failed_calls) == 1
+        event_data = failed_calls[0][0][1]
+        assert event_data["order_id"] == "order-to-cancel"
+        assert event_data["reason"] == "exchange_rejected"
+
+        await engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_cancel_order_non_dry_run_exception(self, mock_config, mock_event_bus, mock_clob):
+        """Verify cancel_order handles CLOB exceptions gracefully."""
+        mock_config.get_bool.side_effect = lambda key, default: {
+            "mercury.dry_run": False,
+            "execution.rebalance_partial_fills": True,
+        }.get(key, default)
+
+        mock_clob.cancel_order = AsyncMock(side_effect=Exception("Network error"))
+        mock_clob._connected = True
+
+        engine = ExecutionEngine(
+            config=mock_config,
+            event_bus=mock_event_bus,
+            clob_client=mock_clob,
+        )
+        await engine.start()
+
+        result = await engine.cancel_order("order-to-cancel")
+
+        assert result is False
+
+        # Verify cancel_failed event was published with exception details
+        failed_calls = [
+            call for call in mock_event_bus.publish.call_args_list
+            if call[0][0] == "order.cancel_failed"
+        ]
+        assert len(failed_calls) == 1
+        event_data = failed_calls[0][0][1]
+        assert event_data["order_id"] == "order-to-cancel"
+        assert "Network error" in event_data["reason"]
+
+        await engine.stop()
+
+
+class TestCancelAll:
+    """Test cancel_all functionality."""
+
+    @pytest.mark.asyncio
+    async def test_cancel_all_no_orders(self, execution_engine, mock_event_bus):
+        """Verify cancel_all handles empty order list."""
+        await execution_engine.start()
+
+        result = await execution_engine.cancel_all()
+
+        assert result["total"] == 0
+        assert result["cancelled"] == 0
+        assert result["failed"] == 0
+        assert result["errors"] == []
+
+        # Verify completed event was published
+        completed_calls = [
+            call for call in mock_event_bus.publish.call_args_list
+            if call[0][0] == "order.cancel_all.completed"
+        ]
+        assert len(completed_calls) == 1
+
+        await execution_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_cancel_all_multiple_orders(self, execution_engine, mock_event_bus):
+        """Verify cancel_all cancels all tracked orders."""
+        await execution_engine.start()
+
+        # Add some open orders
+        from mercury.domain.order import Order, OrderStatus
+        for i in range(3):
+            order = Order(
+                order_id=f"open-order-{i}",
+                market_id="test-market",
+                token_id="test-token",
+                side=OrderSide.BUY,
+                outcome="YES",
+                requested_size=Decimal("10.0"),
+                filled_size=Decimal("0"),
+                price=Decimal("0.5"),
+                status=OrderStatus.OPEN,
+            )
+            execution_engine._open_orders[f"open-order-{i}"] = order
+
+        mock_event_bus.publish.reset_mock()
+        result = await execution_engine.cancel_all()
+
+        assert result["total"] == 3
+        assert result["cancelled"] == 3
+        assert result["failed"] == 0
+        assert result["errors"] == []
+        assert len(execution_engine._open_orders) == 0
+
+        # Verify cancelled events were published for each order
+        cancelled_calls = [
+            call for call in mock_event_bus.publish.call_args_list
+            if call[0][0] == "order.cancelled"
+        ]
+        assert len(cancelled_calls) == 3
+
+        await execution_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_cancel_all_partial_failure(self, mock_config, mock_event_bus, mock_clob):
+        """Verify cancel_all handles partial failures."""
+        mock_config.get_bool.side_effect = lambda key, default: {
+            "mercury.dry_run": False,
+            "execution.rebalance_partial_fills": True,
+        }.get(key, default)
+
+        # First cancel succeeds, second fails
+        mock_clob.cancel_order = AsyncMock(side_effect=[True, False, True])
+        mock_clob._connected = True
+
+        engine = ExecutionEngine(
+            config=mock_config,
+            event_bus=mock_event_bus,
+            clob_client=mock_clob,
+        )
+        await engine.start()
+
+        # Add some open orders
+        from mercury.domain.order import Order, OrderStatus
+        for i in range(3):
+            order = Order(
+                order_id=f"open-order-{i}",
+                market_id="test-market",
+                token_id="test-token",
+                side=OrderSide.BUY,
+                outcome="YES",
+                requested_size=Decimal("10.0"),
+                filled_size=Decimal("0"),
+                price=Decimal("0.5"),
+                status=OrderStatus.OPEN,
+            )
+            engine._open_orders[f"open-order-{i}"] = order
+
+        mock_event_bus.publish.reset_mock()
+        result = await engine.cancel_all()
+
+        assert result["total"] == 3
+        assert result["cancelled"] == 2
+        assert result["failed"] == 1
+        assert len(result["errors"]) == 1
+        assert result["errors"][0]["order_id"] == "open-order-1"
+
+        await engine.stop()
+
+
+class TestOpenOrderTracking:
+    """Test open order tracking."""
+
+    @pytest.mark.asyncio
+    async def test_get_open_orders(self, execution_engine):
+        """Verify get_open_orders returns tracked orders."""
+        await execution_engine.start()
+
+        # Initially empty
+        assert execution_engine.get_open_orders() == []
+        assert execution_engine.get_open_order_count() == 0
+
+        # Add some orders
+        from mercury.domain.order import Order, OrderStatus
+        order1 = Order(
+            order_id="order-1",
+            market_id="market-1",
+            token_id="token-1",
+            side=OrderSide.BUY,
+            outcome="YES",
+            requested_size=Decimal("10.0"),
+            filled_size=Decimal("0"),
+            price=Decimal("0.5"),
+            status=OrderStatus.OPEN,
+        )
+        order2 = Order(
+            order_id="order-2",
+            market_id="market-2",
+            token_id="token-2",
+            side=OrderSide.SELL,
+            outcome="NO",
+            requested_size=Decimal("5.0"),
+            filled_size=Decimal("0"),
+            price=Decimal("0.6"),
+            status=OrderStatus.SUBMITTED,
+        )
+        execution_engine._open_orders["order-1"] = order1
+        execution_engine._open_orders["order-2"] = order2
+
+        orders = execution_engine.get_open_orders()
+        assert len(orders) == 2
+        assert execution_engine.get_open_order_count() == 2
+
+        await execution_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_get_open_order(self, execution_engine):
+        """Verify get_open_order retrieves specific order."""
+        await execution_engine.start()
+
+        from mercury.domain.order import Order, OrderStatus
+        order = Order(
+            order_id="specific-order",
+            market_id="test-market",
+            token_id="test-token",
+            side=OrderSide.BUY,
+            outcome="YES",
+            requested_size=Decimal("10.0"),
+            filled_size=Decimal("0"),
+            price=Decimal("0.5"),
+            status=OrderStatus.OPEN,
+        )
+        execution_engine._open_orders["specific-order"] = order
+
+        # Found
+        found = execution_engine.get_open_order("specific-order")
+        assert found is not None
+        assert found.order_id == "specific-order"
+
+        # Not found
+        not_found = execution_engine.get_open_order("nonexistent-order")
+        assert not_found is None
+
+        await execution_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_order_tracking_on_submission(self, execution_engine, mock_event_bus):
+        """Verify orders are tracked on submission event."""
+        await execution_engine.start()
+
+        # The order tracking happens in _emit_order_event
+        from mercury.domain.order import Order, OrderStatus
+        order = Order(
+            order_id="tracked-order",
+            market_id="test-market",
+            token_id="test-token",
+            side=OrderSide.BUY,
+            outcome="YES",
+            requested_size=Decimal("10.0"),
+            filled_size=Decimal("0"),
+            price=Decimal("0.5"),
+            status=OrderStatus.SUBMITTED,
+        )
+
+        # Initially not tracked
+        assert "tracked-order" not in execution_engine._open_orders
+
+        # Emit submitted event
+        await execution_engine._emit_order_event("order.submitted", order)
+
+        # Now tracked
+        assert "tracked-order" in execution_engine._open_orders
+
+        await execution_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_order_untracked_on_terminal_status(self, execution_engine, mock_event_bus):
+        """Verify orders are untracked on terminal status."""
+        await execution_engine.start()
+
+        from mercury.domain.order import Order, OrderStatus
+
+        # Add an order
+        order = Order(
+            order_id="tracked-order",
+            market_id="test-market",
+            token_id="test-token",
+            side=OrderSide.BUY,
+            outcome="YES",
+            requested_size=Decimal("10.0"),
+            filled_size=Decimal("10.0"),
+            price=Decimal("0.5"),
+            status=OrderStatus.OPEN,
+        )
+        execution_engine._open_orders["tracked-order"] = order
+
+        # Update to filled
+        order.status = OrderStatus.FILLED
+        await execution_engine._emit_order_event("order.filled", order)
+
+        # Should be untracked
+        assert "tracked-order" not in execution_engine._open_orders
+
+        await execution_engine.stop()
+
+    @pytest.mark.asyncio
+    async def test_terminal_states_untrack_orders(self, execution_engine, mock_event_bus):
+        """Verify all terminal states untrack orders."""
+        await execution_engine.start()
+
+        from mercury.domain.order import Order, OrderStatus
+
+        terminal_states = [
+            OrderStatus.FILLED,
+            OrderStatus.CANCELLED,
+            OrderStatus.REJECTED,
+            OrderStatus.EXPIRED,
+        ]
+
+        for status in terminal_states:
+            order = Order(
+                order_id=f"order-{status.value}",
+                market_id="test-market",
+                token_id="test-token",
+                side=OrderSide.BUY,
+                outcome="YES",
+                requested_size=Decimal("10.0"),
+                filled_size=Decimal("0"),
+                price=Decimal("0.5"),
+                status=OrderStatus.OPEN,
+            )
+            execution_engine._open_orders[f"order-{status.value}"] = order
+
+            # Update to terminal status
+            order.status = status
+            await execution_engine._emit_order_event(f"order.{status.value}", order)
+
+            # Should be untracked
+            assert f"order-{status.value}" not in execution_engine._open_orders
+
+        await execution_engine.stop()
