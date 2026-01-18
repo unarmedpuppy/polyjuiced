@@ -9,6 +9,7 @@ This service:
 
 import asyncio
 import time
+from datetime import datetime
 from typing import Dict, List, Optional, Set
 
 import structlog
@@ -73,7 +74,6 @@ class StrategyEngine(BaseComponent):
 
     async def start(self) -> None:
         """Start the strategy engine."""
-        self._start_time = time.time()
         self._should_run = True
         self._log.info("starting_strategy_engine")
 
@@ -96,6 +96,10 @@ class StrategyEngine(BaseComponent):
             enabled=len(self.enabled_strategies),
         )
 
+        # Set running state
+        self._running = True
+        self._started_at = datetime.utcnow()
+
     async def stop(self) -> None:
         """Stop the strategy engine."""
         self._should_run = False
@@ -109,6 +113,7 @@ class StrategyEngine(BaseComponent):
                 self._log.warning("strategy_stop_error", name=name, error=str(e))
 
         self._log.info("strategy_engine_stopped")
+        self._running = False
 
     async def health_check(self) -> HealthCheckResult:
         """Check strategy engine health."""
@@ -185,6 +190,18 @@ class StrategyEngine(BaseComponent):
         """Get a strategy by name."""
         return self._strategies.get(name)
 
+    def is_strategy_enabled(self, name: str) -> bool:
+        """Check if a strategy is enabled.
+
+        Args:
+            name: Strategy name.
+
+        Returns:
+            True if strategy exists and is enabled.
+        """
+        strategy = self._strategies.get(name)
+        return strategy is not None and strategy.enabled
+
     async def enable_strategy(self, name: str) -> bool:
         """Enable a strategy at runtime.
 
@@ -233,21 +250,43 @@ class StrategyEngine(BaseComponent):
 
         # Build OrderBook from data
         from decimal import Decimal
-        from mercury.integrations.polymarket.types import OrderBookData, OrderBookLevel, OrderBookSnapshot
-        from datetime import datetime
+        from mercury.domain.market import OrderBookLevel
 
-        yes_bid = Decimal(data["yes_bid"]) if data.get("yes_bid") else None
-        yes_ask = Decimal(data["yes_ask"]) if data.get("yes_ask") else None
-        no_bid = Decimal(data["no_bid"]) if data.get("no_bid") else None
-        no_ask = Decimal(data["no_ask"]) if data.get("no_ask") else None
+        # Parse price data into OrderBookLevel lists
+        yes_bids = []
+        yes_asks = []
+        no_bids = []
+        no_asks = []
 
-        # Create a simple OrderBook representation
+        if data.get("yes_bid"):
+            yes_bids.append(OrderBookLevel(
+                price=Decimal(data["yes_bid"]),
+                size=Decimal(data.get("yes_bid_size", "100"))
+            ))
+        if data.get("yes_ask"):
+            yes_asks.append(OrderBookLevel(
+                price=Decimal(data["yes_ask"]),
+                size=Decimal(data.get("yes_ask_size", "100"))
+            ))
+        if data.get("no_bid"):
+            no_bids.append(OrderBookLevel(
+                price=Decimal(data["no_bid"]),
+                size=Decimal(data.get("no_bid_size", "100"))
+            ))
+        if data.get("no_ask"):
+            no_asks.append(OrderBookLevel(
+                price=Decimal(data["no_ask"]),
+                size=Decimal(data.get("no_ask_size", "100"))
+            ))
+
+        # Create OrderBook with level lists
         book = OrderBook(
             market_id=market_id,
-            yes_best_bid=yes_bid,
-            yes_best_ask=yes_ask,
-            no_best_bid=no_bid,
-            no_best_ask=no_ask,
+            yes_bids=yes_bids,
+            yes_asks=yes_asks,
+            no_bids=no_bids,
+            no_asks=no_asks,
+            timestamp=datetime.utcnow(),
         )
 
         # Route to each strategy
@@ -287,8 +326,6 @@ class StrategyEngine(BaseComponent):
                 "target_size_usd": str(signal.target_size_usd),
                 "yes_price": str(signal.yes_price),
                 "no_price": str(signal.no_price),
-                "yes_token_id": signal.yes_token_id,
-                "no_token_id": signal.no_token_id,
                 "confidence": signal.confidence,
                 "metadata": signal.metadata,
             }
