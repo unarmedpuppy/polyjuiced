@@ -19,6 +19,18 @@ from mercury.integrations.polymarket.types import (
     WebSocketMessage,
 )
 
+from mercury.integrations.polymarket.clob import (
+    CLOBClient,
+    CLOBClientError,
+    OrderRejectedError,
+    OrderTimeoutError,
+    InsufficientLiquidityError,
+    InsufficientBalanceError,
+    ArbitrageInvalidError,
+    OrderSigningError,
+    BatchOrderError,
+)
+
 __all__ = [
     # Enums
     "OrderSide",
@@ -39,4 +51,15 @@ __all__ = [
     "OrderResult",
     "DualLegOrderResult",
     "PositionInfo",
+    # CLOB Client
+    "CLOBClient",
+    # Errors
+    "CLOBClientError",
+    "OrderRejectedError",
+    "OrderTimeoutError",
+    "InsufficientLiquidityError",
+    "InsufficientBalanceError",
+    "ArbitrageInvalidError",
+    "OrderSigningError",
+    "BatchOrderError",
 ]
