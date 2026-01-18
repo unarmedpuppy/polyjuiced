@@ -48,6 +48,42 @@ class TestStateStoreImport:
 
         assert ConnectionPool is not None
 
+    def test_migration_runner_importable(self):
+        """Verify MigrationRunner class can be imported."""
+        from mercury.services.state_store import MigrationRunner
+
+        assert MigrationRunner is not None
+
+    def test_fill_record_importable(self):
+        """Verify FillRecord model can be imported."""
+        from mercury.services.state_store import FillRecord
+
+        assert FillRecord is not None
+
+    def test_trade_telemetry_importable(self):
+        """Verify TradeTelemetry model can be imported."""
+        from mercury.services.state_store import TradeTelemetry
+
+        assert TradeTelemetry is not None
+
+    def test_rebalance_trade_importable(self):
+        """Verify RebalanceTrade model can be imported."""
+        from mercury.services.state_store import RebalanceTrade
+
+        assert RebalanceTrade is not None
+
+    def test_circuit_breaker_state_importable(self):
+        """Verify CircuitBreakerState model can be imported."""
+        from mercury.services.state_store import CircuitBreakerState
+
+        assert CircuitBreakerState is not None
+
+    def test_realized_pnl_entry_importable(self):
+        """Verify RealizedPnlEntry model can be imported."""
+        from mercury.services.state_store import RealizedPnlEntry
+
+        assert RealizedPnlEntry is not None
+
 
 class TestConnectionPool:
     """Test ConnectionPool functionality."""
@@ -151,6 +187,12 @@ class TestStateStoreConnection:
         assert "daily_stats" in tables
         assert "fills" in tables
         assert "schema_version" in tables
+        # New tables from migration
+        assert "fill_records" in tables
+        assert "trade_telemetry" in tables
+        assert "rebalance_trades" in tables
+        assert "circuit_breaker_state" in tables
+        assert "realized_pnl_ledger" in tables
 
         await store.close()
 
@@ -168,6 +210,7 @@ class TestStateStoreConnection:
 
         assert health["status"] == "healthy"
         assert "Database connected" in health["message"]
+        assert health["schema_version"] == 2
 
         await store.close()
 
@@ -220,6 +263,54 @@ class TestTradeOperations:
         assert retrieved.size == Decimal("10.0")
         assert retrieved.price == Decimal("0.50")
         assert retrieved.cost == Decimal("5.0")
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_save_trade_with_enhanced_fields(self, tmp_path):
+        """Test saving trade with enhanced fields from legacy."""
+        from mercury.services.state_store import StateStore, Trade
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        trade = Trade(
+            trade_id="test-trade-enhanced",
+            market_id="test-market",
+            strategy="gabagool",
+            side="YES",
+            size=Decimal("10.0"),
+            price=Decimal("0.50"),
+            cost=Decimal("5.0"),
+            # Enhanced fields
+            condition_id="cond-123",
+            asset="BTC",
+            yes_price=Decimal("0.52"),
+            no_price=Decimal("0.48"),
+            spread=Decimal("0.04"),
+            expected_profit=Decimal("0.10"),
+            hedge_ratio=Decimal("1.0"),
+            execution_status="FILLED",
+            yes_liquidity_at_price=Decimal("100.0"),
+            no_liquidity_at_price=Decimal("120.0"),
+        )
+
+        await store.save_trade(trade)
+
+        retrieved = await store.get_trade("test-trade-enhanced")
+
+        assert retrieved is not None
+        assert retrieved.condition_id == "cond-123"
+        assert retrieved.asset == "BTC"
+        assert retrieved.yes_price == Decimal("0.52")
+        assert retrieved.no_price == Decimal("0.48")
+        assert retrieved.spread == Decimal("0.04")
+        assert retrieved.expected_profit == Decimal("0.10")
+        assert retrieved.hedge_ratio == Decimal("1.0")
+        assert retrieved.execution_status == "FILLED"
+        assert retrieved.yes_liquidity_at_price == Decimal("100.0")
+        assert retrieved.no_liquidity_at_price == Decimal("120.0")
 
         await store.close()
 
@@ -279,6 +370,40 @@ class TestTradeOperations:
         result = await store.get_trade("non-existent-trade")
 
         assert result is None
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_resolve_trade(self, tmp_path):
+        """Test resolving a trade with profit."""
+        from mercury.services.state_store import StateStore, Trade
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        trade = Trade(
+            trade_id="trade-to-resolve",
+            market_id="test-market",
+            strategy="gabagool",
+            side="YES",
+            size=Decimal("10.0"),
+            price=Decimal("0.50"),
+            cost=Decimal("5.0"),
+        )
+        await store.save_trade(trade)
+
+        # Resolve the trade
+        await store.resolve_trade(
+            trade_id="trade-to-resolve",
+            actual_profit=Decimal("2.50"),
+            status="resolved",
+        )
+
+        retrieved = await store.get_trade("trade-to-resolve")
+        assert retrieved.status == "resolved"
+        assert retrieved.actual_profit == Decimal("2.50")
+        assert retrieved.resolved_at is not None
 
         await store.close()
 
@@ -432,6 +557,37 @@ class TestSettlementQueue:
         await store.close()
 
     @pytest.mark.asyncio
+    async def test_queue_for_settlement_with_enhanced_fields(self, tmp_path):
+        """Test settlement queue with enhanced fields from legacy."""
+        from mercury.services.state_store import StateStore, Position
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        position = Position(
+            position_id="settle-pos-enhanced",
+            market_id="test-market",
+            strategy="gabagool",
+            side="YES",
+            size=Decimal("10.0"),
+            entry_price=Decimal("0.50"),
+        )
+
+        await store.queue_for_settlement(
+            position,
+            condition_id="cond-123",
+            token_id="token-abc",
+            asset="BTC",
+            market_end_time=datetime.now(timezone.utc),
+        )
+
+        claimable = await store.get_claimable_positions()
+        assert any(p.position_id == "settle-pos-enhanced" for p in claimable)
+
+        await store.close()
+
+    @pytest.mark.asyncio
     async def test_mark_claimed(self, tmp_path):
         """Test marking position as claimed."""
         from mercury.services.state_store import StateStore, Position
@@ -456,11 +612,38 @@ class TestSettlementQueue:
         assert any(p.position_id == "settle-claim-1" for p in claimable)
 
         # Mark as claimed
-        await store.mark_claimed("settle-claim-1", proceeds=Decimal("10.0"))
+        await store.mark_claimed("settle-claim-1", proceeds=Decimal("10.0"), profit=Decimal("5.0"))
 
         # Verify no longer claimable
         claimable = await store.get_claimable_positions()
         assert not any(p.position_id == "settle-claim-1" for p in claimable)
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_record_claim_attempt(self, tmp_path):
+        """Test recording claim attempt."""
+        from mercury.services.state_store import StateStore, Position
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        position = Position(
+            position_id="settle-attempt-1",
+            market_id="test-market",
+            strategy="gabagool",
+            side="YES",
+            size=Decimal("10.0"),
+            entry_price=Decimal("0.50"),
+        )
+
+        await store.queue_for_settlement(position)
+        await store.record_claim_attempt("settle-attempt-1", error="Network timeout")
+
+        # Should still be claimable with fewer than max attempts
+        claimable = await store.get_claimable_positions(max_attempts=5)
+        assert any(p.position_id == "settle-attempt-1" for p in claimable)
 
         await store.close()
 
@@ -522,6 +705,43 @@ class TestDailyStats:
         await store.close()
 
     @pytest.mark.asyncio
+    async def test_update_daily_stats_with_enhanced_fields(self, tmp_path):
+        """Test updating daily stats with enhanced fields from legacy."""
+        from mercury.services.state_store import StateStore, DailyStats
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        today = date.today()
+
+        stats = DailyStats(
+            date=today,
+            trade_count=5,
+            volume_usd=Decimal("100.0"),
+            realized_pnl=Decimal("10.5"),
+            positions_opened=3,
+            positions_closed=2,
+            wins=3,
+            losses=2,
+            exposure=Decimal("50.0"),
+            opportunities_detected=20,
+            opportunities_executed=5,
+        )
+
+        await store.update_daily_stats(stats)
+
+        retrieved = await store.get_daily_stats(today)
+
+        assert retrieved.wins == 3
+        assert retrieved.losses == 2
+        assert retrieved.exposure == Decimal("50.0")
+        assert retrieved.opportunities_detected == 20
+        assert retrieved.opportunities_executed == 5
+
+        await store.close()
+
+    @pytest.mark.asyncio
     async def test_increment_daily_stats(self, tmp_path):
         """Test incrementing daily stats."""
         from mercury.services.state_store import StateStore
@@ -579,6 +799,388 @@ class TestFillOperations:
         async with conn.execute("SELECT COUNT(*) FROM fills") as cursor:
             row = await cursor.fetchone()
             assert row[0] == 1
+
+        await store.close()
+
+
+class TestFillRecords:
+    """Test detailed fill records for slippage analysis."""
+
+    @pytest.mark.asyncio
+    async def test_save_fill_record(self, tmp_path):
+        """Test saving a detailed fill record."""
+        from mercury.services.state_store import StateStore, FillRecord
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        record = FillRecord(
+            token_id="token-123",
+            condition_id="cond-123",
+            asset="BTC",
+            side="BUY",
+            intended_size=Decimal("10.0"),
+            filled_size=Decimal("9.5"),
+            intended_price=Decimal("0.50"),
+            actual_avg_price=Decimal("0.51"),
+            time_to_fill_ms=150,
+            slippage=Decimal("0.02"),
+            pre_fill_depth=Decimal("100.0"),
+            post_fill_depth=Decimal("90.5"),
+        )
+
+        record_id = await store.save_fill_record(record)
+        assert record_id > 0
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_get_fill_records(self, tmp_path):
+        """Test retrieving fill records."""
+        from mercury.services.state_store import StateStore, FillRecord
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        # Save some records
+        for i in range(3):
+            record = FillRecord(
+                token_id="token-123",
+                condition_id="cond-123",
+                asset="BTC" if i < 2 else "ETH",
+                side="BUY",
+                intended_size=Decimal("10.0"),
+                filled_size=Decimal("9.5"),
+                intended_price=Decimal("0.50"),
+                actual_avg_price=Decimal("0.51"),
+                time_to_fill_ms=150 + i * 10,
+                slippage=Decimal("0.02"),
+                pre_fill_depth=Decimal("100.0"),
+            )
+            await store.save_fill_record(record)
+
+        # Get all
+        records = await store.get_fill_records()
+        assert len(records) == 3
+
+        # Filter by asset
+        btc_records = await store.get_fill_records(asset="BTC")
+        assert len(btc_records) == 2
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_get_slippage_stats(self, tmp_path):
+        """Test slippage statistics aggregation."""
+        from mercury.services.state_store import StateStore, FillRecord
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        # Save some records
+        for i in range(3):
+            record = FillRecord(
+                token_id="token-123",
+                condition_id="cond-123",
+                asset="BTC",
+                side="BUY",
+                intended_size=Decimal("10.0"),
+                filled_size=Decimal("9.5"),
+                intended_price=Decimal("0.50"),
+                actual_avg_price=Decimal("0.51"),
+                time_to_fill_ms=100 + i * 50,
+                slippage=Decimal(str(0.01 + i * 0.01)),  # 0.01, 0.02, 0.03
+                pre_fill_depth=Decimal("100.0"),
+            )
+            await store.save_fill_record(record)
+
+        stats = await store.get_slippage_stats(lookback_minutes=60)
+
+        assert stats["fill_count"] == 3
+        assert stats["avg_slippage"] is not None
+        assert stats["total_volume"] > 0
+
+        await store.close()
+
+
+class TestTradeTelemetry:
+    """Test trade telemetry operations."""
+
+    @pytest.mark.asyncio
+    async def test_save_and_get_trade_telemetry(self, tmp_path):
+        """Test saving and retrieving trade telemetry."""
+        from mercury.services.state_store import StateStore, TradeTelemetry
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        telemetry = TradeTelemetry(
+            trade_id="trade-tel-1",
+            opportunity_detected_at=datetime.now(timezone.utc),
+            opportunity_spread=Decimal("0.05"),
+            opportunity_yes_price=Decimal("0.52"),
+            opportunity_no_price=Decimal("0.47"),
+            execution_latency_ms=Decimal("50.5"),
+            initial_hedge_ratio=Decimal("1.0"),
+            rebalance_attempts=2,
+        )
+
+        await store.save_trade_telemetry(telemetry)
+
+        retrieved = await store.get_trade_telemetry("trade-tel-1")
+
+        assert retrieved is not None
+        assert retrieved.trade_id == "trade-tel-1"
+        assert retrieved.opportunity_spread == Decimal("0.05")
+        assert retrieved.opportunity_yes_price == Decimal("0.52")
+        assert retrieved.execution_latency_ms == Decimal("50.5")
+        assert retrieved.rebalance_attempts == 2
+
+        await store.close()
+
+
+class TestRebalanceTrades:
+    """Test rebalance trade operations."""
+
+    @pytest.mark.asyncio
+    async def test_save_and_get_rebalance_trades(self, tmp_path):
+        """Test saving and retrieving rebalance trades."""
+        from mercury.services.state_store import StateStore, RebalanceTrade
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        rebalance = RebalanceTrade(
+            trade_id="parent-trade-1",
+            action="SELL_YES",
+            shares=Decimal("5.0"),
+            price=Decimal("0.60"),
+            status="SUCCESS",
+            filled_shares=Decimal("5.0"),
+            profit=Decimal("0.50"),
+        )
+
+        record_id = await store.save_rebalance_trade(rebalance)
+        assert record_id > 0
+
+        # Save another
+        rebalance2 = RebalanceTrade(
+            trade_id="parent-trade-1",
+            action="BUY_NO",
+            shares=Decimal("3.0"),
+            price=Decimal("0.45"),
+            status="PARTIAL",
+            filled_shares=Decimal("2.5"),
+            error="Insufficient liquidity",
+        )
+        await store.save_rebalance_trade(rebalance2)
+
+        # Retrieve
+        trades = await store.get_rebalance_trades("parent-trade-1")
+        assert len(trades) == 2
+        assert trades[0].action == "SELL_YES"
+        assert trades[1].action == "BUY_NO"
+        assert trades[1].error == "Insufficient liquidity"
+
+        await store.close()
+
+
+class TestCircuitBreaker:
+    """Test circuit breaker operations."""
+
+    @pytest.mark.asyncio
+    async def test_get_circuit_breaker_state(self, tmp_path):
+        """Test getting circuit breaker state."""
+        from mercury.services.state_store import StateStore
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        state = await store.get_circuit_breaker_state()
+
+        assert state is not None
+        assert state.realized_pnl == Decimal("0")
+        assert state.circuit_breaker_hit is False
+        assert state.total_trades_today == 0
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_record_realized_pnl(self, tmp_path):
+        """Test recording realized P&L."""
+        from mercury.services.state_store import StateStore
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        # Record profit
+        state = await store.record_realized_pnl(
+            trade_id="trade-pnl-1",
+            pnl_amount=Decimal("10.0"),
+            pnl_type="resolution",
+            max_daily_loss=Decimal("100.0"),
+        )
+
+        assert state.realized_pnl == Decimal("10.0")
+        assert state.total_trades_today == 1
+        assert state.circuit_breaker_hit is False
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_circuit_breaker_triggers(self, tmp_path):
+        """Test circuit breaker triggers on loss limit."""
+        from mercury.services.state_store import StateStore
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        # Record large loss
+        state = await store.record_realized_pnl(
+            trade_id="trade-loss-1",
+            pnl_amount=Decimal("-150.0"),
+            pnl_type="resolution",
+            max_daily_loss=Decimal("100.0"),
+        )
+
+        assert state.realized_pnl == Decimal("-150.0")
+        assert state.circuit_breaker_hit is True
+        assert state.hit_reason is not None
+        assert "Daily loss limit exceeded" in state.hit_reason
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_reset_circuit_breaker(self, tmp_path):
+        """Test manually resetting circuit breaker."""
+        from mercury.services.state_store import StateStore
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        # Trigger circuit breaker
+        await store.record_realized_pnl(
+            trade_id="trade-loss-reset",
+            pnl_amount=Decimal("-150.0"),
+            pnl_type="resolution",
+            max_daily_loss=Decimal("100.0"),
+        )
+
+        # Reset
+        await store.reset_circuit_breaker(reason="Testing reset")
+
+        state = await store.get_circuit_breaker_state()
+        assert state.circuit_breaker_hit is False
+        assert state.realized_pnl == Decimal("-150.0")  # P&L preserved
+
+        await store.close()
+
+
+class TestRealizedPnlLedger:
+    """Test realized P&L ledger operations."""
+
+    @pytest.mark.asyncio
+    async def test_get_total_realized_pnl(self, tmp_path):
+        """Test getting total realized P&L."""
+        from mercury.services.state_store import StateStore
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        # Record some P&L
+        await store.record_realized_pnl("trade-1", Decimal("10.0"), "resolution", Decimal("100.0"))
+        await store.record_realized_pnl("trade-2", Decimal("-5.0"), "settlement", Decimal("100.0"))
+        await store.record_realized_pnl("trade-3", Decimal("3.0"), "rebalance", Decimal("100.0"))
+
+        total = await store.get_total_realized_pnl()
+        assert total == Decimal("8.0")
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_get_pnl_by_type(self, tmp_path):
+        """Test getting P&L breakdown by type."""
+        from mercury.services.state_store import StateStore
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        # Record P&L of different types
+        await store.record_realized_pnl("trade-a", Decimal("10.0"), "resolution", Decimal("100.0"))
+        await store.record_realized_pnl("trade-b", Decimal("-5.0"), "settlement", Decimal("100.0"))
+        await store.record_realized_pnl("trade-c", Decimal("3.0"), "rebalance", Decimal("100.0"))
+
+        by_type = await store.get_pnl_by_type()
+
+        assert by_type["resolution"] == Decimal("10.0")
+        assert by_type["settlement"] == Decimal("-5.0")
+        assert by_type["rebalance"] == Decimal("3.0")
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_get_daily_pnl_breakdown(self, tmp_path):
+        """Test getting daily P&L breakdown."""
+        from mercury.services.state_store import StateStore
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        # Record some P&L
+        await store.record_realized_pnl("trade-day-1", Decimal("10.0"), "resolution", Decimal("100.0"), notes="First trade")
+        await store.record_realized_pnl("trade-day-2", Decimal("5.0"), "settlement", Decimal("100.0"))
+
+        entries = await store.get_daily_pnl_breakdown()
+
+        assert len(entries) == 2
+        assert entries[0].trade_id == "trade-day-1"
+        assert entries[0].pnl_amount == Decimal("10.0")
+        assert entries[0].notes == "First trade"
+
+        await store.close()
+
+
+class TestDatabaseStatistics:
+    """Test database statistics."""
+
+    @pytest.mark.asyncio
+    async def test_get_database_stats(self, tmp_path):
+        """Test getting database statistics."""
+        from mercury.services.state_store import StateStore, Trade
+
+        db_path = str(tmp_path / "test.db")
+        store = StateStore(db_path=db_path)
+        await store.connect()
+
+        # Add some data
+        trade = Trade(
+            trade_id="stats-trade-1",
+            market_id="test-market",
+            strategy="gabagool",
+            side="YES",
+            size=Decimal("10.0"),
+            price=Decimal("0.50"),
+            cost=Decimal("5.0"),
+        )
+        await store.save_trade(trade)
+
+        stats = await store.get_database_stats()
+
+        assert stats["trades"] == 1
+        assert stats["positions"] == 0
+        assert "db_size_mb" in stats
 
         await store.close()
 
