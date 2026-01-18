@@ -58,8 +58,7 @@ class TestPhase4Persistence:
     @pytest.mark.asyncio
     async def test_trade_crud(self, tmp_path):
         """Verify trade CRUD operations work."""
-        from mercury.services.state_store import StateStore
-        from mercury.domain.order import Trade
+        from mercury.services.state_store import StateStore, Trade
 
         db_path = tmp_path / "test.db"
         store = StateStore(db_path=str(db_path))
@@ -93,8 +92,7 @@ class TestPhase4Persistence:
     @pytest.mark.asyncio
     async def test_position_lifecycle(self, tmp_path):
         """Verify position lifecycle operations work."""
-        from mercury.services.state_store import StateStore
-        from mercury.domain.order import Position, PositionResult
+        from mercury.services.state_store import StateStore, Position, PositionResult
 
         db_path = tmp_path / "test.db"
         store = StateStore(db_path=str(db_path))
@@ -134,8 +132,7 @@ class TestPhase4Persistence:
     @pytest.mark.asyncio
     async def test_settlement_queue(self, tmp_path):
         """Verify settlement queue operations work."""
-        from mercury.services.state_store import StateStore
-        from mercury.domain.order import Position
+        from mercury.services.state_store import StateStore, Position
 
         db_path = tmp_path / "test.db"
         store = StateStore(db_path=str(db_path))
