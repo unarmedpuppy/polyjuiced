@@ -357,29 +357,62 @@ class StrategyEngine(BaseComponent):
                 )
 
     async def _publish_signal(self, strategy_name: str, signal: TradingSignal) -> None:
-        """Publish a trading signal to EventBus."""
+        """Publish a trading signal to EventBus.
+
+        Publishes to signal.{strategy_name} channel with full TradingSignal data.
+
+        Signal payload includes:
+        - signal_id: Unique signal identifier
+        - strategy_name: Name of the strategy that generated this signal
+        - market_id: The market condition ID
+        - signal_type: Type of signal (BUY_YES, BUY_NO, ARBITRAGE, etc.)
+        - confidence: Signal confidence score (0.0 to 1.0)
+        - priority: Signal priority level (low, medium, high, critical)
+        - target_size_usd: Target trade size in USD
+        - yes_price: Current YES price
+        - no_price: Current NO price
+        - expected_pnl: Expected profit/loss
+        - max_slippage: Maximum acceptable slippage
+        - metadata: Additional strategy-specific data
+        - created_at: When the signal was generated
+        - expires_at: When the signal expires (optional)
+
+        Args:
+            strategy_name: Name of the strategy generating the signal.
+            signal: The TradingSignal to publish.
+        """
         self._log.info(
             "signal_generated",
             strategy=strategy_name,
             signal_id=signal.signal_id,
             signal_type=signal.signal_type.value,
             target_size=str(signal.target_size_usd),
+            confidence=signal.confidence,
+            priority=signal.priority.value,
         )
 
-        await self._event_bus.publish(
-            f"signal.{strategy_name}",
-            {
-                "signal_id": signal.signal_id,
-                "strategy": strategy_name,
-                "market_id": signal.market_id,
-                "signal_type": signal.signal_type.value,
-                "target_size_usd": str(signal.target_size_usd),
-                "yes_price": str(signal.yes_price),
-                "no_price": str(signal.no_price),
-                "confidence": signal.confidence,
-                "metadata": signal.metadata,
-            }
-        )
+        # Build the full signal payload with all fields
+        payload = {
+            "signal_id": signal.signal_id,
+            "strategy_name": strategy_name,
+            "market_id": signal.market_id,
+            "signal_type": signal.signal_type.value,
+            "confidence": signal.confidence,
+            "priority": signal.priority.value,
+            "target_size_usd": str(signal.target_size_usd),
+            "yes_price": str(signal.yes_price),
+            "no_price": str(signal.no_price),
+            "expected_pnl": str(signal.expected_pnl),
+            "max_slippage": str(signal.max_slippage),
+            "metadata": signal.metadata,
+            "created_at": signal.created_at.isoformat(),
+        }
+
+        # Add optional expires_at if set
+        if signal.expires_at is not None:
+            payload["expires_at"] = signal.expires_at.isoformat()
+
+        await self._event_bus.publish(f"signal.{strategy_name}", payload)
 
     async def _on_enable_strategy(self, data: dict) -> None:
         """Handle enable strategy request from event bus."""

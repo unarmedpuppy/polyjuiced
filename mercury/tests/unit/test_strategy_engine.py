@@ -483,16 +483,34 @@ class TestSignalPublishing:
     async def test_signal_payload_contains_required_fields(
         self, strategy_engine, mock_event_bus
     ):
-        """Verify published signal contains all required fields."""
+        """Verify published signal contains all required fields.
+
+        The signal payload must include:
+        - signal_id: Unique identifier
+        - strategy_name: Name of generating strategy
+        - market_id: Market condition ID
+        - signal_type: Type of signal
+        - confidence: Confidence score (0.0 to 1.0)
+        - priority: Priority level
+        - target_size_usd: Target trade size
+        - yes_price, no_price: Current prices
+        - expected_pnl: Expected profit/loss
+        - max_slippage: Maximum acceptable slippage
+        - metadata: Additional data
+        - created_at: Timestamp
+        """
         signal = TradingSignal(
             signal_id="test-signal-123",
             strategy_name="test_strategy",
             market_id="test_market",
             signal_type=SignalType.ARBITRAGE,
             confidence=0.85,
+            priority=SignalPriority.HIGH,
             target_size_usd=Decimal("25.00"),
             yes_price=Decimal("0.45"),
             no_price=Decimal("0.50"),
+            expected_pnl=Decimal("0.05"),
+            max_slippage=Decimal("0.02"),
             metadata={"reason": "test"},
         )
 
@@ -500,15 +518,57 @@ class TestSignalPublishing:
 
         payload = mock_event_bus.publish.call_args[0][1]
 
+        # Core identification fields
         assert payload["signal_id"] == "test-signal-123"
-        assert payload["strategy"] == "test_strategy"
+        assert payload["strategy_name"] == "test_strategy"
         assert payload["market_id"] == "test_market"
         assert payload["signal_type"] == "ARBITRAGE"
+
+        # Trading parameters
+        assert payload["confidence"] == 0.85
+        assert payload["priority"] == "high"
         assert payload["target_size_usd"] == "25.00"
+
+        # Price information
         assert payload["yes_price"] == "0.45"
         assert payload["no_price"] == "0.50"
-        assert payload["confidence"] == 0.85
+        assert payload["expected_pnl"] == "0.05"
+        assert payload["max_slippage"] == "0.02"
+
+        # Metadata and timestamps
         assert payload["metadata"] == {"reason": "test"}
+        assert "created_at" in payload
+        # expires_at should not be present since signal has no expiration
+        assert "expires_at" not in payload
+
+    @pytest.mark.asyncio
+    async def test_signal_payload_includes_expires_at_when_set(
+        self, strategy_engine, mock_event_bus
+    ):
+        """Verify expires_at is included in payload when signal has expiration."""
+        from datetime import timedelta
+
+        expires = datetime.utcnow() + timedelta(minutes=5)
+        signal = TradingSignal(
+            signal_id="expiring-signal-456",
+            strategy_name="test_strategy",
+            market_id="test_market",
+            signal_type=SignalType.ARBITRAGE,
+            confidence=0.95,
+            priority=SignalPriority.CRITICAL,
+            target_size_usd=Decimal("50.00"),
+            yes_price=Decimal("0.40"),
+            no_price=Decimal("0.55"),
+            expires_at=expires,
+        )
+
+        await strategy_engine._publish_signal("test_strategy", signal)
+
+        payload = mock_event_bus.publish.call_args[0][1]
+
+        assert "expires_at" in payload
+        assert payload["expires_at"] == expires.isoformat()
+        assert payload["priority"] == "critical"
 
 
 class TestEventHandlers:
