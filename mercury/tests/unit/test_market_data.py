@@ -392,14 +392,14 @@ class TestStalenessDetection:
 
         await service._check_staleness()
 
-        # Find the stale event data
+        # Find the stale event data (now a StaleAlert dataclass)
         stale_calls = [call for call in mock_event_bus.publish.call_args_list
                        if "market.stale" in call[0][0]]
         assert len(stale_calls) == 1
-        event_data = stale_calls[0][0][1]
-        assert event_data["market_id"] == "test"
-        assert event_data["threshold_seconds"] == 10.0
-        assert "timestamp" in event_data
+        event = stale_calls[0][0][1]  # StaleAlert dataclass
+        assert event.market_id == "test"
+        assert event.threshold_seconds == 10.0
+        assert event.timestamp  # Has timestamp string
 
     def test_get_stale_markets_returns_empty_set_initially(self, service):
         """Test that get_stale_markets returns empty set when no markets subscribed."""
@@ -850,3 +850,64 @@ class TestBestPricesWithInMemoryBook:
         assert prices is not None
         assert prices == (Decimal("0.46"), Decimal("0.54"))
         await service.stop()
+
+
+class TestTradeEventPublishing:
+    """Tests for trade event publishing."""
+
+    @pytest.mark.asyncio
+    async def test_publish_trade_publishes_trade_event(self, service, mock_event_bus):
+        """Test that publish_trade publishes a TradeEvent to EventBus."""
+        await service.publish_trade(
+            market_id="test-market",
+            token_id="yes-token-123",
+            side="buy",
+            price=Decimal("0.55"),
+            size=Decimal("100"),
+            trade_id="trade-001",
+        )
+
+        mock_event_bus.publish.assert_called_once()
+        channel, event = mock_event_bus.publish.call_args[0]
+
+        assert channel == "market.trade.test-market"
+        assert event.market_id == "test-market"
+        assert event.token_id == "yes-token-123"
+        assert event.side == "buy"
+        assert event.price == "0.55"
+        assert event.size == "100"
+        assert event.trade_id == "trade-001"
+
+    @pytest.mark.asyncio
+    async def test_publish_trade_sell_side(self, service, mock_event_bus):
+        """Test publishing a sell trade."""
+        await service.publish_trade(
+            market_id="test-market",
+            token_id="no-token-456",
+            side="sell",
+            price=Decimal("0.48"),
+            size=Decimal("50"),
+        )
+
+        channel, event = mock_event_bus.publish.call_args[0]
+
+        assert channel == "market.trade.test-market"
+        assert event.side == "sell"
+        assert event.price == "0.48"
+        assert event.trade_id is None
+
+    @pytest.mark.asyncio
+    async def test_publish_trade_with_decimal_precision(self, service, mock_event_bus):
+        """Test that trade price preserves decimal precision."""
+        await service.publish_trade(
+            market_id="test",
+            token_id="token",
+            side="buy",
+            price=Decimal("0.123456"),
+            size=Decimal("99.99"),
+        )
+
+        _, event = mock_event_bus.publish.call_args[0]
+
+        assert event.price == "0.123456"
+        assert event.size == "99.99"

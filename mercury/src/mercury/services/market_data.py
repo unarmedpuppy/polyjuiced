@@ -24,6 +24,12 @@ import structlog
 from mercury.core.config import ConfigManager
 from mercury.core.events import EventBus
 from mercury.core.lifecycle import BaseComponent, HealthCheckResult, HealthStatus
+from mercury.domain.events import (
+    FreshAlert,
+    OrderBookSnapshotEvent,
+    StaleAlert,
+    TradeEvent,
+)
 from mercury.domain.market import OrderBook, OrderBookLevel
 from mercury.domain.orderbook import InMemoryOrderBook, MarketOrderBook
 from mercury.integrations.polymarket.types import (
@@ -643,20 +649,22 @@ class MarketDataService(BaseComponent):
             # Transition: fresh -> stale
             if is_stale_now and not state.is_marked_stale:
                 state.is_marked_stale = True
+                display_age = age if age != float("inf") else -1
                 self._log.warning(
                     "market_became_stale",
                     market_id=market_id,
-                    age_seconds=age if age != float("inf") else -1,
+                    age_seconds=display_age,
                     threshold_seconds=threshold,
+                )
+                stale_alert = StaleAlert.create(
+                    market_id=market_id,
+                    age_seconds=display_age,
+                    threshold_seconds=threshold,
+                    last_update_time=last_update_time if last_update_time > 0 else None,
                 )
                 await self._event_bus.publish(
                     f"market.stale.{market_id}",
-                    {
-                        "market_id": market_id,
-                        "age_seconds": age if age != float("inf") else -1,
-                        "threshold_seconds": threshold,
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    }
+                    stale_alert,
                 )
 
             # Transition: stale -> fresh
@@ -667,13 +675,13 @@ class MarketDataService(BaseComponent):
                     market_id=market_id,
                     age_seconds=age,
                 )
+                fresh_alert = FreshAlert.create(
+                    market_id=market_id,
+                    age_seconds=age,
+                )
                 await self._event_bus.publish(
                     f"market.fresh.{market_id}",
-                    {
-                        "market_id": market_id,
-                        "age_seconds": age,
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    }
+                    fresh_alert,
                 )
 
     async def _on_subscribe_request(self, data: dict) -> None:
@@ -916,40 +924,68 @@ class MarketDataService(BaseComponent):
     async def _publish_order_book(self, book: OrderBook) -> None:
         """Publish order book update to EventBus.
 
+        Uses the OrderBookSnapshotEvent dataclass for consistent event structure.
+
         Args:
             book: The OrderBook to publish.
         """
+        event = OrderBookSnapshotEvent.from_market_book(
+            market_id=book.market_id,
+            yes_best_bid=book.yes_best_bid,
+            yes_best_ask=book.yes_best_ask,
+            no_best_bid=book.no_best_bid,
+            no_best_ask=book.no_best_ask,
+            timestamp=book.timestamp,
+        )
+
         await self._event_bus.publish(
             f"market.orderbook.{book.market_id}",
-            {
-                "market_id": book.market_id,
-                "timestamp": book.timestamp.isoformat() if book.timestamp else datetime.now(timezone.utc).isoformat(),
-                "yes_bid": str(book.yes_best_bid) if book.yes_best_bid else None,
-                "yes_ask": str(book.yes_best_ask) if book.yes_best_ask else None,
-                "no_bid": str(book.no_best_bid) if book.no_best_bid else None,
-                "no_ask": str(book.no_best_ask) if book.no_best_ask else None,
-                "combined_ask": str(book.combined_ask) if book.combined_ask else None,
-            }
+            event,
         )
 
     async def _publish_snapshot(self, state: MarketState) -> None:
-        """Publish order book snapshot to EventBus."""
+        """Publish order book snapshot to EventBus.
+
+        Uses the OrderBookSnapshotEvent dataclass for consistent event structure.
+        """
         snapshot = state.get_snapshot()
         if snapshot is None:
             return
 
+        # Get size information from the in-memory order book if available
+        yes_bid_size: Optional[Decimal] = None
+        yes_ask_size: Optional[Decimal] = None
+        no_bid_size: Optional[Decimal] = None
+        no_ask_size: Optional[Decimal] = None
+        sequence = 0
+
+        if state.market_book is not None:
+            yes_bid_size = state.market_book.yes_book.best_bid_size
+            yes_ask_size = state.market_book.yes_book.best_ask_size
+            no_bid_size = state.market_book.no_book.best_bid_size
+            no_ask_size = state.market_book.no_book.best_ask_size
+            sequence = max(
+                state.market_book.yes_book.sequence,
+                state.market_book.no_book.sequence,
+            )
+
+        event = OrderBookSnapshotEvent.from_market_book(
+            market_id=state.market_id,
+            yes_best_bid=snapshot.yes_book.best_bid,
+            yes_best_ask=snapshot.yes_book.best_ask,
+            no_best_bid=snapshot.no_book.best_bid,
+            no_best_ask=snapshot.no_book.best_ask,
+            yes_bid_size=yes_bid_size if yes_bid_size and yes_bid_size > 0 else None,
+            yes_ask_size=yes_ask_size if yes_ask_size and yes_ask_size > 0 else None,
+            no_bid_size=no_bid_size if no_bid_size and no_bid_size > 0 else None,
+            no_ask_size=no_ask_size if no_ask_size and no_ask_size > 0 else None,
+            sequence=sequence,
+            timestamp=snapshot.timestamp,
+        )
+
         await self._event_bus.publish(
             f"market.orderbook.{state.market_id}",
-            {
-                "market_id": state.market_id,
-                "timestamp": snapshot.timestamp.isoformat(),
-                "yes_bid": str(snapshot.yes_book.best_bid) if snapshot.yes_book.best_bid else None,
-                "yes_ask": str(snapshot.yes_book.best_ask) if snapshot.yes_book.best_ask else None,
-                "no_bid": str(snapshot.no_book.best_bid) if snapshot.no_book.best_bid else None,
-                "no_ask": str(snapshot.no_book.best_ask) if snapshot.no_book.best_ask else None,
-                "combined_ask": str(snapshot.combined_ask) if snapshot.combined_ask else None,
-                "arbitrage_spread_cents": str(snapshot.arbitrage_spread_cents) if snapshot.arbitrage_spread_cents else None,
-            }
+            event,
         )
 
     async def _monitor_loop(self) -> None:
@@ -957,3 +993,48 @@ class MarketDataService(BaseComponent):
         while self._should_run:
             await asyncio.sleep(float(self._refresh_interval))
             await self._check_staleness()
+
+    async def publish_trade(
+        self,
+        market_id: str,
+        token_id: str,
+        side: str,
+        price: Decimal,
+        size: Decimal,
+        trade_id: Optional[str] = None,
+    ) -> None:
+        """Publish a trade event to EventBus.
+
+        This method allows external components (like the WebSocket handler)
+        to publish trade events with proper market context.
+
+        Args:
+            market_id: The market's condition ID.
+            token_id: The token that was traded.
+            side: Trade side ("buy" or "sell").
+            price: Trade execution price.
+            size: Trade size.
+            trade_id: Optional trade identifier.
+        """
+        trade_event = TradeEvent.create(
+            market_id=market_id,
+            token_id=token_id,
+            side=side,
+            price=price,
+            size=size,
+            trade_id=trade_id,
+        )
+
+        self._log.debug(
+            "publishing_trade_event",
+            market_id=market_id,
+            token_id=token_id,
+            side=side,
+            price=str(price),
+            size=str(size),
+        )
+
+        await self._event_bus.publish(
+            f"market.trade.{market_id}",
+            trade_event,
+        )
