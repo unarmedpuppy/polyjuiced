@@ -3,10 +3,12 @@ Unit tests for the RiskManager service.
 
 Tests cover:
 - Pre-trade validation
-- Circuit breaker state transitions
+- 4-level circuit breaker state transitions (NORMAL -> WARNING -> CAUTION -> HALT)
 - Exposure tracking
 - Daily reset functionality
 - Event handling
+- Circuit breaker event publishing
+- Position size multipliers
 """
 import pytest
 from decimal import Decimal
@@ -20,7 +22,7 @@ from mercury.domain.risk import CircuitBreakerState
 
 @pytest.fixture
 def risk_config():
-    """Create mock config for risk manager."""
+    """Create mock config for risk manager with 4-level circuit breaker thresholds."""
     config = MagicMock()
 
     def get_side_effect(key, default=None):
@@ -28,9 +30,12 @@ def risk_config():
             "risk.max_daily_loss_usd": Decimal("100.0"),
             "risk.max_unhedged_exposure_usd": Decimal("50.0"),
             "risk.max_position_size_usd": Decimal("25.0"),
+            # 4-level circuit breaker: NORMAL -> WARNING -> CAUTION -> HALT
             "risk.circuit_breaker_warning_failures": 3,
+            "risk.circuit_breaker_caution_failures": 4,
             "risk.circuit_breaker_halt_failures": 5,
             "risk.circuit_breaker_warning_loss": Decimal("50.0"),
+            "risk.circuit_breaker_caution_loss": Decimal("75.0"),
             "risk.circuit_breaker_halt_loss": Decimal("100.0"),
             "risk.circuit_breaker_cooldown_minutes": 5,
         }
@@ -128,10 +133,13 @@ class TestPreTradeValidation:
     @pytest.mark.asyncio
     async def test_rejects_when_circuit_breaker_halt(self, risk_manager):
         """Signal should be rejected when circuit breaker is HALT."""
-        risk_manager._circuit_breaker_state = CircuitBreakerState.HALT
-        from datetime import datetime, timezone
+        from datetime import datetime, timezone, timedelta
 
+        # Simulate circuit breaker trip to HALT with active cooldown
+        risk_manager._circuit_breaker_state = CircuitBreakerState.HALT
         risk_manager._circuit_breaker_triggered_at = datetime.now(timezone.utc)
+        risk_manager._cooldown_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+        risk_manager._circuit_breaker_reasons = ["Test halt reason"]
 
         signal = TradingSignal(
             signal_id="test-4",
@@ -147,56 +155,106 @@ class TestPreTradeValidation:
         allowed, reason = await risk_manager.check_pre_trade(signal)
 
         assert allowed is False
-        assert "circuit breaker" in reason.lower()
+        assert "circuit breaker" in reason.lower() or "halt" in reason.lower()
 
 
 class TestCircuitBreaker:
-    """Test circuit breaker state transitions."""
+    """Test 4-level circuit breaker state transitions."""
 
     def test_failure_tracking(self, risk_manager):
         """Test consecutive failure counting."""
-        assert risk_manager._consecutive_failures == 0
+        assert risk_manager.consecutive_failures == 0
 
         risk_manager.record_failure()
-        assert risk_manager._consecutive_failures == 1
+        assert risk_manager.consecutive_failures == 1
 
         risk_manager.record_failure()
-        assert risk_manager._consecutive_failures == 2
+        assert risk_manager.consecutive_failures == 2
 
     def test_warning_after_threshold_failures(self, risk_manager):
-        """Circuit breaker should go to WARNING after threshold failures."""
+        """Circuit breaker should go to WARNING after 3 failures."""
         for _ in range(3):  # Warning threshold
             risk_manager.record_failure()
 
         assert risk_manager.circuit_breaker_state == CircuitBreakerState.WARNING
+        assert risk_manager.size_multiplier == 0.5
+
+    def test_caution_after_threshold_failures(self, risk_manager):
+        """Circuit breaker should go to CAUTION after 4 failures."""
+        for _ in range(4):  # Caution threshold
+            risk_manager.record_failure()
+
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.CAUTION
+        assert risk_manager.size_multiplier == 0.0
+        assert not risk_manager.can_open_positions
 
     def test_halt_after_threshold_failures(self, risk_manager):
-        """Circuit breaker should go to HALT after threshold failures."""
+        """Circuit breaker should go to HALT after 5 failures."""
         for _ in range(5):  # Halt threshold
             risk_manager.record_failure()
 
         assert risk_manager.circuit_breaker_state == CircuitBreakerState.HALT
+        assert not risk_manager.can_trade
 
     def test_success_resets_failures(self, risk_manager):
         """Successful trade should reset failure count."""
         risk_manager.record_failure()
         risk_manager.record_failure()
-        assert risk_manager._consecutive_failures == 2
+        assert risk_manager.consecutive_failures == 2
 
         risk_manager.record_success()
-        assert risk_manager._consecutive_failures == 0
+        assert risk_manager.consecutive_failures == 0
 
     def test_warning_on_loss_threshold(self, risk_manager):
-        """Circuit breaker should go to WARNING when loss exceeds warning threshold."""
+        """Circuit breaker should go to WARNING when loss exceeds $50 threshold."""
         risk_manager.record_pnl(Decimal("-60.0"))  # Exceeds 50.0 warning threshold
 
         assert risk_manager.circuit_breaker_state == CircuitBreakerState.WARNING
+        assert risk_manager.size_multiplier == 0.5
+
+    def test_caution_on_loss_threshold(self, risk_manager):
+        """Circuit breaker should go to CAUTION when loss exceeds $75 threshold."""
+        risk_manager.record_pnl(Decimal("-80.0"))  # Exceeds 75.0 caution threshold
+
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.CAUTION
+        assert risk_manager.size_multiplier == 0.0
 
     def test_halt_on_loss_threshold(self, risk_manager):
-        """Circuit breaker should go to HALT when loss exceeds halt threshold."""
+        """Circuit breaker should go to HALT when loss exceeds $100 threshold."""
         risk_manager.record_pnl(Decimal("-110.0"))  # Exceeds 100.0 halt threshold
 
         assert risk_manager.circuit_breaker_state == CircuitBreakerState.HALT
+
+    def test_size_multiplier_property(self, risk_manager):
+        """Test size_multiplier reflects circuit breaker state."""
+        assert risk_manager.size_multiplier == 1.0  # NORMAL
+
+        for _ in range(3):
+            risk_manager.record_failure()
+        assert risk_manager.size_multiplier == 0.5  # WARNING
+
+        risk_manager.record_failure()  # 4th failure
+        assert risk_manager.size_multiplier == 0.0  # CAUTION
+
+    def test_reasons_tracked_on_trip(self, risk_manager):
+        """Test that reasons are tracked when circuit breaker trips."""
+        for _ in range(3):
+            risk_manager.record_failure()
+
+        reasons = risk_manager.circuit_breaker_reasons
+        assert len(reasons) > 0
+        assert any("failure" in r.lower() for r in reasons)
+
+    def test_combined_failure_and_loss(self, risk_manager):
+        """Test that the more severe condition determines state."""
+        # 3 failures = WARNING
+        for _ in range(3):
+            risk_manager.record_failure()
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.WARNING
+
+        # Adding loss that triggers CAUTION should upgrade to CAUTION
+        risk_manager.record_pnl(Decimal("-80.0"))  # CAUTION loss threshold
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.CAUTION
 
 
 class TestExposureTracking:
@@ -435,3 +493,167 @@ class TestLifecycle:
         from mercury.core.lifecycle import HealthStatus
 
         assert result.status == HealthStatus.DEGRADED
+
+
+class TestCautionLevel:
+    """Test CAUTION level specific behavior."""
+
+    @pytest.mark.asyncio
+    async def test_caution_rejects_new_positions(self, risk_manager):
+        """CAUTION level should reject all new position signals."""
+        # Trip to CAUTION
+        for _ in range(4):
+            risk_manager.record_failure()
+
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.CAUTION
+
+        signal = TradingSignal(
+            signal_id="test-caution",
+            strategy_name="gabagool",
+            market_id="test-market",
+            signal_type=SignalType.ARBITRAGE,
+            confidence=0.8,
+            target_size_usd=Decimal("10.0"),
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+
+        allowed, reason = await risk_manager.check_pre_trade(signal)
+
+        assert allowed is False
+        assert "caution" in reason.lower()
+        assert "only position closes allowed" in reason.lower()
+
+    def test_caution_state_properties(self, risk_manager):
+        """Test CAUTION state has correct properties."""
+        for _ in range(4):
+            risk_manager.record_failure()
+
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.CAUTION
+        assert risk_manager.size_multiplier == 0.0
+        assert risk_manager.can_trade is True  # Can close positions
+        assert risk_manager.can_open_positions is False
+
+
+class TestCircuitBreakerEvents:
+    """Test circuit breaker event publishing."""
+
+    @pytest.mark.asyncio
+    async def test_event_published_on_state_change(self, risk_manager, mock_event_bus):
+        """Event should be published when circuit breaker state changes."""
+        await risk_manager.start()
+
+        # Trip to WARNING
+        for _ in range(3):
+            risk_manager.record_failure()
+
+        # Allow event loop to process
+        import asyncio
+        await asyncio.sleep(0.01)
+
+        # Check event was published
+        calls = mock_event_bus.publish.call_args_list
+        circuit_breaker_calls = [c for c in calls if c[0][0] == "risk.circuit_breaker"]
+
+        assert len(circuit_breaker_calls) > 0
+        event_data = circuit_breaker_calls[0][0][1]
+        assert event_data["old_state"] == "NORMAL"
+        assert event_data["new_state"] == "WARNING"
+        assert "size_multiplier" in event_data
+        assert event_data["size_multiplier"] == 0.5
+
+    @pytest.mark.asyncio
+    async def test_event_includes_reasons(self, risk_manager, mock_event_bus):
+        """Circuit breaker event should include reasons for state change."""
+        await risk_manager.start()
+
+        # Trip via loss
+        risk_manager.record_pnl(Decimal("-80.0"))  # CAUTION threshold
+
+        import asyncio
+        await asyncio.sleep(0.01)
+
+        calls = mock_event_bus.publish.call_args_list
+        circuit_breaker_calls = [c for c in calls if c[0][0] == "risk.circuit_breaker"]
+
+        assert len(circuit_breaker_calls) > 0
+        event_data = circuit_breaker_calls[0][0][1]
+        assert "reasons" in event_data
+        assert len(event_data["reasons"]) > 0
+
+    @pytest.mark.asyncio
+    async def test_event_includes_state_properties(self, risk_manager, mock_event_bus):
+        """Circuit breaker event should include trading capability flags."""
+        await risk_manager.start()
+
+        # Trip to HALT
+        for _ in range(5):
+            risk_manager.record_failure()
+
+        import asyncio
+        await asyncio.sleep(0.01)
+
+        calls = mock_event_bus.publish.call_args_list
+        circuit_breaker_calls = [c for c in calls if c[0][0] == "risk.circuit_breaker"]
+
+        # Find the HALT event (may have multiple events as we progress through levels)
+        halt_events = [c for c in circuit_breaker_calls if c[0][1].get("new_state") == "HALT"]
+        assert len(halt_events) > 0
+
+        event_data = halt_events[0][0][1]
+        assert event_data["can_trade"] is False
+        assert event_data["can_open_positions"] is False
+        assert event_data["size_multiplier"] == 0.0
+
+
+class TestWarningLevelPositionSizing:
+    """Test WARNING level position size reduction."""
+
+    @pytest.mark.asyncio
+    async def test_warning_reduces_position_limit(self, risk_manager):
+        """WARNING level should reduce position size limit by 50%."""
+        # Trip to WARNING
+        for _ in range(3):
+            risk_manager.record_failure()
+
+        assert risk_manager.circuit_breaker_state == CircuitBreakerState.WARNING
+
+        # Normal limit is $25, WARNING reduces to $12.50
+        # A $15 signal should be rejected at WARNING level
+        signal = TradingSignal(
+            signal_id="test-warning-size",
+            strategy_name="gabagool",
+            market_id="test-market",
+            signal_type=SignalType.ARBITRAGE,
+            confidence=0.8,
+            target_size_usd=Decimal("15.0"),  # Exceeds 50% of limit ($12.50)
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+
+        allowed, reason = await risk_manager.check_pre_trade(signal)
+
+        assert allowed is False
+        assert "warning" in reason.lower() or "limit" in reason.lower()
+
+    @pytest.mark.asyncio
+    async def test_warning_allows_reduced_positions(self, risk_manager):
+        """WARNING level should allow positions within reduced limit."""
+        for _ in range(3):
+            risk_manager.record_failure()
+
+        # $10 is within the $12.50 WARNING limit
+        signal = TradingSignal(
+            signal_id="test-warning-ok",
+            strategy_name="gabagool",
+            market_id="test-market",
+            signal_type=SignalType.ARBITRAGE,
+            confidence=0.8,
+            target_size_usd=Decimal("10.0"),  # Within 50% limit
+            yes_price=Decimal("0.48"),
+            no_price=Decimal("0.50"),
+        )
+
+        allowed, reason = await risk_manager.check_pre_trade(signal)
+
+        assert allowed is True

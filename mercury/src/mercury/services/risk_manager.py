@@ -3,13 +3,20 @@
 This service:
 - Validates trading signals against risk limits
 - Tracks exposure and daily P&L
-- Manages circuit breaker state based on failures and losses
+- Manages 4-level circuit breaker state based on failures and losses
+- Publishes risk.circuit_breaker events on state changes
 - Approves or rejects signals via event bus
+
+Circuit Breaker Levels (ported from legacy/src/risk/circuit_breaker.py):
+- NORMAL: All systems go, full position sizes
+- WARNING: Near limits, reduce position sizes by 50%
+- CAUTION: Only close existing positions, no new positions
+- HALT: No trading at all, full system pause
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import structlog
 
@@ -67,12 +74,20 @@ class RiskManager(BaseComponent):
             max_unhedged_exposure_usd=self._get_decimal("risk.max_unhedged_exposure_usd", Decimal("50")),
         )
 
-        # Circuit breaker thresholds
+        # Circuit breaker thresholds - 4 levels: NORMAL -> WARNING -> CAUTION -> HALT
+        # Failure thresholds
         self._warning_failures = self._get_int("risk.circuit_breaker_warning_failures", 3)
+        self._caution_failures = self._get_int("risk.circuit_breaker_caution_failures", 4)
         self._halt_failures = self._get_int("risk.circuit_breaker_halt_failures", 5)
+
+        # Loss thresholds (in USD)
         self._warning_loss = self._get_decimal("risk.circuit_breaker_warning_loss", Decimal("50"))
+        self._caution_loss = self._get_decimal("risk.circuit_breaker_caution_loss", Decimal("75"))
         self._halt_loss = self._get_decimal("risk.circuit_breaker_halt_loss", Decimal("100"))
+
+        # Cooldown and timing
         self._cooldown_minutes = self._get_int("risk.circuit_breaker_cooldown_minutes", 5)
+        self._cooldown_duration = timedelta(minutes=self._cooldown_minutes)
 
         # State tracking
         self._daily_pnl: Decimal = Decimal("0")
@@ -83,6 +98,8 @@ class RiskManager(BaseComponent):
         self._consecutive_failures: int = 0
         self._circuit_breaker_state: CircuitBreakerState = CircuitBreakerState.NORMAL
         self._circuit_breaker_triggered_at: Optional[datetime] = None
+        self._circuit_breaker_reasons: List[str] = []
+        self._cooldown_until: Optional[datetime] = None
         self._last_reset: datetime = datetime.now(timezone.utc)
 
     def _get_decimal(self, key: str, default: Decimal) -> Decimal:
@@ -154,17 +171,29 @@ class RiskManager(BaseComponent):
         Returns:
             Tuple of (allowed, reason). Reason is None if allowed.
         """
-        # Check circuit breaker
-        if self._circuit_breaker_state == CircuitBreakerState.HALT:
+        state = self._circuit_breaker_state
+
+        # Check HALT level - no trading at all
+        if state == CircuitBreakerState.HALT:
             if not self._is_cooldown_expired():
-                return False, "Circuit breaker triggered"
+                return False, f"Circuit breaker triggered (HALT): {', '.join(self._circuit_breaker_reasons)}"
+
+        # Check CAUTION level - only closing positions allowed
+        if state == CircuitBreakerState.CAUTION:
+            # CAUTION only allows closing existing positions, not opening new ones
+            # For now, reject all signals at CAUTION level
+            # TODO: Allow CLOSE signals when signal types support it
+            return False, f"Circuit breaker at CAUTION: only position closes allowed. Reasons: {', '.join(self._circuit_breaker_reasons)}"
 
         # Check daily loss limit
         if self._daily_pnl <= -self._limits.max_daily_loss_usd:
             return False, f"Daily loss limit reached: ${-self._daily_pnl:.2f}"
 
-        # Check position size
-        if signal.target_size_usd > self._limits.max_position_size_usd:
+        # Check position size (apply size multiplier for WARNING level)
+        effective_max_size = self._limits.max_position_size_usd * Decimal(str(state.size_multiplier))
+        if signal.target_size_usd > effective_max_size:
+            if state == CircuitBreakerState.WARNING:
+                return False, f"Position size ${signal.target_size_usd:.2f} exceeds WARNING-adjusted limit ${effective_max_size:.2f}"
             return False, f"Position size ${signal.target_size_usd:.2f} exceeds limit ${self._limits.max_position_size_usd:.2f}"
 
         # Check unhedged exposure for non-arbitrage
@@ -278,70 +307,160 @@ class RiskManager(BaseComponent):
         Consecutive failures trigger circuit breaker state changes.
         """
         self._consecutive_failures += 1
-
-        old_state = self._circuit_breaker_state
-        new_state = self._compute_circuit_breaker_state()
-
-        if new_state != old_state:
-            self._circuit_breaker_state = new_state
-            if new_state == CircuitBreakerState.HALT:
-                self._circuit_breaker_triggered_at = datetime.now(timezone.utc)
-
-            self._log.warning(
-                "circuit_breaker_changed",
-                old_state=old_state.value,
-                new_state=new_state.value,
-                consecutive_failures=self._consecutive_failures,
-                daily_pnl=str(self._daily_pnl),
-            )
+        self._update_circuit_breaker_state()
 
     def record_success(self) -> None:
         """Record a successful trade, resetting consecutive failure count."""
-        self._consecutive_failures = 0
+        if self._consecutive_failures > 0:
+            self._consecutive_failures = 0
+            # Recompute state - may recover from WARNING to NORMAL if losses permit
+            self._update_circuit_breaker_state()
 
-    def _compute_circuit_breaker_state(self) -> CircuitBreakerState:
-        """Compute circuit breaker state based on failures and loss."""
-        # Check failure-based thresholds
+    def _compute_circuit_breaker_state(self) -> Tuple[CircuitBreakerState, List[str]]:
+        """Compute circuit breaker state based on failures and loss.
+
+        Returns:
+            Tuple of (state, reasons) where reasons explain why the state was set.
+        """
+        reasons: List[str] = []
+
+        # Determine state from failures
+        failure_state = CircuitBreakerState.NORMAL
         if self._consecutive_failures >= self._halt_failures:
-            return CircuitBreakerState.HALT
+            failure_state = CircuitBreakerState.HALT
+            reasons.append(f"Consecutive failures: {self._consecutive_failures} >= {self._halt_failures}")
+        elif self._consecutive_failures >= self._caution_failures:
+            failure_state = CircuitBreakerState.CAUTION
+            reasons.append(f"Consecutive failures: {self._consecutive_failures} >= {self._caution_failures}")
         elif self._consecutive_failures >= self._warning_failures:
-            return CircuitBreakerState.WARNING
+            failure_state = CircuitBreakerState.WARNING
+            reasons.append(f"Consecutive failures: {self._consecutive_failures} >= {self._warning_failures}")
 
-        # Check loss-based thresholds
+        # Determine state from loss
         loss = -self._daily_pnl
+        loss_state = CircuitBreakerState.NORMAL
         if loss >= self._halt_loss:
-            return CircuitBreakerState.HALT
+            loss_state = CircuitBreakerState.HALT
+            reasons.append(f"Daily loss: ${loss:.2f} >= ${self._halt_loss}")
+        elif loss >= self._caution_loss:
+            loss_state = CircuitBreakerState.CAUTION
+            reasons.append(f"Daily loss: ${loss:.2f} >= ${self._caution_loss}")
         elif loss >= self._warning_loss:
-            return CircuitBreakerState.WARNING
+            loss_state = CircuitBreakerState.WARNING
+            reasons.append(f"Daily loss: ${loss:.2f} >= ${self._warning_loss}")
 
-        return CircuitBreakerState.NORMAL
+        # Take the more severe state
+        state_order = [
+            CircuitBreakerState.NORMAL,
+            CircuitBreakerState.WARNING,
+            CircuitBreakerState.CAUTION,
+            CircuitBreakerState.HALT,
+        ]
+        failure_idx = state_order.index(failure_state)
+        loss_idx = state_order.index(loss_state)
+        final_state = state_order[max(failure_idx, loss_idx)]
 
-    def _update_circuit_breaker_for_loss(self) -> None:
-        """Update circuit breaker state based on daily P&L."""
+        return final_state, reasons
+
+    def _update_circuit_breaker_state(self) -> None:
+        """Update circuit breaker state and publish event if state changed."""
         old_state = self._circuit_breaker_state
-        new_state = self._compute_circuit_breaker_state()
+        new_state, reasons = self._compute_circuit_breaker_state()
 
         if new_state != old_state:
-            self._circuit_breaker_state = new_state
-            if new_state == CircuitBreakerState.HALT:
-                self._circuit_breaker_triggered_at = datetime.now(timezone.utc)
+            self._trip_circuit_breaker(new_state, reasons)
 
-            self._log.warning(
-                "circuit_breaker_changed",
-                old_state=old_state.value,
-                new_state=new_state.value,
-                daily_pnl=str(self._daily_pnl),
+    def _update_circuit_breaker_for_loss(self) -> None:
+        """Update circuit breaker state based on daily P&L.
+
+        Alias for _update_circuit_breaker_state for backward compatibility.
+        """
+        self._update_circuit_breaker_state()
+
+    def _trip_circuit_breaker(self, level: CircuitBreakerState, reasons: List[str]) -> None:
+        """Trip the circuit breaker to a new level.
+
+        Args:
+            level: New circuit breaker level.
+            reasons: List of reasons for tripping.
+        """
+        old_state = self._circuit_breaker_state
+
+        # Only trip to higher (more severe) levels, never downgrade via trip
+        # (recovery happens through reset_daily or manual reset)
+        state_order = [
+            CircuitBreakerState.NORMAL,
+            CircuitBreakerState.WARNING,
+            CircuitBreakerState.CAUTION,
+            CircuitBreakerState.HALT,
+        ]
+        if state_order.index(level) <= state_order.index(old_state):
+            return
+
+        now = datetime.now(timezone.utc)
+        self._circuit_breaker_state = level
+        self._circuit_breaker_reasons = reasons
+        self._circuit_breaker_triggered_at = now
+        self._cooldown_until = now + self._cooldown_duration
+
+        self._log.warning(
+            "circuit_breaker_tripped",
+            old_state=old_state.value,
+            new_state=level.value,
+            reasons=reasons,
+            size_multiplier=level.size_multiplier,
+            cooldown_until=self._cooldown_until.isoformat(),
+        )
+
+        # Publish event asynchronously (fire and forget)
+        import asyncio
+
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._publish_circuit_breaker_event(old_state, level, reasons))
+        except RuntimeError:
+            # No event loop running (e.g., in sync tests) - skip publishing
+            pass
+
+    async def _publish_circuit_breaker_event(
+        self,
+        old_state: CircuitBreakerState,
+        new_state: CircuitBreakerState,
+        reasons: List[str],
+    ) -> None:
+        """Publish risk.circuit_breaker event when state changes.
+
+        Args:
+            old_state: Previous circuit breaker state.
+            new_state: New circuit breaker state.
+            reasons: List of reasons for the state change.
+        """
+        try:
+            await self._event_bus.publish(
+                "risk.circuit_breaker",
+                {
+                    "old_state": old_state.value,
+                    "new_state": new_state.value,
+                    "reasons": reasons,
+                    "size_multiplier": new_state.size_multiplier,
+                    "can_trade": new_state.can_trade,
+                    "can_open_positions": new_state.can_open_positions,
+                    "consecutive_failures": self._consecutive_failures,
+                    "daily_pnl": str(self._daily_pnl),
+                    "cooldown_until": (
+                        self._cooldown_until.isoformat() if self._cooldown_until else None
+                    ),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
             )
+        except Exception as e:
+            self._log.error("failed_to_publish_circuit_breaker_event", error=str(e))
 
     def _is_cooldown_expired(self) -> bool:
         """Check if circuit breaker cooldown has expired."""
-        if self._circuit_breaker_triggered_at is None:
+        if self._cooldown_until is None:
             return True
-
-        from datetime import timedelta
-
-        cooldown = timedelta(minutes=self._cooldown_minutes)
-        return datetime.now(timezone.utc) >= self._circuit_breaker_triggered_at + cooldown
+        return datetime.now(timezone.utc) >= self._cooldown_until
 
     def reset_daily(self) -> None:
         """Reset daily counters (called at midnight or on demand)."""
@@ -350,6 +469,7 @@ class RiskManager(BaseComponent):
             final_pnl=str(self._daily_pnl),
             final_trades=self._daily_trades,
             final_volume=str(self._daily_volume),
+            final_circuit_breaker_state=self._circuit_breaker_state.value,
         )
 
         self._daily_pnl = Decimal("0")
@@ -360,12 +480,48 @@ class RiskManager(BaseComponent):
         self._consecutive_failures = 0
         self._circuit_breaker_state = CircuitBreakerState.NORMAL
         self._circuit_breaker_triggered_at = None
+        self._circuit_breaker_reasons = []
+        self._cooldown_until = None
         self._last_reset = datetime.now(timezone.utc)
 
     @property
     def circuit_breaker_state(self) -> CircuitBreakerState:
         """Get current circuit breaker state."""
         return self._circuit_breaker_state
+
+    @property
+    def circuit_breaker_reasons(self) -> List[str]:
+        """Get reasons for current circuit breaker state."""
+        return self._circuit_breaker_reasons.copy()
+
+    @property
+    def size_multiplier(self) -> float:
+        """Get current position size multiplier based on circuit breaker state."""
+        return self._circuit_breaker_state.size_multiplier
+
+    @property
+    def can_trade(self) -> bool:
+        """Check if trading is allowed in current state."""
+        if self._circuit_breaker_state == CircuitBreakerState.HALT:
+            return self._is_cooldown_expired()
+        return self._circuit_breaker_state.can_trade
+
+    @property
+    def can_open_positions(self) -> bool:
+        """Check if new positions can be opened in current state."""
+        if self._circuit_breaker_state == CircuitBreakerState.HALT:
+            return self._is_cooldown_expired()
+        return self._circuit_breaker_state.can_open_positions
+
+    @property
+    def cooldown_until(self) -> Optional[datetime]:
+        """Get cooldown expiration time, if in cooldown."""
+        return self._cooldown_until
+
+    @property
+    def is_in_cooldown(self) -> bool:
+        """Check if currently in cooldown period."""
+        return not self._is_cooldown_expired()
 
     @property
     def current_exposure(self) -> Decimal:
@@ -381,6 +537,11 @@ class RiskManager(BaseComponent):
     def daily_trades(self) -> int:
         """Get number of trades today."""
         return self._daily_trades
+
+    @property
+    def consecutive_failures(self) -> int:
+        """Get current consecutive failure count."""
+        return self._consecutive_failures
 
     async def _on_signal(self, data: dict) -> None:
         """Handle incoming trading signal from event bus."""

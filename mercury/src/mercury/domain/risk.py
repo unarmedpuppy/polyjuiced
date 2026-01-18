@@ -15,11 +15,39 @@ class CircuitBreakerState(str, Enum):
 
     States progress from NORMAL -> WARNING -> CAUTION -> HALT
     based on consecutive failures or daily loss limits.
+
+    Position size multipliers:
+    - NORMAL: 1.0 (full size)
+    - WARNING: 0.5 (50% size reduction)
+    - CAUTION: 0.0 (only close positions, no new ones)
+    - HALT: 0.0 (no trading at all)
     """
     NORMAL = "NORMAL"    # Trading normally, all systems go
-    WARNING = "WARNING"  # Near limits, extra caution advised
-    CAUTION = "CAUTION"  # Very close to limits, reduce activity
+    WARNING = "WARNING"  # Near limits, reduce position sizes by 50%
+    CAUTION = "CAUTION"  # Only close existing positions
     HALT = "HALT"        # Trading halted, circuit breaker triggered
+
+    @property
+    def size_multiplier(self) -> float:
+        """Get position size multiplier for this state."""
+        if self == CircuitBreakerState.NORMAL:
+            return 1.0
+        elif self == CircuitBreakerState.WARNING:
+            return 0.5
+        elif self == CircuitBreakerState.CAUTION:
+            return 0.0
+        else:  # HALT
+            return 0.0
+
+    @property
+    def can_open_positions(self) -> bool:
+        """Check if new positions can be opened in this state."""
+        return self in (CircuitBreakerState.NORMAL, CircuitBreakerState.WARNING)
+
+    @property
+    def can_trade(self) -> bool:
+        """Check if any trading is allowed in this state."""
+        return self != CircuitBreakerState.HALT
 
 
 # Keep CircuitBreakerLevel as an alias for backwards compatibility
