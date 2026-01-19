@@ -7,6 +7,7 @@ from mercury.services.execution import ExecutionEngine
 from mercury.services.strategy_engine import StrategyEngine
 from mercury.services.risk_manager import RiskManager
 from mercury.services.settlement import SettlementManager
+from mercury.services.health import HealthServer, HealthStatusCollector
 
 __all__ = [
     "MetricsEmitter",
@@ -16,4 +17,6 @@ __all__ = [
     "StrategyEngine",
     "RiskManager",
     "SettlementManager",
+    "HealthServer",
+    "HealthStatusCollector",
 ]
