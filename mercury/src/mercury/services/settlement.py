@@ -639,6 +639,13 @@ class SettlementManager(BaseComponent):
                     profit=profit,
                     attempts=entry.claim_attempts + 1,
                 )
+                # Record settlement latency if market_end_time is available
+                if entry.market_end_time is not None:
+                    latency_seconds = (
+                        datetime.now(timezone.utc) - entry.market_end_time
+                    ).total_seconds()
+                    if latency_seconds > 0:
+                        self._metrics.record_settlement_latency(latency_seconds)
 
             return SettlementResult(
                 success=True,
@@ -680,6 +687,13 @@ class SettlementManager(BaseComponent):
                         profit=profit,
                         attempts=entry.claim_attempts + 1,
                     )
+                    # Record settlement latency if market_end_time is available
+                    if entry.market_end_time is not None:
+                        latency_seconds = (
+                            datetime.now(timezone.utc) - entry.market_end_time
+                        ).total_seconds()
+                        if latency_seconds > 0:
+                            self._metrics.record_settlement_latency(latency_seconds)
 
                 self._log.info(
                     "claim_successful",

@@ -1254,6 +1254,7 @@ class TestSettlementMetricsEmission:
         metrics.record_settlement_claimed = MagicMock()
         metrics.record_settlement_failed = MagicMock()
         metrics.update_settlement_queue_size = MagicMock()
+        metrics.record_settlement_latency = MagicMock()
         return metrics
 
     @pytest.fixture
@@ -1338,6 +1339,69 @@ class TestSettlementMetricsEmission:
         # Should not raise even without metrics emitter
         result = await settlement_manager.check_settlements()
         assert result == 1
+
+    @pytest.mark.asyncio
+    async def test_emits_settlement_latency_with_market_end_time(
+        self,
+        settlement_manager_with_metrics,
+        mock_state_store,
+        mock_gamma_client,
+        mock_metrics_emitter,
+        sample_position,
+        resolved_market_info_yes,
+    ):
+        """Should emit settlement latency metric when market_end_time is available."""
+        # Create queue entry with market_end_time set to 1 hour ago
+        queue_entry_with_end_time = SettlementQueueEntry(
+            id=1,
+            position_id="pos-123",
+            market_id="market-456",
+            condition_id="cond-789" + "0" * 40,
+            side="YES",
+            size=Decimal("10"),
+            entry_price=Decimal("0.45"),
+            shares=Decimal("10"),
+            entry_cost=Decimal("4.50"),
+            status="pending",
+            claim_attempts=0,
+            market_end_time=datetime.now(timezone.utc) - timedelta(hours=1),
+        )
+
+        mock_state_store.get_claimable_positions.return_value = [sample_position]
+        mock_state_store.get_settlement_queue_entry.return_value = queue_entry_with_end_time
+        mock_gamma_client.get_market_info.return_value = resolved_market_info_yes
+
+        await settlement_manager_with_metrics.check_settlements()
+
+        # Verify settlement latency metric was emitted
+        mock_metrics_emitter.record_settlement_latency.assert_called_once()
+        latency_call_args = mock_metrics_emitter.record_settlement_latency.call_args
+        latency_seconds = latency_call_args[0][0]
+        # Should be approximately 1 hour (3600 seconds), with some tolerance
+        assert 3590 < latency_seconds < 3610
+
+    @pytest.mark.asyncio
+    async def test_no_latency_metric_without_market_end_time(
+        self,
+        settlement_manager_with_metrics,
+        mock_state_store,
+        mock_gamma_client,
+        mock_metrics_emitter,
+        sample_position,
+        sample_queue_entry,  # This fixture has no market_end_time
+        resolved_market_info_yes,
+    ):
+        """Should not emit latency metric when market_end_time is None."""
+        mock_state_store.get_claimable_positions.return_value = [sample_position]
+        mock_state_store.get_settlement_queue_entry.return_value = sample_queue_entry
+        mock_gamma_client.get_market_info.return_value = resolved_market_info_yes
+
+        await settlement_manager_with_metrics.check_settlements()
+
+        # Verify settlement latency metric was NOT emitted
+        mock_metrics_emitter.record_settlement_latency.assert_not_called()
+        # But settlement claimed was still emitted
+        mock_metrics_emitter.record_settlement_claimed.assert_called_once()
 
 
 class TestErrorCategorization:

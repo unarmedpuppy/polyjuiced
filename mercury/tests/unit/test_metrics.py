@@ -278,3 +278,35 @@ class TestSettlementMetrics:
         # Check attempts histogram has a count of 1 with value 3
         assert "mercury_settlement_claim_attempts_count 1.0" in output
         assert "mercury_settlement_claim_attempts_sum 3.0" in output
+
+    def test_record_settlement_latency(self, metrics_emitter):
+        """Verify settlement latency is recorded."""
+        # 1 hour latency
+        metrics_emitter.record_settlement_latency(3600.0)
+
+        output = metrics_emitter.get_metrics()
+
+        # Check latency histogram exists and has a count
+        assert "mercury_settlement_latency_seconds" in output
+        assert "mercury_settlement_latency_seconds_count 1.0" in output
+        assert "mercury_settlement_latency_seconds_sum 3600.0" in output
+
+    def test_record_settlement_latency_buckets(self, metrics_emitter):
+        """Verify settlement latency buckets are appropriate."""
+        # Record various latencies
+        metrics_emitter.record_settlement_latency(60.0)    # 1 min
+        metrics_emitter.record_settlement_latency(600.0)   # 10 min
+        metrics_emitter.record_settlement_latency(3600.0)  # 1 hour
+        metrics_emitter.record_settlement_latency(86400.0) # 1 day
+
+        output = metrics_emitter.get_metrics()
+
+        # Verify histogram buckets exist
+        assert 'mercury_settlement_latency_seconds_bucket{le="60.0"}' in output
+        assert 'mercury_settlement_latency_seconds_bucket{le="3600.0"}' in output
+        assert 'mercury_settlement_latency_seconds_bucket{le="86400.0"}' in output
+
+    def test_settlement_latency_metric_exists(self, metrics_emitter):
+        """Verify settlement latency metric is created at init."""
+        output = metrics_emitter.get_metrics()
+        assert "mercury_settlement_latency_seconds" in output

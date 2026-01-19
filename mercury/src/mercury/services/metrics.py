@@ -199,6 +199,19 @@ class MetricsEmitter:
             registry=self._registry,
         )
 
+        # Settlement latency histogram - time from market resolution to claim
+        # Buckets span from minutes to days (in seconds)
+        # 1min, 5min, 10min, 30min, 1hr, 2hr, 6hr, 12hr, 24hr, 48hr, 7days
+        settlement_latency_buckets = [
+            60, 300, 600, 1800, 3600, 7200, 21600, 43200, 86400, 172800, 604800
+        ]
+        self._settlement_latency = Histogram(
+            "mercury_settlement_latency_seconds",
+            "Time from market resolution to successful claim in seconds",
+            buckets=settlement_latency_buckets,
+            registry=self._registry,
+        )
+
         # Execution latency breakdown histograms (target: sub-100ms total)
         # Buckets optimized for low-latency trading: 1ms to 500ms
         latency_buckets = [0.001, 0.005, 0.010, 0.025, 0.050, 0.075, 0.100, 0.150, 0.250, 0.500]
@@ -507,6 +520,18 @@ class MetricsEmitter:
         self._settlement_queue_size.labels(status="pending").set(pending)
         self._settlement_queue_size.labels(status="claimed").set(claimed)
         self._settlement_queue_size.labels(status="failed").set(failed)
+
+    def record_settlement_latency(self, latency_seconds: float) -> None:
+        """Record settlement latency.
+
+        Measures the time from market resolution (market_end_time) to when
+        the position was successfully claimed. This helps track how quickly
+        settlements are being processed.
+
+        Args:
+            latency_seconds: Time in seconds from market resolution to claim.
+        """
+        self._settlement_latency.observe(latency_seconds)
 
     def get_metrics(self) -> str:
         """Get Prometheus metrics output.
