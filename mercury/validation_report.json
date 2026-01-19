@@ -1,0 +1,59 @@
+{
+  "started_at": "2026-01-19T17:32:33.139615+00:00",
+  "completed_at": "2026-01-19T17:32:33.139891+00:00",
+  "duration_seconds": 0.000276,
+  "summary": {
+    "overall_match_rate": "86.7%",
+    "signals": {
+      "total": 8,
+      "matches": 8,
+      "mismatches": 0,
+      "match_rate": "100.0%"
+    },
+    "position_sizing": {
+      "total": 6,
+      "matches": 6,
+      "mismatches": 0,
+      "match_rate": "100.0%"
+    },
+    "risk_decisions": {
+      "total": 8,
+      "matches": 7,
+      "mismatches": 1,
+      "match_rate": "87.5%"
+    },
+    "circuit_breaker": {
+      "total": 8,
+      "matches": 5,
+      "mismatches": 3,
+      "match_rate": "62.5%"
+    }
+  },
+  "discrepancy_categories": {
+    "risk_decision:Mercury rejected (Circuit breaker CAUTION - only c": 1,
+    "circuit_breaker:state: Mercury=WARNING vs polyjuiced=NORMAL; multi": 2,
+    "circuit_breaker:state: Mercury=CAUTION vs polyjuiced=NORMAL; multi": 1
+  },
+  "critical_discrepancies": [
+    "Risk decision mismatch for test-signal-2--75: Mercury rejected (Circuit breaker CAUTION - only closes allowed) vs polyjuiced allowed (None)"
+  ],
+  "signal_mismatches": [],
+  "risk_mismatches": [
+    {
+      "signal_id": "test-signal-2--75",
+      "market_id": "test-market",
+      "timestamp": "2026-01-19 17:32:33.139823+00:00",
+      "signal_size": "20",
+      "result": "mismatch",
+      "mercury_allowed": false,
+      "mercury_reason": "Circuit breaker CAUTION - only closes allowed",
+      "mercury_circuit_breaker_state": "CAUTION",
+      "mercury_daily_pnl": "-75",
+      "polyjuiced_allowed": true,
+      "polyjuiced_reason": null,
+      "polyjuiced_circuit_breaker_level": "NORMAL",
+      "polyjuiced_daily_loss": 75.0,
+      "discrepancy_reason": "Mercury rejected (Circuit breaker CAUTION - only closes allowed) vs polyjuiced allowed (None)"
+    }
+  ]
+}
