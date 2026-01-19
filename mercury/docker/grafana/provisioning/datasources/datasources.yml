@@ -4,6 +4,14 @@ datasources:
   - name: Prometheus
     type: prometheus
     access: proxy
-    url: http://prometheus:9090
+    # Production: points to mercury-prometheus container
+    # Development: override via PROMETHEUS_URL env var or use 'prometheus' container name
+    url: ${PROMETHEUS_URL:-http://mercury-prometheus:9090}
     isDefault: true
     editable: false
+    jsonData:
+      timeInterval: "15s"
+      httpMethod: POST
+      manageAlerts: true
+      prometheusType: Prometheus
+      prometheusVersion: "2.48.0"

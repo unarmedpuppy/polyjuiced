@@ -6,8 +6,9 @@ providers:
     folder: Mercury
     folderUid: mercury
     type: file
-    disableDeletion: false
-    updateIntervalSeconds: 30
-    allowUiUpdates: true
+    disableDeletion: true
+    updateIntervalSeconds: 60
+    allowUiUpdates: false
     options:
       path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

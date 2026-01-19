@@ -55,6 +55,8 @@ services:
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=mercury
       - GF_USERS_ALLOW_SIGN_UP=false
+      # Override prometheus URL for development
+      - PROMETHEUS_URL=http://prometheus:9090
     volumes:
       - grafana-data:/var/lib/grafana
       - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro

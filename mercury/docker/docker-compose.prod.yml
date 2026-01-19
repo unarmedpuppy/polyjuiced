@@ -1,0 +1,292 @@
+# Mercury Production Deployment
+# Deploy with: docker compose -f docker-compose.prod.yml up -d
+#
+# Prerequisites:
+# - External network: docker network create my-network
+# - Harbor registry access configured
+# - .env file with credentials
+#
+# Required environment variables (in .env or exported):
+# - MERCURY_POLYMARKET_PRIVATE_KEY
+# - MERCURY_POLYMARKET_API_KEY
+# - MERCURY_POLYMARKET_API_SECRET
+# - MERCURY_POLYMARKET_API_PASSPHRASE
+# - MERCURY_POLYGON_PRIVATE_KEY (optional)
+# - GRAFANA_ADMIN_PASSWORD (optional, defaults to 'mercury')
+
+version: "3.8"
+
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "50m"
+    max-file: "5"
+    compress: "true"
+
+services:
+  mercury:
+    image: harbor.server.unarmedpuppy.com/library/mercury:${MERCURY_VERSION:-latest}
+    container_name: mercury
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      # Application settings
+      - MERCURY_DRY_RUN=${MERCURY_DRY_RUN:-false}
+      - MERCURY_LOG_LEVEL=${MERCURY_LOG_LEVEL:-INFO}
+      - MERCURY_LOG_JSON=true
+      - MERCURY_CONFIG_PATH=/app/config/production.toml
+
+      # Infrastructure
+      - MERCURY_REDIS_URL=redis://mercury-redis:6379
+      - MERCURY_DATABASE_PATH=/app/data/mercury.db
+
+      # Polymarket credentials (from .env)
+      - MERCURY_POLYMARKET_PRIVATE_KEY=${MERCURY_POLYMARKET_PRIVATE_KEY}
+      - MERCURY_POLYMARKET_API_KEY=${MERCURY_POLYMARKET_API_KEY}
+      - MERCURY_POLYMARKET_API_SECRET=${MERCURY_POLYMARKET_API_SECRET}
+      - MERCURY_POLYMARKET_API_PASSPHRASE=${MERCURY_POLYMARKET_API_PASSPHRASE}
+
+      # Polygon (optional)
+      - MERCURY_POLYGON_PRIVATE_KEY=${MERCURY_POLYGON_PRIVATE_KEY:-}
+    depends_on:
+      mercury-redis:
+        condition: service_healthy
+    volumes:
+      - mercury-data:/app/data
+      - ./config:/app/config:ro
+    networks:
+      - mercury-internal
+      - my-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:9090/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+      - "traefik.enable=true"
+      - "traefik.docker.network=my-network"
+      # HTTPS redirect
+      - "traefik.http.middlewares.mercury-redirect.redirectscheme.scheme=https"
+      - "traefik.http.routers.mercury-redirect.middlewares=mercury-redirect"
+      - "traefik.http.routers.mercury-redirect.rule=Host(`mercury.server.unarmedpuppy.com`)"
+      - "traefik.http.routers.mercury-redirect.entrypoints=web"
+      # Local network access (no auth) - highest priority
+      - "traefik.http.routers.mercury-local.rule=Host(`mercury.server.unarmedpuppy.com`) && ClientIP(`192.168.86.0/24`)"
+      - "traefik.http.routers.mercury-local.priority=100"
+      - "traefik.http.routers.mercury-local.entrypoints=websecure"
+      - "traefik.http.routers.mercury-local.tls.certresolver=myresolver"
+      - "traefik.http.routers.mercury-local.service=mercury"
+      # External access (requires auth) - lowest priority
+      - "traefik.http.routers.mercury.rule=Host(`mercury.server.unarmedpuppy.com`)"
+      - "traefik.http.routers.mercury.priority=1"
+      - "traefik.http.routers.mercury.entrypoints=websecure"
+      - "traefik.http.routers.mercury.tls.certresolver=myresolver"
+      - "traefik.http.routers.mercury.tls=true"
+      - "traefik.http.routers.mercury.middlewares=mercury-auth"
+      - "traefik.http.routers.mercury.service=mercury"
+      # Service and auth middleware
+      - "traefik.http.services.mercury.loadbalancer.server.port=9090"
+      - "traefik.http.middlewares.mercury-auth.basicauth.users=${MERCURY_BASIC_AUTH:-admin:$$apr1$$yE.A6vVX$$p7.fpGKw5Unp0UW6H/2c.0}"
+      - "traefik.http.middlewares.mercury-auth.basicauth.realm=Mercury"
+      # Homepage labels
+      - "homepage.group=Finance"
+      - "homepage.name=Mercury"
+      - "homepage.icon=si-bitcoin"
+      - "homepage.href=https://mercury.server.unarmedpuppy.com/health"
+      - "homepage.description=Polymarket trading bot"
+
+  mercury-redis:
+    image: harbor.server.unarmedpuppy.com/docker-hub/library/redis:7-alpine
+    container_name: mercury-redis
+    restart: unless-stopped
+    logging: *default-logging
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - mercury-redis-data:/data
+    networks:
+      - mercury-internal
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 300M
+        reservations:
+          cpus: '0.1'
+          memory: 64M
+
+  mercury-prometheus:
+    image: harbor.server.unarmedpuppy.com/docker-hub/prom/prometheus:v2.48.0
+    container_name: mercury-prometheus
+    restart: unless-stopped
+    logging: *default-logging
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--storage.tsdb.retention.size=5GB'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./prometheus-prod.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus-alerts.yml:/etc/prometheus/alerts.yml:ro
+      - mercury-prometheus-data:/prometheus
+    networks:
+      - mercury-internal
+      - my-network
+    depends_on:
+      - mercury
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          cpus: '0.2'
+          memory: 128M
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=my-network"
+      # HTTPS redirect
+      - "traefik.http.middlewares.mercury-prometheus-redirect.redirectscheme.scheme=https"
+      - "traefik.http.routers.mercury-prometheus-redirect.middlewares=mercury-prometheus-redirect"
+      - "traefik.http.routers.mercury-prometheus-redirect.rule=Host(`mercury-prometheus.server.unarmedpuppy.com`)"
+      - "traefik.http.routers.mercury-prometheus-redirect.entrypoints=web"
+      # Local network access (no auth) - highest priority
+      - "traefik.http.routers.mercury-prometheus-local.rule=Host(`mercury-prometheus.server.unarmedpuppy.com`) && ClientIP(`192.168.86.0/24`)"
+      - "traefik.http.routers.mercury-prometheus-local.priority=100"
+      - "traefik.http.routers.mercury-prometheus-local.entrypoints=websecure"
+      - "traefik.http.routers.mercury-prometheus-local.tls.certresolver=myresolver"
+      - "traefik.http.routers.mercury-prometheus-local.service=mercury-prometheus"
+      # External access (requires auth) - lowest priority
+      - "traefik.http.routers.mercury-prometheus.rule=Host(`mercury-prometheus.server.unarmedpuppy.com`)"
+      - "traefik.http.routers.mercury-prometheus.priority=1"
+      - "traefik.http.routers.mercury-prometheus.entrypoints=websecure"
+      - "traefik.http.routers.mercury-prometheus.tls.certresolver=myresolver"
+      - "traefik.http.routers.mercury-prometheus.tls=true"
+      - "traefik.http.routers.mercury-prometheus.middlewares=mercury-prometheus-auth"
+      - "traefik.http.routers.mercury-prometheus.service=mercury-prometheus"
+      # Service and auth middleware
+      - "traefik.http.services.mercury-prometheus.loadbalancer.server.port=9090"
+      - "traefik.http.middlewares.mercury-prometheus-auth.basicauth.users=${MERCURY_BASIC_AUTH:-admin:$$apr1$$yE.A6vVX$$p7.fpGKw5Unp0UW6H/2c.0}"
+      - "traefik.http.middlewares.mercury-prometheus-auth.basicauth.realm=Mercury-Prometheus"
+      # Homepage labels
+      - "homepage.group=Infrastructure"
+      - "homepage.name=Mercury Prometheus"
+      - "homepage.icon=si-prometheus"
+      - "homepage.href=https://mercury-prometheus.server.unarmedpuppy.com"
+      - "homepage.description=Mercury metrics collection"
+
+  mercury-grafana:
+    image: harbor.server.unarmedpuppy.com/docker-hub/grafana/grafana:10.2.2
+    container_name: mercury-grafana
+    restart: unless-stopped
+    logging: *default-logging
+    user: "1000:1000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-mercury}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=https://mercury-grafana.server.unarmedpuppy.com
+      - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-piechart-panel
+      # Anonymous access for local network (read-only)
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+      # Security
+      - GF_SECURITY_COOKIE_SECURE=true
+      - GF_SECURITY_STRICT_TRANSPORT_SECURITY=true
+    volumes:
+      - mercury-grafana-data:/var/lib/grafana
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    networks:
+      - mercury-internal
+      - my-network
+    depends_on:
+      - mercury-prometheus
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          cpus: '0.2'
+          memory: 128M
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=my-network"
+      # HTTPS redirect
+      - "traefik.http.middlewares.mercury-grafana-redirect.redirectscheme.scheme=https"
+      - "traefik.http.routers.mercury-grafana-redirect.middlewares=mercury-grafana-redirect"
+      - "traefik.http.routers.mercury-grafana-redirect.rule=Host(`mercury-grafana.server.unarmedpuppy.com`)"
+      - "traefik.http.routers.mercury-grafana-redirect.entrypoints=web"
+      # Local network access (no auth) - highest priority
+      - "traefik.http.routers.mercury-grafana-local.rule=Host(`mercury-grafana.server.unarmedpuppy.com`) && ClientIP(`192.168.86.0/24`)"
+      - "traefik.http.routers.mercury-grafana-local.priority=100"
+      - "traefik.http.routers.mercury-grafana-local.entrypoints=websecure"
+      - "traefik.http.routers.mercury-grafana-local.tls.certresolver=myresolver"
+      - "traefik.http.routers.mercury-grafana-local.service=mercury-grafana"
+      # External access (requires auth) - lowest priority
+      - "traefik.http.routers.mercury-grafana.rule=Host(`mercury-grafana.server.unarmedpuppy.com`)"
+      - "traefik.http.routers.mercury-grafana.priority=1"
+      - "traefik.http.routers.mercury-grafana.entrypoints=websecure"
+      - "traefik.http.routers.mercury-grafana.tls.certresolver=myresolver"
+      - "traefik.http.routers.mercury-grafana.tls=true"
+      - "traefik.http.routers.mercury-grafana.middlewares=mercury-grafana-auth"
+      - "traefik.http.routers.mercury-grafana.service=mercury-grafana"
+      # Service and auth middleware
+      - "traefik.http.services.mercury-grafana.loadbalancer.server.port=3000"
+      - "traefik.http.middlewares.mercury-grafana-auth.basicauth.users=${MERCURY_BASIC_AUTH:-admin:$$apr1$$yE.A6vVX$$p7.fpGKw5Unp0UW6H/2c.0}"
+      - "traefik.http.middlewares.mercury-grafana-auth.basicauth.realm=Mercury-Grafana"
+      # Homepage labels
+      - "homepage.group=Finance"
+      - "homepage.name=Mercury Grafana"
+      - "homepage.icon=si-grafana"
+      - "homepage.href=https://mercury-grafana.server.unarmedpuppy.com"
+      - "homepage.description=Mercury trading dashboards"
+
+networks:
+  mercury-internal:
+    driver: bridge
+    internal: true
+  my-network:
+    external: true
+
+volumes:
+  mercury-data:
+    driver: local
+  mercury-redis-data:
+    driver: local
+  mercury-prometheus-data:
+    driver: local
+  mercury-grafana-data:
+    driver: local

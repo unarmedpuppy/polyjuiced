@@ -1,0 +1,50 @@
+# Mercury Production Prometheus Configuration
+#
+# Scrape interval optimized for trading metrics:
+# - 15s for real-time trading metrics
+# - Longer retention with TSDB settings in docker-compose
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    environment: production
+    service: mercury
+
+# Alerting configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []
+      # Uncomment when alertmanager is deployed:
+      # - targets: ['mercury-alertmanager:9093']
+
+# Rule files for alerts
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  # Mercury trading bot metrics
+  - job_name: 'mercury'
+    static_configs:
+      - targets: ['mercury:9090']
+    metrics_path: '/metrics'
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    # Relabel to add job metadata
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        replacement: 'mercury-prod'
+
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+    scrape_interval: 30s
+
+  # Redis metrics (if redis-exporter is added later)
+  # - job_name: 'redis'
+  #   static_configs:
+  #     - targets: ['mercury-redis-exporter:9121']
+  #   scrape_interval: 30s

@@ -1,0 +1,202 @@
+# Mercury Production Alert Rules
+#
+# These alerts cover trading safety, system health, and operational issues.
+
+groups:
+  # Trading Safety Alerts - Critical priority
+  - name: trading_safety
+    interval: 15s
+    rules:
+      # Circuit breaker tripped
+      - alert: CircuitBreakerTripped
+        expr: mercury_circuit_breaker_state{state="HALT"} == 1
+        for: 0m
+        labels:
+          severity: critical
+          team: trading
+        annotations:
+          summary: "Circuit breaker is in HALT state"
+          description: "Mercury circuit breaker has tripped to HALT state. All trading is stopped. Investigate immediately."
+
+      - alert: CircuitBreakerCaution
+        expr: mercury_circuit_breaker_state{state="CAUTION"} == 1
+        for: 5m
+        labels:
+          severity: warning
+          team: trading
+        annotations:
+          summary: "Circuit breaker in CAUTION state"
+          description: "Mercury circuit breaker is in CAUTION state for 5+ minutes. Review risk metrics."
+
+      # Daily loss limit approaching
+      - alert: DailyLossApproaching
+        expr: (mercury_daily_pnl_usd / mercury_max_daily_loss_usd) < -0.8
+        for: 1m
+        labels:
+          severity: warning
+          team: trading
+        annotations:
+          summary: "Daily loss approaching limit"
+          description: "Daily P&L is at {{ $value | humanizePercentage }} of max daily loss limit."
+
+      - alert: DailyLossLimitHit
+        expr: mercury_daily_pnl_usd <= -mercury_max_daily_loss_usd
+        for: 0m
+        labels:
+          severity: critical
+          team: trading
+        annotations:
+          summary: "Daily loss limit hit"
+          description: "Daily P&L has hit the maximum daily loss limit. Trading should be halted."
+
+      # Large unhedged exposure
+      - alert: HighUnhedgedExposure
+        expr: mercury_unhedged_exposure_usd > (mercury_max_unhedged_exposure_usd * 0.9)
+        for: 5m
+        labels:
+          severity: warning
+          team: trading
+        annotations:
+          summary: "High unhedged exposure"
+          description: "Unhedged exposure is {{ $value | humanize }}USD, approaching limit."
+
+  # Order Execution Alerts
+  - name: order_execution
+    interval: 30s
+    rules:
+      # High order rejection rate
+      - alert: HighOrderRejectionRate
+        expr: |
+          (
+            rate(mercury_orders_total{status="rejected"}[5m])
+            / rate(mercury_orders_total[5m])
+          ) > 0.2
+        for: 5m
+        labels:
+          severity: warning
+          team: trading
+        annotations:
+          summary: "High order rejection rate"
+          description: "Order rejection rate is {{ $value | humanizePercentage }} over last 5 minutes."
+
+      # Order execution latency high
+      - alert: HighOrderLatency
+        expr: histogram_quantile(0.95, rate(mercury_order_latency_seconds_bucket[5m])) > 5
+        for: 5m
+        labels:
+          severity: warning
+          team: trading
+        annotations:
+          summary: "High order execution latency"
+          description: "95th percentile order latency is {{ $value | humanizeDuration }} (threshold: 5s)."
+
+      # No orders in a while (if expecting activity)
+      - alert: NoTradingActivity
+        expr: increase(mercury_orders_total[1h]) == 0
+        for: 2h
+        labels:
+          severity: info
+          team: trading
+        annotations:
+          summary: "No trading activity"
+          description: "No orders submitted in the last 2 hours. Verify this is expected."
+
+  # Market Data Alerts
+  - name: market_data
+    interval: 30s
+    rules:
+      # WebSocket disconnection
+      - alert: WebSocketDisconnected
+        expr: mercury_websocket_connected == 0
+        for: 2m
+        labels:
+          severity: warning
+          team: infra
+        annotations:
+          summary: "WebSocket disconnected"
+          description: "Polymarket WebSocket has been disconnected for 2+ minutes."
+
+      # Stale market data
+      - alert: StaleMarketData
+        expr: time() - mercury_last_market_update_timestamp > 60
+        for: 1m
+        labels:
+          severity: warning
+          team: trading
+        annotations:
+          summary: "Stale market data"
+          description: "No market data updates received in the last 60 seconds."
+
+      # High market data latency
+      - alert: HighMarketDataLatency
+        expr: histogram_quantile(0.95, rate(mercury_market_data_latency_seconds_bucket[5m])) > 2
+        for: 5m
+        labels:
+          severity: warning
+          team: infra
+        annotations:
+          summary: "High market data latency"
+          description: "95th percentile market data latency is {{ $value | humanizeDuration }}."
+
+  # System Health Alerts
+  - name: system_health
+    interval: 30s
+    rules:
+      # Mercury service down
+      - alert: MercuryDown
+        expr: up{job="mercury"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          team: infra
+        annotations:
+          summary: "Mercury service is down"
+          description: "Mercury service has been unreachable for 1+ minute."
+
+      # High memory usage
+      - alert: HighMemoryUsage
+        expr: process_resident_memory_bytes{job="mercury"} > 800 * 1024 * 1024
+        for: 10m
+        labels:
+          severity: warning
+          team: infra
+        annotations:
+          summary: "High memory usage"
+          description: "Mercury is using {{ $value | humanize1024 }} of memory (threshold: 800MB)."
+
+      # Redis connection issues
+      - alert: RedisConnectionError
+        expr: mercury_redis_connection_errors_total > 0
+        for: 5m
+        labels:
+          severity: warning
+          team: infra
+        annotations:
+          summary: "Redis connection errors"
+          description: "Mercury is experiencing Redis connection errors."
+
+  # Settlement Alerts
+  - name: settlement
+    interval: 60s
+    rules:
+      # Settlement claim failures
+      - alert: SettlementClaimFailures
+        expr: increase(mercury_settlement_claims_total{status="failed"}[1h]) > 3
+        for: 0m
+        labels:
+          severity: warning
+          team: trading
+        annotations:
+          summary: "Settlement claim failures"
+          description: "{{ $value }} settlement claims have failed in the last hour."
+
+      # Large pending settlements
+      - alert: LargePendingSettlements
+        expr: mercury_pending_settlements_usd > 500
+        for: 30m
+        labels:
+          severity: info
+          team: trading
+        annotations:
+          summary: "Large pending settlements"
+          description: "{{ $value | humanize }}USD in pending settlements for 30+ minutes."
