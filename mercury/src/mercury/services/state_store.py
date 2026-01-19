@@ -546,11 +546,21 @@ class SettlementQueueEntry:
     claim_profit: Optional[Decimal] = None
     claim_attempts: int = 0
     last_claim_error: Optional[str] = None
+    next_retry_at: Optional[datetime] = None
 
     @property
     def is_failed(self) -> bool:
         """Check if this entry has failed claims (attempts > 0 with error)."""
         return self.claim_attempts > 0 and self.last_claim_error is not None and not self.claimed
+
+    @property
+    def can_retry(self) -> bool:
+        """Check if this entry can be retried now."""
+        if self.claimed or self.status == "failed":
+            return False
+        if self.next_retry_at is None:
+            return True
+        return datetime.now(timezone.utc) >= self.next_retry_at
 
     @property
     def cost_basis(self) -> Decimal:
@@ -679,7 +689,12 @@ class MigrationRunner:
         try:
             from mercury.services.migrations import v001_port_legacy_schema
             from mercury.services.migrations import v002_add_daily_stats_drawdown
-            migrations = [v001_port_legacy_schema, v002_add_daily_stats_drawdown]
+            from mercury.services.migrations import v003_add_settlement_retry_fields
+            migrations = [
+                v001_port_legacy_schema,
+                v002_add_daily_stats_drawdown,
+                v003_add_settlement_retry_fields,
+            ]
         except ImportError:
             migrations = []
 
@@ -1505,6 +1520,7 @@ class StateStore:
             List of positions that can be claimed.
         """
         conn = await self._pool.acquire()
+        now = datetime.now(timezone.utc).isoformat()
 
         query = """
             SELECT sq.*, p.strategy, p.opened_at
@@ -1513,8 +1529,9 @@ class StateStore:
             WHERE sq.status = 'pending'
               AND (sq.claimed IS NULL OR sq.claimed = 0)
               AND (sq.claim_attempts IS NULL OR sq.claim_attempts < ?)
+              AND (sq.next_retry_at IS NULL OR sq.next_retry_at <= ?)
         """
-        params: list[Any] = [max_attempts]
+        params: list[Any] = [max_attempts, now]
 
         if min_time_since_end_seconds > 0:
             cutoff = (datetime.now(timezone.utc) - timedelta(seconds=min_time_since_end_seconds)).isoformat()
@@ -1587,12 +1604,17 @@ class StateStore:
         self,
         position_id: str,
         error: Optional[str] = None,
-    ) -> None:
+        next_retry_at: Optional[datetime] = None,
+    ) -> int:
         """Record a claim attempt.
 
         Args:
             position_id: Position ID.
             error: Error message if failed.
+            next_retry_at: When to retry next (for exponential backoff).
+
+        Returns:
+            The new claim_attempts count after incrementing.
         """
         conn = await self._pool.acquire()
         async with self._pool.lock:
@@ -1600,12 +1622,21 @@ class StateStore:
                 """
                 UPDATE settlement_queue
                 SET claim_attempts = COALESCE(claim_attempts, 0) + 1,
-                    last_claim_error = ?
+                    last_claim_error = ?,
+                    next_retry_at = ?
                 WHERE position_id = ?
                 """,
-                (error, position_id),
+                (error, next_retry_at, position_id),
             )
             await conn.commit()
+
+            # Get the new attempt count
+            async with conn.execute(
+                "SELECT claim_attempts FROM settlement_queue WHERE position_id = ?",
+                (position_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+                return row["claim_attempts"] if row else 0
 
     async def get_settlement_stats(self) -> dict[str, Any]:
         """Get settlement queue statistics.
@@ -1765,6 +1796,7 @@ class StateStore:
             claim_profit=Decimal(str(get_val("claim_profit"))) if get_val("claim_profit") else None,
             claim_attempts=get_val("claim_attempts", 0) or 0,
             last_claim_error=get_val("last_claim_error"),
+            next_retry_at=row["next_retry_at"] if isinstance(get_val("next_retry_at"), datetime) else datetime.fromisoformat(row["next_retry_at"]) if get_val("next_retry_at") else None,
         )
 
     async def mark_settlement_failed(

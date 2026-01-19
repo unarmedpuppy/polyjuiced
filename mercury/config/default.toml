@@ -92,6 +92,16 @@ daily_reset_enabled = true
 [settlement]
 check_interval_seconds = 300  # 5 minutes
 max_claim_attempts = 5
+resolution_wait_seconds = 600  # 10 minutes after market end
+
+# Claim retry settings with exponential backoff
+retry_initial_delay_seconds = 60      # 1 minute initial delay
+retry_max_delay_seconds = 3600        # 1 hour max delay
+retry_exponential_base = 2.0          # Double delay each retry
+retry_jitter = true                   # Add randomness to prevent thundering herd
+
+# Alert settings
+alert_after_failures = 3              # Emit alert event after this many failures
 
 [strategies.gabagool]
 enabled = true

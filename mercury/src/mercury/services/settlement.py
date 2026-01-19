@@ -7,11 +7,14 @@ This service:
 - Claims winning positions via CTF redemption
 - Manages the settlement queue state transitions:
   pending -> claimable (after market resolves + wait period) -> claimed
+- Implements exponential backoff for claim retries
+- Alerts after configurable max failures
 
 Ported queue logic from legacy/src/persistence.py settlement_queue handling.
 """
 
 import asyncio
+import random
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -35,6 +38,13 @@ DEFAULT_CHECK_INTERVAL = 300  # 5 minutes
 MAX_CLAIM_ATTEMPTS = 5
 # Wait time after market end before attempting claims (allows resolution to settle)
 DEFAULT_RESOLUTION_WAIT_SECONDS = 600  # 10 minutes
+
+# Retry backoff defaults
+DEFAULT_RETRY_INITIAL_DELAY = 60  # 1 minute
+DEFAULT_RETRY_MAX_DELAY = 3600  # 1 hour
+DEFAULT_RETRY_EXPONENTIAL_BASE = 2.0
+DEFAULT_RETRY_JITTER = True
+DEFAULT_ALERT_AFTER_FAILURES = 3
 
 
 @dataclass
@@ -120,6 +130,28 @@ class SettlementManager(BaseComponent):
             MAX_CLAIM_ATTEMPTS
         )
 
+        # Retry configuration
+        self._retry_initial_delay = config.get_int(
+            "settlement.retry_initial_delay_seconds",
+            DEFAULT_RETRY_INITIAL_DELAY
+        )
+        self._retry_max_delay = config.get_int(
+            "settlement.retry_max_delay_seconds",
+            DEFAULT_RETRY_MAX_DELAY
+        )
+        self._retry_exponential_base = config.get_float(
+            "settlement.retry_exponential_base",
+            DEFAULT_RETRY_EXPONENTIAL_BASE
+        )
+        self._retry_jitter = config.get_bool(
+            "settlement.retry_jitter",
+            DEFAULT_RETRY_JITTER
+        )
+        self._alert_after_failures = config.get_int(
+            "settlement.alert_after_failures",
+            DEFAULT_ALERT_AFTER_FAILURES
+        )
+
         # State
         self._should_run = False
         self._check_task: Optional[asyncio.Task] = None
@@ -131,6 +163,30 @@ class SettlementManager(BaseComponent):
         # Cache for market resolution status (condition_id -> MarketInfo)
         self._resolution_cache: dict[str, MarketInfo] = {}
 
+    def _calculate_next_retry_time(self, attempt: int) -> datetime:
+        """Calculate the next retry time using exponential backoff.
+
+        Args:
+            attempt: The current attempt number (1-indexed, after increment).
+
+        Returns:
+            The datetime when the next retry should be attempted.
+        """
+        # Calculate delay: initial_delay * (base ^ (attempt - 1))
+        delay = self._retry_initial_delay * (
+            self._retry_exponential_base ** (attempt - 1)
+        )
+
+        # Cap at max delay
+        delay = min(delay, self._retry_max_delay)
+
+        # Add jitter (0-25% of delay) to prevent thundering herd
+        if self._retry_jitter:
+            jitter = delay * 0.25 * random.random()
+            delay += jitter
+
+        return datetime.now(timezone.utc) + timedelta(seconds=delay)
+
     async def start(self) -> None:
         """Start the settlement manager."""
         self._start_time = time.time()
@@ -141,6 +197,10 @@ class SettlementManager(BaseComponent):
             resolution_wait=self._resolution_wait,
             max_attempts=self._max_claim_attempts,
             dry_run=self._dry_run,
+            retry_initial_delay=self._retry_initial_delay,
+            retry_max_delay=self._retry_max_delay,
+            retry_exponential_base=self._retry_exponential_base,
+            alert_after_failures=self._alert_after_failures,
         )
 
         # Initialize clients if not provided
@@ -227,9 +287,11 @@ class SettlementManager(BaseComponent):
 
         This method:
         1. Gets positions from settlement queue that are past the resolution wait period
+           and are ready for retry (based on next_retry_at)
         2. Checks if each market has resolved via Gamma API
         3. Processes claims for resolved markets
         4. Updates queue state based on results
+        5. Does NOT block on single failures - continues processing other claims
 
         Returns:
             Number of claims processed.
@@ -239,6 +301,7 @@ class SettlementManager(BaseComponent):
 
         # Get positions that are past the resolution wait period
         # This returns Position objects from the settlement queue
+        # The query respects next_retry_at for failed claims
         queue = await self._state_store.get_claimable_positions(
             max_attempts=self._max_claim_attempts,
             min_time_since_end_seconds=self._resolution_wait,
@@ -251,6 +314,7 @@ class SettlementManager(BaseComponent):
 
         processed = 0
         for position in queue:
+            entry: SettlementQueueEntry | None = None
             try:
                 # Get the settlement queue entry for full details
                 entry = await self._state_store.get_settlement_queue_entry(position.position_id)
@@ -264,19 +328,124 @@ class SettlementManager(BaseComponent):
                     self._claims_processed += 1
                 else:
                     self._claims_failed += 1
+                    # Failure handling is done in _process_claim, including retry scheduling
             except Exception as e:
+                # Catch-all for unexpected errors - don't block other claims
                 self._log.error(
-                    "claim_error",
+                    "claim_error_unexpected",
                     position_id=position.position_id,
                     error=str(e),
                 )
                 self._claims_failed += 1
-                # Record the failed attempt
-                await self._state_store.record_claim_attempt(
-                    position.position_id, error=str(e)
+                # Record the failed attempt with exponential backoff
+                await self._handle_claim_failure(
+                    position.position_id,
+                    error=str(e),
+                    current_attempts=entry.claim_attempts if entry else 0,
+                    market_id=position.market_id,
                 )
+                # Continue processing other claims - don't let one failure block others
 
         return processed
+
+    async def _handle_claim_failure(
+        self,
+        position_id: str,
+        error: str,
+        current_attempts: int,
+        market_id: Optional[str] = None,
+        condition_id: Optional[str] = None,
+    ) -> int:
+        """Handle a claim failure with exponential backoff and alerting.
+
+        Args:
+            position_id: The position ID that failed.
+            error: The error message.
+            current_attempts: The current attempt count before this failure.
+            market_id: Optional market ID for event data.
+            condition_id: Optional condition ID for event data.
+
+        Returns:
+            The new attempt count.
+        """
+        # Calculate next retry time based on the NEW attempt count
+        next_attempt = current_attempts + 1
+        next_retry_at = self._calculate_next_retry_time(next_attempt)
+
+        # Record the failed attempt with next retry time
+        new_attempts = await self._state_store.record_claim_attempt(
+            position_id, error=error, next_retry_at=next_retry_at
+        )
+
+        self._log.warning(
+            "claim_failed_with_retry",
+            position_id=position_id,
+            error=error,
+            attempt=new_attempts,
+            max_attempts=self._max_claim_attempts,
+            next_retry_at=next_retry_at.isoformat(),
+        )
+
+        # Check if we should emit an alert
+        if new_attempts == self._alert_after_failures:
+            await self._emit_claim_alert(
+                position_id=position_id,
+                error=error,
+                attempts=new_attempts,
+                market_id=market_id,
+                condition_id=condition_id,
+            )
+
+        # Check if we've reached max attempts
+        if new_attempts >= self._max_claim_attempts:
+            await self._state_store.mark_settlement_failed(
+                position_id, f"Max attempts ({self._max_claim_attempts}) reached: {error}"
+            )
+            self._log.error(
+                "claim_permanently_failed",
+                position_id=position_id,
+                attempts=new_attempts,
+                error=error,
+            )
+
+        return new_attempts
+
+    async def _emit_claim_alert(
+        self,
+        position_id: str,
+        error: str,
+        attempts: int,
+        market_id: Optional[str] = None,
+        condition_id: Optional[str] = None,
+    ) -> None:
+        """Emit an alert event for a claim that has failed multiple times.
+
+        Args:
+            position_id: The position ID.
+            error: The most recent error.
+            attempts: Number of failed attempts.
+            market_id: Optional market ID.
+            condition_id: Optional condition ID.
+        """
+        await self._event_bus.publish("settlement.alert", {
+            "position_id": position_id,
+            "market_id": market_id,
+            "condition_id": condition_id,
+            "error": error,
+            "attempts": attempts,
+            "alert_threshold": self._alert_after_failures,
+            "max_attempts": self._max_claim_attempts,
+            "severity": "warning" if attempts < self._max_claim_attempts else "critical",
+            "message": f"Claim for position {position_id} has failed {attempts} times",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+
+        self._log.warning(
+            "settlement_alert_emitted",
+            position_id=position_id,
+            attempts=attempts,
+            max_attempts=self._max_claim_attempts,
+        )
 
     async def _check_market_resolution(self, condition_id: str) -> Optional[MarketInfo]:
         """Check if a market has resolved via Gamma API.
@@ -479,14 +648,21 @@ class SettlementManager(BaseComponent):
                 )
             else:
                 error_msg = "Transaction failed"
-                await self._state_store.record_claim_attempt(position_id, error=error_msg)
+                new_attempts = await self._handle_claim_failure(
+                    position_id=position_id,
+                    error=error_msg,
+                    current_attempts=entry.claim_attempts,
+                    market_id=entry.market_id,
+                    condition_id=condition_id,
+                )
 
                 await self._event_bus.publish("settlement.failed", {
                     "position_id": position_id,
                     "market_id": entry.market_id,
                     "condition_id": condition_id,
                     "error": error_msg,
-                    "attempt": entry.claim_attempts + 1,
+                    "attempt": new_attempts,
+                    "max_attempts": self._max_claim_attempts,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 })
 
@@ -499,20 +675,20 @@ class SettlementManager(BaseComponent):
 
         except Exception as e:
             error_msg = str(e)
-            await self._state_store.record_claim_attempt(position_id, error=error_msg)
-
-            # Mark as permanently failed if max attempts reached
-            if entry.claim_attempts + 1 >= self._max_claim_attempts:
-                await self._state_store.mark_settlement_failed(
-                    position_id, f"Max attempts reached: {error_msg}"
-                )
+            new_attempts = await self._handle_claim_failure(
+                position_id=position_id,
+                error=error_msg,
+                current_attempts=entry.claim_attempts,
+                market_id=entry.market_id,
+                condition_id=condition_id,
+            )
 
             await self._event_bus.publish("settlement.failed", {
                 "position_id": position_id,
                 "market_id": entry.market_id,
                 "condition_id": condition_id,
                 "error": error_msg,
-                "attempt": entry.claim_attempts + 1,
+                "attempt": new_attempts,
                 "max_attempts": self._max_claim_attempts,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })

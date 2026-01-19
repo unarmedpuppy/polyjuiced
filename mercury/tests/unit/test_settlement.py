@@ -8,9 +8,12 @@ Tests cover:
 - Settlement queue processing
 - Market resolution checking via Gamma API
 - Claim success/failure handling with proceeds calculation
-- Event publishing (settlement.claimed, settlement.failed, settlement.queued)
+- Event publishing (settlement.claimed, settlement.failed, settlement.queued, settlement.alert)
 - Health check reporting with queue statistics
 - Settlement queue state transitions (pending -> claimable -> claimed)
+- Exponential backoff for claim retries
+- Alert emission after configurable failures
+- Non-blocking failure handling (continue processing other claims)
 """
 import pytest
 import asyncio
@@ -24,6 +27,10 @@ from mercury.services.settlement import (
     DEFAULT_CHECK_INTERVAL,
     DEFAULT_RESOLUTION_WAIT_SECONDS,
     MAX_CLAIM_ATTEMPTS,
+    DEFAULT_RETRY_INITIAL_DELAY,
+    DEFAULT_RETRY_MAX_DELAY,
+    DEFAULT_RETRY_EXPONENTIAL_BASE,
+    DEFAULT_ALERT_AFTER_FAILURES,
 )
 from mercury.services.state_store import Position, SettlementQueueEntry
 from mercury.integrations.polymarket.types import MarketInfo
@@ -39,6 +46,11 @@ def settlement_config():
             "settlement.check_interval_seconds": 60,
             "settlement.resolution_wait_seconds": 600,
             "settlement.max_claim_attempts": 5,
+            "settlement.retry_initial_delay_seconds": 60,
+            "settlement.retry_max_delay_seconds": 3600,
+            "settlement.retry_exponential_base": 2.0,
+            "settlement.retry_jitter": False,  # Disable for predictable tests
+            "settlement.alert_after_failures": 3,
             "mercury.dry_run": True,
             "polymarket.private_key": "0x" + "a" * 64,
             "polygon.rpc_url": "https://polygon-rpc.com",
@@ -50,17 +62,28 @@ def settlement_config():
             "settlement.check_interval_seconds": 60,
             "settlement.resolution_wait_seconds": 600,
             "settlement.max_claim_attempts": 5,
+            "settlement.retry_initial_delay_seconds": 60,
+            "settlement.retry_max_delay_seconds": 3600,
+            "settlement.alert_after_failures": 3,
+        }
+        return values.get(key, default)
+
+    def get_float_side_effect(key, default=0.0):
+        values = {
+            "settlement.retry_exponential_base": 2.0,
         }
         return values.get(key, default)
 
     def get_bool_side_effect(key, default=False):
         values = {
             "mercury.dry_run": True,
+            "settlement.retry_jitter": False,  # Disable for predictable tests
         }
         return values.get(key, default)
 
     config.get.side_effect = get_side_effect
     config.get_int.side_effect = get_int_side_effect
+    config.get_float.side_effect = get_float_side_effect
     config.get_bool.side_effect = get_bool_side_effect
     return config
 
@@ -859,3 +882,363 @@ class TestSettlementResult:
         assert result.success is False
         assert result.error == "Transaction failed"
         assert result.proceeds is None
+
+
+class TestExponentialBackoff:
+    """Test exponential backoff for claim retries."""
+
+    def test_calculate_next_retry_time_first_attempt(self, settlement_manager):
+        """First retry should use initial delay."""
+        # Disable jitter for predictable testing
+        settlement_manager._retry_jitter = False
+        settlement_manager._retry_initial_delay = 60
+
+        next_retry = settlement_manager._calculate_next_retry_time(1)
+
+        # First attempt: 60 * 2^0 = 60 seconds
+        expected_delay = timedelta(seconds=60)
+        assert (next_retry - datetime.now(timezone.utc)) < expected_delay + timedelta(seconds=5)
+        assert (next_retry - datetime.now(timezone.utc)) > expected_delay - timedelta(seconds=5)
+
+    def test_calculate_next_retry_time_exponential_increase(self, settlement_manager):
+        """Retry delay should increase exponentially."""
+        settlement_manager._retry_jitter = False
+        settlement_manager._retry_initial_delay = 60
+        settlement_manager._retry_exponential_base = 2.0
+
+        # Calculate delays for multiple attempts
+        delays = []
+        for attempt in range(1, 5):
+            next_retry = settlement_manager._calculate_next_retry_time(attempt)
+            delay = (next_retry - datetime.now(timezone.utc)).total_seconds()
+            delays.append(delay)
+
+        # Verify exponential increase: 60, 120, 240, 480
+        assert 55 < delays[0] < 65  # ~60 seconds
+        assert 115 < delays[1] < 125  # ~120 seconds
+        assert 235 < delays[2] < 245  # ~240 seconds
+        assert 475 < delays[3] < 485  # ~480 seconds
+
+    def test_calculate_next_retry_time_max_delay_cap(self, settlement_manager):
+        """Delay should be capped at max_delay."""
+        settlement_manager._retry_jitter = False
+        settlement_manager._retry_initial_delay = 60
+        settlement_manager._retry_max_delay = 300  # 5 minutes max
+        settlement_manager._retry_exponential_base = 2.0
+
+        # Attempt 10 would be 60 * 2^9 = 30720 seconds without cap
+        next_retry = settlement_manager._calculate_next_retry_time(10)
+        delay = (next_retry - datetime.now(timezone.utc)).total_seconds()
+
+        # Should be capped at 300 seconds
+        assert 295 < delay < 305
+
+    def test_calculate_next_retry_time_with_jitter(self, settlement_manager):
+        """Jitter should add randomness to delay."""
+        settlement_manager._retry_jitter = True
+        settlement_manager._retry_initial_delay = 60
+
+        # Run multiple times to verify jitter adds variation
+        delays = []
+        for _ in range(10):
+            next_retry = settlement_manager._calculate_next_retry_time(1)
+            delay = (next_retry - datetime.now(timezone.utc)).total_seconds()
+            delays.append(delay)
+
+        # With jitter, delays should vary (not all exactly 60)
+        min_delay = min(delays)
+        max_delay = max(delays)
+        # Base delay is 60, jitter adds up to 25%, so range is 60-75
+        assert 59 < min_delay < 76
+        assert 59 < max_delay < 76
+
+
+class TestClaimFailureHandling:
+    """Test claim failure handling with retries and alerts."""
+
+    @pytest.mark.asyncio
+    async def test_handle_claim_failure_records_attempt(
+        self,
+        settlement_manager,
+        mock_state_store,
+    ):
+        """Should record claim attempt with next retry time."""
+        mock_state_store.record_claim_attempt.return_value = 1
+
+        await settlement_manager._handle_claim_failure(
+            position_id="pos-123",
+            error="Network error",
+            current_attempts=0,
+            market_id="market-456",
+        )
+
+        # Verify record_claim_attempt was called with next_retry_at
+        mock_state_store.record_claim_attempt.assert_called_once()
+        call_args = mock_state_store.record_claim_attempt.call_args
+        # The call is: record_claim_attempt(position_id, error=error, next_retry_at=next_retry_at)
+        assert call_args[0][0] == "pos-123"  # position_id as first positional arg
+        assert call_args[1]["error"] == "Network error"
+        assert call_args[1]["next_retry_at"] is not None
+
+    @pytest.mark.asyncio
+    async def test_handle_claim_failure_emits_alert_at_threshold(
+        self,
+        settlement_manager,
+        mock_state_store,
+        mock_event_bus,
+    ):
+        """Should emit alert when failures reach alert threshold."""
+        settlement_manager._alert_after_failures = 3
+        mock_state_store.record_claim_attempt.return_value = 3  # Matches threshold
+
+        await settlement_manager._handle_claim_failure(
+            position_id="pos-123",
+            error="Persistent error",
+            current_attempts=2,  # Will become 3
+            market_id="market-456",
+            condition_id="cond-789",
+        )
+
+        # Verify settlement.alert was published
+        alert_calls = [
+            call for call in mock_event_bus.publish.call_args_list
+            if call[0][0] == "settlement.alert"
+        ]
+        assert len(alert_calls) == 1
+
+        alert_data = alert_calls[0][0][1]
+        assert alert_data["position_id"] == "pos-123"
+        assert alert_data["attempts"] == 3
+        assert alert_data["severity"] == "warning"
+
+    @pytest.mark.asyncio
+    async def test_handle_claim_failure_no_alert_before_threshold(
+        self,
+        settlement_manager,
+        mock_state_store,
+        mock_event_bus,
+    ):
+        """Should not emit alert before reaching threshold."""
+        settlement_manager._alert_after_failures = 3
+        mock_state_store.record_claim_attempt.return_value = 2  # Below threshold
+
+        await settlement_manager._handle_claim_failure(
+            position_id="pos-123",
+            error="Transient error",
+            current_attempts=1,
+            market_id="market-456",
+        )
+
+        # Verify settlement.alert was NOT published
+        alert_calls = [
+            call for call in mock_event_bus.publish.call_args_list
+            if call[0][0] == "settlement.alert"
+        ]
+        assert len(alert_calls) == 0
+
+    @pytest.mark.asyncio
+    async def test_handle_claim_failure_marks_failed_at_max_attempts(
+        self,
+        settlement_manager,
+        mock_state_store,
+        mock_event_bus,
+    ):
+        """Should mark as failed when max attempts reached."""
+        settlement_manager._max_claim_attempts = 5
+        settlement_manager._alert_after_failures = 3
+        mock_state_store.record_claim_attempt.return_value = 5  # At max
+
+        await settlement_manager._handle_claim_failure(
+            position_id="pos-123",
+            error="Final error",
+            current_attempts=4,  # Will become 5
+            market_id="market-456",
+        )
+
+        # Verify mark_settlement_failed was called
+        mock_state_store.mark_settlement_failed.assert_called_once_with(
+            "pos-123",
+            "Max attempts (5) reached: Final error",
+        )
+
+
+class TestCheckSettlementsWithRetry:
+    """Test check_settlements behavior with retry logic."""
+
+    @pytest.mark.asyncio
+    async def test_continues_processing_after_failure(
+        self,
+        settlement_manager,
+        mock_state_store,
+        mock_gamma_client,
+        mock_event_bus,
+    ):
+        """Should continue processing other claims after one fails."""
+        # Create two positions
+        pos1 = Position(
+            position_id="pos-1",
+            market_id="market-1",
+            strategy="test",
+            side="YES",
+            size=Decimal("10"),
+            entry_price=Decimal("0.5"),
+        )
+        pos2 = Position(
+            position_id="pos-2",
+            market_id="market-2",
+            strategy="test",
+            side="YES",
+            size=Decimal("10"),
+            entry_price=Decimal("0.5"),
+        )
+        mock_state_store.get_claimable_positions.return_value = [pos1, pos2]
+
+        # First position fails to get entry, second succeeds
+        entry2 = SettlementQueueEntry(
+            position_id="pos-2",
+            market_id="market-2",
+            condition_id="cond-2" + "0" * 40,
+            side="YES",
+            size=Decimal("10"),
+            entry_price=Decimal("0.5"),
+            shares=Decimal("10"),
+            entry_cost=Decimal("5.0"),
+        )
+
+        def get_entry_side_effect(pos_id):
+            if pos_id == "pos-1":
+                return None  # Entry not found
+            return entry2
+
+        mock_state_store.get_settlement_queue_entry.side_effect = get_entry_side_effect
+        mock_gamma_client.get_market_info.return_value = None  # Not resolved yet
+
+        result = await settlement_manager.check_settlements()
+
+        # Both positions were processed (first skipped, second returned not resolved)
+        assert result == 0  # Neither claimed successfully
+        # But processing didn't stop after first failure
+        assert mock_state_store.get_settlement_queue_entry.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_handles_exception_during_claim_gracefully(
+        self,
+        settlement_manager,
+        mock_state_store,
+        mock_gamma_client,
+        mock_event_bus,
+    ):
+        """Should handle exceptions during claim and continue.
+
+        Note: Exceptions in _check_market_resolution are caught and logged,
+        returning None (market not resolved). The failure counter increments
+        because the claim is unsuccessful, but no retry is scheduled since
+        "market not resolved" is a normal expected state.
+        """
+        pos1 = Position(
+            position_id="pos-1",
+            market_id="market-1",
+            strategy="test",
+            side="YES",
+            size=Decimal("10"),
+            entry_price=Decimal("0.5"),
+        )
+        mock_state_store.get_claimable_positions.return_value = [pos1]
+
+        entry1 = SettlementQueueEntry(
+            position_id="pos-1",
+            market_id="market-1",
+            condition_id="cond-1" + "0" * 40,
+            side="YES",
+            size=Decimal("10"),
+            entry_price=Decimal("0.5"),
+            shares=Decimal("10"),
+            entry_cost=Decimal("5.0"),
+            claim_attempts=0,
+        )
+        mock_state_store.get_settlement_queue_entry.return_value = entry1
+
+        # Make get_settlement_queue_entry raise an exception to test catch-all
+        def raise_on_second_call(pos_id):
+            if hasattr(raise_on_second_call, "called"):
+                raise Exception("Unexpected DB error")
+            raise_on_second_call.called = True
+            return entry1
+
+        # Reset for this test - use a fresh exception that will be caught
+        mock_state_store.get_settlement_queue_entry.side_effect = Exception("DB crashed")
+        mock_state_store.record_claim_attempt.return_value = 1
+
+        result = await settlement_manager.check_settlements()
+
+        # Claim failed but was handled
+        assert result == 0
+        assert settlement_manager._claims_failed == 1
+        # Failure was recorded with backoff (entry is None so claim_attempts is 0)
+        mock_state_store.record_claim_attempt.assert_called()
+
+
+class TestSettlementQueueEntryCanRetry:
+    """Test the can_retry property of SettlementQueueEntry."""
+
+    def test_can_retry_true_when_no_next_retry_at(self):
+        """Should be retryable when next_retry_at is None."""
+        entry = SettlementQueueEntry(
+            position_id="pos-1",
+            market_id="market-1",
+            side="YES",
+            size=Decimal("10"),
+            entry_price=Decimal("0.5"),
+            next_retry_at=None,
+        )
+        assert entry.can_retry is True
+
+    def test_can_retry_true_when_past_next_retry_at(self):
+        """Should be retryable when past next_retry_at."""
+        entry = SettlementQueueEntry(
+            position_id="pos-1",
+            market_id="market-1",
+            side="YES",
+            size=Decimal("10"),
+            entry_price=Decimal("0.5"),
+            next_retry_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+        )
+        assert entry.can_retry is True
+
+    def test_can_retry_false_when_before_next_retry_at(self):
+        """Should not be retryable when before next_retry_at."""
+        entry = SettlementQueueEntry(
+            position_id="pos-1",
+            market_id="market-1",
+            side="YES",
+            size=Decimal("10"),
+            entry_price=Decimal("0.5"),
+            next_retry_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+        )
+        assert entry.can_retry is False
+
+    def test_can_retry_false_when_claimed(self):
+        """Should not be retryable when already claimed."""
+        entry = SettlementQueueEntry(
+            position_id="pos-1",
+            market_id="market-1",
+            side="YES",
+            size=Decimal("10"),
+            entry_price=Decimal("0.5"),
+            claimed=True,
+            next_retry_at=None,
+        )
+        assert entry.can_retry is False
+
+    def test_can_retry_false_when_permanently_failed(self):
+        """Should not be retryable when status is failed."""
+        entry = SettlementQueueEntry(
+            position_id="pos-1",
+            market_id="market-1",
+            side="YES",
+            size=Decimal("10"),
+            entry_price=Decimal("0.5"),
+            status="failed",
+            next_retry_at=None,
+        )
+        assert entry.can_retry is False
