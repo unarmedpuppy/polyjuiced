@@ -6,17 +6,27 @@ Tests cover:
 - Periodic check loop with configurable interval
 - Position event handling (position.opened subscription)
 - Settlement queue processing
-- Claim success/failure handling
-- Event publishing (settlement.claimed, settlement.failed)
-- Health check reporting
+- Market resolution checking via Gamma API
+- Claim success/failure handling with proceeds calculation
+- Event publishing (settlement.claimed, settlement.failed, settlement.queued)
+- Health check reporting with queue statistics
+- Settlement queue state transitions (pending -> claimable -> claimed)
 """
 import pytest
 import asyncio
 from decimal import Decimal
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock, AsyncMock, patch
 
-from mercury.services.settlement import SettlementManager, DEFAULT_CHECK_INTERVAL
+from mercury.services.settlement import (
+    SettlementManager,
+    SettlementResult,
+    DEFAULT_CHECK_INTERVAL,
+    DEFAULT_RESOLUTION_WAIT_SECONDS,
+    MAX_CLAIM_ATTEMPTS,
+)
+from mercury.services.state_store import Position, SettlementQueueEntry
+from mercury.integrations.polymarket.types import MarketInfo
 
 
 @pytest.fixture
@@ -27,6 +37,8 @@ def settlement_config():
     def get_side_effect(key, default=None):
         values = {
             "settlement.check_interval_seconds": 60,
+            "settlement.resolution_wait_seconds": 600,
+            "settlement.max_claim_attempts": 5,
             "mercury.dry_run": True,
             "polymarket.private_key": "0x" + "a" * 64,
             "polygon.rpc_url": "https://polygon-rpc.com",
@@ -36,6 +48,8 @@ def settlement_config():
     def get_int_side_effect(key, default=0):
         values = {
             "settlement.check_interval_seconds": 60,
+            "settlement.resolution_wait_seconds": 600,
+            "settlement.max_claim_attempts": 5,
         }
         return values.get(key, default)
 
@@ -56,7 +70,19 @@ def mock_state_store():
     """Create mock StateStore."""
     store = MagicMock()
     store.get_claimable_positions = AsyncMock(return_value=[])
-    store.mark_settlement_attempt = AsyncMock()
+    store.get_settlement_queue_entry = AsyncMock(return_value=None)
+    store.get_settlement_queue = AsyncMock(return_value=[])
+    store.get_settlement_stats = AsyncMock(return_value={
+        "total_positions": 0,
+        "unclaimed": 0,
+        "claimed_count": 0,
+        "total_claim_profit": 0,
+    })
+    store.get_failed_claims = AsyncMock(return_value=[])
+    store.mark_claimed = AsyncMock()
+    store.mark_settlement_failed = AsyncMock()
+    store.record_claim_attempt = AsyncMock()
+    store.retry_failed_claim = AsyncMock(return_value=True)
     store.queue_for_settlement = AsyncMock()
     return store
 
@@ -68,6 +94,7 @@ def mock_gamma_client():
     client.connect = AsyncMock()
     client.close = AsyncMock()
     client.get_market = AsyncMock(return_value={"resolved": False})
+    client.get_market_info = AsyncMock(return_value=None)
     return client
 
 
@@ -89,6 +116,75 @@ def settlement_manager(settlement_config, mock_event_bus, mock_state_store, mock
         event_bus=mock_event_bus,
         state_store=mock_state_store,
         gamma_client=mock_gamma_client,
+    )
+
+
+@pytest.fixture
+def sample_position():
+    """Create a sample Position for testing."""
+    return Position(
+        position_id="pos-123",
+        market_id="market-456",
+        strategy="gabagool",
+        side="YES",
+        size=Decimal("10"),
+        entry_price=Decimal("0.45"),
+    )
+
+
+@pytest.fixture
+def sample_queue_entry():
+    """Create a sample SettlementQueueEntry for testing."""
+    return SettlementQueueEntry(
+        id=1,
+        position_id="pos-123",
+        market_id="market-456",
+        condition_id="cond-789" + "0" * 40,
+        side="YES",
+        size=Decimal("10"),
+        entry_price=Decimal("0.45"),
+        shares=Decimal("10"),
+        entry_cost=Decimal("4.50"),
+        status="pending",
+        claim_attempts=0,
+    )
+
+
+@pytest.fixture
+def resolved_market_info_yes():
+    """Create a MarketInfo that resolved to YES."""
+    return MarketInfo(
+        condition_id="cond-789" + "0" * 40,
+        question_id="question-123",
+        question="Will BTC be above $50k?",
+        slug="btc-above-50k",
+        yes_token_id="yes-token-123",
+        no_token_id="no-token-456",
+        yes_price=Decimal("1.0"),
+        no_price=Decimal("0.0"),
+        active=False,
+        closed=True,
+        resolved=True,
+        resolution="YES",
+    )
+
+
+@pytest.fixture
+def resolved_market_info_no():
+    """Create a MarketInfo that resolved to NO."""
+    return MarketInfo(
+        condition_id="cond-789" + "0" * 40,
+        question_id="question-123",
+        question="Will BTC be above $50k?",
+        slug="btc-above-50k",
+        yes_token_id="yes-token-123",
+        no_token_id="no-token-456",
+        yes_price=Decimal("0.0"),
+        no_price=Decimal("1.0"),
+        active=False,
+        closed=True,
+        resolved=True,
+        resolution="NO",
     )
 
 
@@ -119,12 +215,25 @@ class TestSettlementManagerInitialization:
 
         assert manager._check_interval == 60
 
+    def test_initializes_with_resolution_wait(self, settlement_config, mock_event_bus, mock_state_store):
+        """Verify resolution wait is loaded from config."""
+        manager = SettlementManager(
+            config=settlement_config,
+            event_bus=mock_event_bus,
+            state_store=mock_state_store,
+        )
+
+        assert manager._resolution_wait == 600
+
     def test_initial_state(self, settlement_manager):
         """Verify initial manager state."""
         assert settlement_manager._should_run is False
         assert settlement_manager._claims_processed == 0
         assert settlement_manager._claims_failed == 0
+        assert settlement_manager._positions_queued == 0
+        assert settlement_manager._markets_checked == 0
         assert settlement_manager._check_task is None
+        assert settlement_manager._resolution_cache == {}
 
 
 class TestSettlementManagerLifecycle:
@@ -137,9 +246,8 @@ class TestSettlementManagerLifecycle:
 
         assert settlement_manager._should_run is True
         assert settlement_manager._check_task is not None
-        mock_event_bus.subscribe.assert_called_once_with(
-            "position.opened", settlement_manager._on_position_opened
-        )
+        # Should subscribe to both position.opened and order.filled
+        assert mock_event_bus.subscribe.call_count == 2
 
         await settlement_manager.stop()
 
@@ -237,16 +345,20 @@ class TestCheckSettlements:
         mock_state_store.get_claimable_positions.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_processes_claimable_positions(self, settlement_manager, mock_state_store, mock_gamma_client, mock_event_bus):
+    async def test_processes_claimable_positions(
+        self,
+        settlement_manager,
+        mock_state_store,
+        mock_gamma_client,
+        mock_event_bus,
+        sample_position,
+        sample_queue_entry,
+        resolved_market_info_yes,
+    ):
         """Should process positions from the settlement queue."""
-        queue_item = {
-            "id": 1,
-            "position_id": "pos-123",
-            "market_id": "market-456",
-            "condition_id": "cond-789" + "0" * 40,  # 64 char hex
-        }
-        mock_state_store.get_claimable_positions.return_value = [queue_item]
-        mock_gamma_client.get_market.return_value = {"resolved": True}
+        mock_state_store.get_claimable_positions.return_value = [sample_position]
+        mock_state_store.get_settlement_queue_entry.return_value = sample_queue_entry
+        mock_gamma_client.get_market_info.return_value = resolved_market_info_yes
 
         result = await settlement_manager.check_settlements()
 
@@ -256,32 +368,36 @@ class TestCheckSettlements:
         mock_event_bus.publish.assert_called()
 
     @pytest.mark.asyncio
-    async def test_skips_unresolved_markets(self, settlement_manager, mock_state_store, mock_gamma_client):
+    async def test_skips_unresolved_markets(
+        self,
+        settlement_manager,
+        mock_state_store,
+        mock_gamma_client,
+        sample_position,
+        sample_queue_entry,
+    ):
         """Should skip positions where market is not resolved."""
-        queue_item = {
-            "id": 1,
-            "position_id": "pos-123",
-            "market_id": "market-456",
-            "condition_id": "cond-789",
-        }
-        mock_state_store.get_claimable_positions.return_value = [queue_item]
-        mock_gamma_client.get_market.return_value = {"resolved": False}
+        mock_state_store.get_claimable_positions.return_value = [sample_position]
+        mock_state_store.get_settlement_queue_entry.return_value = sample_queue_entry
+        mock_gamma_client.get_market_info.return_value = None  # Not resolved
 
         result = await settlement_manager.check_settlements()
 
         assert result == 0
 
     @pytest.mark.asyncio
-    async def test_handles_claim_errors(self, settlement_manager, mock_state_store, mock_gamma_client):
+    async def test_handles_claim_errors(
+        self,
+        settlement_manager,
+        mock_state_store,
+        mock_gamma_client,
+        sample_position,
+        sample_queue_entry,
+    ):
         """Should handle errors during claim processing."""
-        queue_item = {
-            "id": 1,
-            "position_id": "pos-123",
-            "market_id": "market-456",
-            "condition_id": "cond-789",
-        }
-        mock_state_store.get_claimable_positions.return_value = [queue_item]
-        mock_gamma_client.get_market.side_effect = Exception("API error")
+        mock_state_store.get_claimable_positions.return_value = [sample_position]
+        mock_state_store.get_settlement_queue_entry.return_value = sample_queue_entry
+        mock_gamma_client.get_market_info.side_effect = Exception("API error")
 
         result = await settlement_manager.check_settlements()
 
@@ -289,24 +405,190 @@ class TestCheckSettlements:
         assert settlement_manager._claims_failed == 1
 
 
+class TestMarketResolutionChecking:
+    """Test market resolution checking via Gamma API."""
+
+    @pytest.mark.asyncio
+    async def test_caches_resolved_markets(
+        self,
+        settlement_manager,
+        mock_gamma_client,
+        resolved_market_info_yes,
+    ):
+        """Should cache resolved market info."""
+        condition_id = "cond-789" + "0" * 40
+        mock_gamma_client.get_market_info.return_value = resolved_market_info_yes
+
+        # First call - should hit API
+        result1 = await settlement_manager._check_market_resolution(condition_id)
+        assert result1 is not None
+        assert result1.resolved is True
+        assert mock_gamma_client.get_market_info.call_count == 1
+
+        # Second call - should use cache
+        result2 = await settlement_manager._check_market_resolution(condition_id)
+        assert result2 is not None
+        # Still only 1 API call
+        assert mock_gamma_client.get_market_info.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_does_not_cache_unresolved_markets(
+        self,
+        settlement_manager,
+        mock_gamma_client,
+    ):
+        """Should not cache unresolved market info."""
+        condition_id = "cond-789" + "0" * 40
+        unresolved = MarketInfo(
+            condition_id=condition_id,
+            question_id="q",
+            question="test",
+            slug="test",
+            yes_token_id="y",
+            no_token_id="n",
+            yes_price=Decimal("0.5"),
+            no_price=Decimal("0.5"),
+            active=True,
+            closed=False,
+            resolved=False,
+        )
+        mock_gamma_client.get_market_info.return_value = unresolved
+
+        # First call
+        result1 = await settlement_manager._check_market_resolution(condition_id)
+        assert result1 is None  # Not resolved
+
+        # Second call - should still hit API
+        await settlement_manager._check_market_resolution(condition_id)
+        assert mock_gamma_client.get_market_info.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_clear_resolution_cache(self, settlement_manager, mock_gamma_client, resolved_market_info_yes):
+        """Should be able to clear the resolution cache."""
+        condition_id = "cond-789" + "0" * 40
+        mock_gamma_client.get_market_info.return_value = resolved_market_info_yes
+
+        # Populate cache
+        await settlement_manager._check_market_resolution(condition_id)
+        assert len(settlement_manager._resolution_cache) == 1
+
+        # Clear cache
+        cleared = settlement_manager.clear_resolution_cache()
+        assert cleared == 1
+        assert len(settlement_manager._resolution_cache) == 0
+
+
+class TestSettlementProceedsCalculation:
+    """Test settlement proceeds and profit calculation."""
+
+    def test_winning_yes_position(self, settlement_manager, sample_queue_entry, resolved_market_info_yes):
+        """YES position wins when market resolves YES."""
+        proceeds, profit = settlement_manager._calculate_settlement_proceeds(
+            sample_queue_entry,
+            resolved_market_info_yes,
+        )
+
+        # Shares are 10, entry cost is 4.50
+        # Winner gets $1 per share = $10
+        # Profit = $10 - $4.50 = $5.50
+        assert proceeds == Decimal("10")
+        assert profit == Decimal("5.50")
+
+    def test_losing_yes_position(self, settlement_manager, sample_queue_entry, resolved_market_info_no):
+        """YES position loses when market resolves NO."""
+        proceeds, profit = settlement_manager._calculate_settlement_proceeds(
+            sample_queue_entry,
+            resolved_market_info_no,
+        )
+
+        # Loser gets $0
+        # Loss = -entry_cost = -$4.50
+        assert proceeds == Decimal("0")
+        assert profit == Decimal("-4.50")
+
+    def test_winning_no_position(self, settlement_manager, resolved_market_info_no):
+        """NO position wins when market resolves NO."""
+        no_entry = SettlementQueueEntry(
+            position_id="pos-456",
+            market_id="market-456",
+            side="NO",
+            size=Decimal("10"),
+            entry_price=Decimal("0.55"),
+            shares=Decimal("10"),
+            entry_cost=Decimal("5.50"),
+        )
+
+        proceeds, profit = settlement_manager._calculate_settlement_proceeds(
+            no_entry,
+            resolved_market_info_no,
+        )
+
+        # Winner gets $1 per share = $10
+        # Profit = $10 - $5.50 = $4.50
+        assert proceeds == Decimal("10")
+        assert profit == Decimal("4.50")
+
+    def test_losing_no_position(self, settlement_manager, resolved_market_info_yes):
+        """NO position loses when market resolves YES."""
+        no_entry = SettlementQueueEntry(
+            position_id="pos-456",
+            market_id="market-456",
+            side="NO",
+            size=Decimal("10"),
+            entry_price=Decimal("0.55"),
+            shares=Decimal("10"),
+            entry_cost=Decimal("5.50"),
+        )
+
+        proceeds, profit = settlement_manager._calculate_settlement_proceeds(
+            no_entry,
+            resolved_market_info_yes,
+        )
+
+        # Loser gets $0
+        # Loss = -entry_cost = -$5.50
+        assert proceeds == Decimal("0")
+        assert profit == Decimal("-5.50")
+
+
 class TestPositionOpenedHandler:
     """Test the position.opened event handler."""
 
     @pytest.mark.asyncio
-    async def test_queues_position_for_settlement(self, settlement_manager, mock_state_store):
+    async def test_queues_position_for_settlement(self, settlement_manager, mock_state_store, mock_event_bus):
         """Should queue new positions for settlement."""
         event_data = {
             "position_id": "pos-123",
             "market_id": "market-456",
+            "side": "YES",
+            "size": "10",
+            "entry_price": "0.45",
+            "strategy": "gabagool",
         }
 
         await settlement_manager._on_position_opened(event_data)
 
-        mock_state_store.queue_for_settlement.assert_called_once_with(
-            position_id="pos-123",
-            market_id="market-456",
-            condition_id="market-456",  # Uses market_id as condition_id
-        )
+        mock_state_store.queue_for_settlement.assert_called_once()
+        assert settlement_manager._positions_queued == 1
+        # Should emit settlement.queued event
+        mock_event_bus.publish.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_parses_market_end_time(self, settlement_manager, mock_state_store):
+        """Should parse market_end_time from event data."""
+        event_data = {
+            "position_id": "pos-123",
+            "market_id": "market-456",
+            "side": "YES",
+            "size": "10",
+            "entry_price": "0.45",
+            "market_end_time": "2025-01-01T12:00:00Z",
+        }
+
+        await settlement_manager._on_position_opened(event_data)
+
+        call_kwargs = mock_state_store.queue_for_settlement.call_args[1]
+        assert call_kwargs["market_end_time"] is not None
 
     @pytest.mark.asyncio
     async def test_ignores_incomplete_events(self, settlement_manager, mock_state_store):
@@ -359,6 +641,27 @@ class TestHealthCheck:
         assert "active" in result.message.lower()
         assert "claims_processed" in result.details
         assert "claims_failed" in result.details
+        assert "positions_queued" in result.details
+        assert "markets_checked" in result.details
+
+        await settlement_manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_includes_queue_stats(self, settlement_manager, mock_state_store):
+        """Health check should include queue statistics."""
+        mock_state_store.get_settlement_stats.return_value = {
+            "total_positions": 10,
+            "unclaimed": 5,
+            "total_claim_profit": 25.50,
+        }
+
+        await settlement_manager.start()
+
+        result = await settlement_manager.health_check()
+
+        assert result.details["queue_total"] == 10
+        assert result.details["queue_unclaimed"] == 5
+        assert result.details["total_claim_profit"] == 25.50
 
         await settlement_manager.stop()
 
@@ -367,42 +670,50 @@ class TestDryRunMode:
     """Test dry run mode behavior."""
 
     @pytest.mark.asyncio
-    async def test_dry_run_simulates_claim(self, settlement_manager, mock_state_store, mock_gamma_client, mock_event_bus):
+    async def test_dry_run_simulates_claim(
+        self,
+        settlement_manager,
+        mock_state_store,
+        mock_gamma_client,
+        mock_event_bus,
+        sample_position,
+        sample_queue_entry,
+        resolved_market_info_yes,
+    ):
         """Dry run should simulate successful claims."""
-        queue_item = {
-            "id": 1,
-            "position_id": "pos-123",
-            "market_id": "market-456",
-            "condition_id": "cond-789" + "0" * 40,
-        }
-        mock_state_store.get_claimable_positions.return_value = [queue_item]
-        mock_gamma_client.get_market.return_value = {"resolved": True}
+        mock_state_store.get_claimable_positions.return_value = [sample_position]
+        mock_state_store.get_settlement_queue_entry.return_value = sample_queue_entry
+        mock_gamma_client.get_market_info.return_value = resolved_market_info_yes
 
         result = await settlement_manager.check_settlements()
 
         assert result == 1
-        mock_state_store.mark_settlement_attempt.assert_called_once()
+        mock_state_store.mark_claimed.assert_called_once()
 
-        # Should publish settlement.claimed event
+        # Should publish settlement.claimed event with dry_run=True
         call_args = mock_event_bus.publish.call_args
         assert call_args[0][0] == "settlement.claimed"
-        assert call_args[0][1]["position_id"] == "pos-123"
+        assert call_args[0][1]["dry_run"] is True
 
 
 class TestEventPublishing:
     """Test event publishing behavior."""
 
     @pytest.mark.asyncio
-    async def test_publishes_claimed_event_on_success(self, settlement_manager, mock_state_store, mock_gamma_client, mock_event_bus):
+    async def test_publishes_claimed_event_on_success(
+        self,
+        settlement_manager,
+        mock_state_store,
+        mock_gamma_client,
+        mock_event_bus,
+        sample_position,
+        sample_queue_entry,
+        resolved_market_info_yes,
+    ):
         """Should publish settlement.claimed on successful claim."""
-        queue_item = {
-            "id": 1,
-            "position_id": "pos-123",
-            "market_id": "market-456",
-            "condition_id": "cond-789" + "0" * 40,
-        }
-        mock_state_store.get_claimable_positions.return_value = [queue_item]
-        mock_gamma_client.get_market.return_value = {"resolved": True}
+        mock_state_store.get_claimable_positions.return_value = [sample_position]
+        mock_state_store.get_settlement_queue_entry.return_value = sample_queue_entry
+        mock_gamma_client.get_market_info.return_value = resolved_market_info_yes
 
         await settlement_manager.check_settlements()
 
@@ -416,4 +727,135 @@ class TestEventPublishing:
         event_data = claimed_calls[0][0][1]
         assert event_data["position_id"] == "pos-123"
         assert event_data["market_id"] == "market-456"
+        assert event_data["resolution"] == "YES"
+        assert "proceeds" in event_data
+        assert "profit" in event_data
         assert "timestamp" in event_data
+
+    @pytest.mark.asyncio
+    async def test_publishes_queued_event(self, settlement_manager, mock_state_store, mock_event_bus):
+        """Should publish settlement.queued when position is queued."""
+        event_data = {
+            "position_id": "pos-123",
+            "market_id": "market-456",
+            "side": "YES",
+            "size": "10",
+            "entry_price": "0.45",
+        }
+
+        await settlement_manager._on_position_opened(event_data)
+
+        # Find the settlement.queued call
+        queued_calls = [
+            call for call in mock_event_bus.publish.call_args_list
+            if call[0][0] == "settlement.queued"
+        ]
+        assert len(queued_calls) == 1
+
+        event_data = queued_calls[0][0][1]
+        assert event_data["position_id"] == "pos-123"
+        assert event_data["market_id"] == "market-456"
+
+
+class TestPublicQueueManagement:
+    """Test public queue management methods."""
+
+    @pytest.mark.asyncio
+    async def test_get_settlement_queue(self, settlement_manager, mock_state_store):
+        """Should return settlement queue entries."""
+        entries = [
+            SettlementQueueEntry(
+                position_id="pos-1",
+                market_id="m-1",
+                side="YES",
+                size=Decimal("10"),
+                entry_price=Decimal("0.5"),
+            )
+        ]
+        mock_state_store.get_settlement_queue.return_value = entries
+
+        result = await settlement_manager.get_settlement_queue()
+
+        assert len(result) == 1
+        assert result[0].position_id == "pos-1"
+
+    @pytest.mark.asyncio
+    async def test_get_failed_claims(self, settlement_manager, mock_state_store):
+        """Should return failed claim entries."""
+        entries = [
+            SettlementQueueEntry(
+                position_id="pos-1",
+                market_id="m-1",
+                side="YES",
+                size=Decimal("10"),
+                entry_price=Decimal("0.5"),
+                claim_attempts=3,
+                last_claim_error="Network error",
+            )
+        ]
+        mock_state_store.get_failed_claims.return_value = entries
+
+        result = await settlement_manager.get_failed_claims()
+
+        assert len(result) == 1
+        assert result[0].claim_attempts == 3
+
+    @pytest.mark.asyncio
+    async def test_retry_failed_claim(self, settlement_manager, mock_state_store):
+        """Should reset failed claim for retry."""
+        mock_state_store.retry_failed_claim.return_value = True
+
+        result = await settlement_manager.retry_failed_claim("pos-123")
+
+        assert result is True
+        mock_state_store.retry_failed_claim.assert_called_once_with("pos-123")
+
+    @pytest.mark.asyncio
+    async def test_force_check_market(self, settlement_manager, mock_gamma_client, resolved_market_info_yes):
+        """Should bypass cache for forced market check."""
+        condition_id = "cond-789" + "0" * 40
+        mock_gamma_client.get_market_info.return_value = resolved_market_info_yes
+
+        # First, populate cache
+        await settlement_manager._check_market_resolution(condition_id)
+        assert len(settlement_manager._resolution_cache) == 1
+
+        # Force check should clear and refetch
+        mock_gamma_client.get_market_info.reset_mock()
+        result = await settlement_manager.force_check_market(condition_id)
+
+        assert result is not None
+        mock_gamma_client.get_market_info.assert_called_once()
+
+
+class TestSettlementResult:
+    """Test the SettlementResult dataclass."""
+
+    def test_successful_result(self):
+        """Test creating a successful settlement result."""
+        result = SettlementResult(
+            success=True,
+            position_id="pos-123",
+            condition_id="cond-456",
+            proceeds=Decimal("10"),
+            profit=Decimal("5.50"),
+            resolution="YES",
+        )
+
+        assert result.success is True
+        assert result.proceeds == Decimal("10")
+        assert result.profit == Decimal("5.50")
+        assert result.error is None
+
+    def test_failed_result(self):
+        """Test creating a failed settlement result."""
+        result = SettlementResult(
+            success=False,
+            position_id="pos-123",
+            condition_id="cond-456",
+            error="Transaction failed",
+        )
+
+        assert result.success is False
+        assert result.error == "Transaction failed"
+        assert result.proceeds is None

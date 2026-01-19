@@ -1838,6 +1838,115 @@ class StateStore:
 
         return updated
 
+    async def get_settlement_history(
+        self,
+        limit: int = 50,
+        include_pending: bool = True,
+    ) -> list[SettlementQueueEntry]:
+        """Get settlement queue history for dashboard display.
+
+        Returns positions ordered by most recent first (by queued_at or market_end_time).
+        This is useful for displaying settlement history in a dashboard.
+
+        Args:
+            limit: Maximum number of positions to return.
+            include_pending: Include pending positions (default True).
+
+        Returns:
+            List of SettlementQueueEntry objects with relevant fields for display.
+        """
+        conn = await self._pool.acquire()
+
+        query = "SELECT * FROM settlement_queue"
+        params: list[Any] = []
+
+        if not include_pending:
+            query += " WHERE status != 'pending'"
+
+        query += " ORDER BY COALESCE(queued_at, market_end_time) DESC LIMIT ?"
+        params.append(limit)
+
+        entries = []
+        async with conn.execute(query, params) as cursor:
+            async for row in cursor:
+                entries.append(self._row_to_settlement_entry(row))
+
+        self._log.debug(
+            "get_settlement_history",
+            limit=limit,
+            include_pending=include_pending,
+            count=len(entries),
+        )
+
+        return entries
+
+    async def cleanup_old_claimed_positions(
+        self,
+        days: int = 30,
+    ) -> int:
+        """Delete claimed positions older than specified days.
+
+        This is a data retention function to prevent unbounded database growth.
+        Only deletes positions that have been successfully claimed.
+
+        Args:
+            days: Delete positions claimed more than this many days ago.
+
+        Returns:
+            Number of deleted records.
+        """
+        conn = await self._pool.acquire()
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+        async with self._pool.lock:
+            cursor = await conn.execute(
+                """
+                DELETE FROM settlement_queue
+                WHERE claimed = 1 AND claimed_at < ?
+                """,
+                (cutoff,),
+            )
+            deleted = cursor.rowcount
+            await conn.commit()
+
+        if deleted > 0:
+            self._log.info(
+                "cleanup_old_claimed_positions",
+                days=days,
+                deleted=deleted,
+            )
+        else:
+            self._log.debug("cleanup_old_claimed_positions: nothing to delete")
+
+        return deleted
+
+    async def get_positions_by_condition(
+        self,
+        condition_id: str,
+    ) -> list[SettlementQueueEntry]:
+        """Get all settlement queue entries for a specific market condition.
+
+        Useful for checking if there are any pending positions for a market
+        before or after resolution.
+
+        Args:
+            condition_id: Market condition ID.
+
+        Returns:
+            List of SettlementQueueEntry objects for the condition.
+        """
+        conn = await self._pool.acquire()
+
+        entries = []
+        async with conn.execute(
+            "SELECT * FROM settlement_queue WHERE condition_id = ? ORDER BY queued_at",
+            (condition_id,),
+        ) as cursor:
+            async for row in cursor:
+                entries.append(self._row_to_settlement_entry(row))
+
+        return entries
+
     # ============ Daily Stats ============
 
     async def get_daily_stats(self, for_date: Optional[date] = None) -> DailyStats:
