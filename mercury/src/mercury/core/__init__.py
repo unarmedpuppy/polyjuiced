@@ -1,9 +1,10 @@
-"""Core framework infrastructure - config, events, logging, lifecycle, retry."""
+"""Core framework infrastructure - config, events, logging, lifecycle, retry, shutdown."""
 
 from mercury.core.config import ConfigManager
 from mercury.core.events import EventBus
 from mercury.core.logging import setup_logging
 from mercury.core.lifecycle import Startable, Stoppable, HealthCheckable
+from mercury.core.shutdown import ShutdownManager, ShutdownPhase, ShutdownProgress
 from mercury.core.retry import (
     RetryConfig,
     RetryContext,
@@ -39,6 +40,10 @@ __all__ = [
     "Startable",
     "Stoppable",
     "HealthCheckable",
+    # Shutdown
+    "ShutdownManager",
+    "ShutdownPhase",
+    "ShutdownProgress",
     # Retry - Config
     "RetryConfig",
     "RetryContext",
