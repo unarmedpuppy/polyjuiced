@@ -9,6 +9,10 @@ Event Channel Naming Convention:
 - market.trade.{market_id} - Trade events
 - market.stale.{market_id} - Stale data alerts
 - market.fresh.{market_id} - Fresh data recovery notifications
+- settlement.claimed - Position successfully claimed
+- settlement.failed - Claim attempt failed
+- settlement.queued - New position queued for settlement
+- settlement.alert - Alert for repeated claim failures
 """
 
 from dataclasses import dataclass, field
@@ -312,3 +316,206 @@ class FreshAlert:
             age_seconds=age_seconds,
             stale_duration_seconds=stale_duration_seconds,
         )
+
+
+@dataclass(frozen=True)
+class SettlementClaimedEvent:
+    """Settlement claimed event payload.
+
+    Published to: settlement.claimed
+
+    This event is emitted when a position is successfully claimed after
+    market resolution. Contains the proceeds and profit from the settlement.
+
+    Attributes:
+        position_id: Unique position identifier.
+        market_id: Market identifier.
+        condition_id: Market condition ID (for CTF redemption).
+        resolution: Market resolution ("YES" or "NO").
+        proceeds: Settlement proceeds in USD (string for Decimal serialization).
+        profit: Settlement profit/loss in USD (can be negative).
+        side: Position side ("YES" or "NO").
+        timestamp: When the claim was processed (ISO format).
+        tx_hash: Transaction hash (if on-chain, None for dry run).
+        gas_used: Gas used for the transaction (if on-chain).
+        dry_run: Whether this was a simulated claim.
+        attempts: Number of attempts before successful claim.
+    """
+
+    position_id: str
+    market_id: str
+    condition_id: str
+    resolution: str
+    proceeds: str  # String for Decimal serialization
+    profit: str
+    side: str
+    timestamp: str  # ISO format string
+    tx_hash: Optional[str] = None
+    gas_used: Optional[int] = None
+    dry_run: bool = False
+    attempts: int = 1
+
+    @classmethod
+    def create(
+        cls,
+        position_id: str,
+        market_id: str,
+        condition_id: str,
+        resolution: str,
+        proceeds: Decimal,
+        profit: Decimal,
+        side: str,
+        tx_hash: Optional[str] = None,
+        gas_used: Optional[int] = None,
+        dry_run: bool = False,
+        attempts: int = 1,
+        timestamp: Optional[datetime] = None,
+    ) -> "SettlementClaimedEvent":
+        """Create a SettlementClaimedEvent.
+
+        Args:
+            position_id: Unique position identifier.
+            market_id: Market identifier.
+            condition_id: Market condition ID.
+            resolution: Market resolution ("YES" or "NO").
+            proceeds: Settlement proceeds in USD.
+            profit: Settlement profit/loss in USD.
+            side: Position side ("YES" or "NO").
+            tx_hash: Transaction hash (if on-chain).
+            gas_used: Gas used (if on-chain).
+            dry_run: Whether this was a simulated claim.
+            attempts: Number of attempts before success.
+            timestamp: Event timestamp (defaults to now).
+
+        Returns:
+            SettlementClaimedEvent instance.
+        """
+        ts = timestamp or datetime.now(timezone.utc)
+
+        return cls(
+            position_id=position_id,
+            market_id=market_id,
+            condition_id=condition_id,
+            resolution=resolution,
+            proceeds=str(proceeds),
+            profit=str(profit),
+            side=side,
+            timestamp=ts.isoformat(),
+            tx_hash=tx_hash,
+            gas_used=gas_used,
+            dry_run=dry_run,
+            attempts=attempts,
+        )
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for event publishing.
+
+        Returns:
+            Dictionary representation suitable for JSON serialization.
+        """
+        return {
+            "position_id": self.position_id,
+            "market_id": self.market_id,
+            "condition_id": self.condition_id,
+            "resolution": self.resolution,
+            "proceeds": self.proceeds,
+            "profit": self.profit,
+            "side": self.side,
+            "timestamp": self.timestamp,
+            "tx_hash": self.tx_hash,
+            "gas_used": self.gas_used,
+            "dry_run": self.dry_run,
+            "attempts": self.attempts,
+        }
+
+
+@dataclass(frozen=True)
+class SettlementFailedEvent:
+    """Settlement failed event payload.
+
+    Published to: settlement.failed
+
+    This event is emitted when a claim attempt fails. Contains the error
+    reason and current attempt count for retry tracking.
+
+    Attributes:
+        position_id: Unique position identifier.
+        market_id: Market identifier.
+        condition_id: Market condition ID.
+        reason: Error message describing the failure.
+        attempt_count: Current attempt number (after this failure).
+        max_attempts: Maximum allowed attempts before permanent failure.
+        timestamp: When the failure occurred (ISO format).
+        is_permanent: Whether this failure is permanent (max attempts reached).
+        next_retry_at: When the next retry will be attempted (ISO format).
+    """
+
+    position_id: str
+    reason: str
+    attempt_count: int
+    timestamp: str  # ISO format string
+    market_id: Optional[str] = None
+    condition_id: Optional[str] = None
+    max_attempts: int = 5
+    is_permanent: bool = False
+    next_retry_at: Optional[str] = None
+
+    @classmethod
+    def create(
+        cls,
+        position_id: str,
+        reason: str,
+        attempt_count: int,
+        market_id: Optional[str] = None,
+        condition_id: Optional[str] = None,
+        max_attempts: int = 5,
+        next_retry_at: Optional[datetime] = None,
+        timestamp: Optional[datetime] = None,
+    ) -> "SettlementFailedEvent":
+        """Create a SettlementFailedEvent.
+
+        Args:
+            position_id: Unique position identifier.
+            reason: Error message describing the failure.
+            attempt_count: Current attempt number.
+            market_id: Market identifier.
+            condition_id: Market condition ID.
+            max_attempts: Maximum allowed attempts.
+            next_retry_at: When the next retry will be attempted.
+            timestamp: Event timestamp (defaults to now).
+
+        Returns:
+            SettlementFailedEvent instance.
+        """
+        ts = timestamp or datetime.now(timezone.utc)
+        is_permanent = attempt_count >= max_attempts
+
+        return cls(
+            position_id=position_id,
+            reason=reason,
+            attempt_count=attempt_count,
+            timestamp=ts.isoformat(),
+            market_id=market_id,
+            condition_id=condition_id,
+            max_attempts=max_attempts,
+            is_permanent=is_permanent,
+            next_retry_at=next_retry_at.isoformat() if next_retry_at else None,
+        )
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for event publishing.
+
+        Returns:
+            Dictionary representation suitable for JSON serialization.
+        """
+        return {
+            "position_id": self.position_id,
+            "market_id": self.market_id,
+            "condition_id": self.condition_id,
+            "reason": self.reason,
+            "attempt_count": self.attempt_count,
+            "max_attempts": self.max_attempts,
+            "is_permanent": self.is_permanent,
+            "next_retry_at": self.next_retry_at,
+            "timestamp": self.timestamp,
+        }

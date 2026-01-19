@@ -26,9 +26,11 @@ import structlog
 from mercury.core.config import ConfigManager
 from mercury.core.events import EventBus
 from mercury.core.lifecycle import BaseComponent, HealthCheckResult, HealthStatus
+from mercury.domain.events import SettlementClaimedEvent, SettlementFailedEvent
 from mercury.integrations.chain.client import PolygonClient
 from mercury.integrations.polymarket.gamma import GammaClient
 from mercury.integrations.polymarket.types import MarketInfo, PolymarketSettings
+from mercury.services.metrics import MetricsEmitter
 from mercury.services.state_store import Position, SettlementQueueEntry, StateStore
 
 log = structlog.get_logger()
@@ -95,6 +97,7 @@ class SettlementManager(BaseComponent):
         state_store: Optional[StateStore] = None,
         gamma_client: Optional[GammaClient] = None,
         polygon_client: Optional[PolygonClient] = None,
+        metrics_emitter: Optional[MetricsEmitter] = None,
     ):
         """Initialize the settlement manager.
 
@@ -104,6 +107,7 @@ class SettlementManager(BaseComponent):
             state_store: StateStore for persistence.
             gamma_client: GammaClient for market queries.
             polygon_client: PolygonClient for chain interactions.
+            metrics_emitter: MetricsEmitter for observability metrics.
         """
         super().__init__()
         self._config = config
@@ -114,6 +118,7 @@ class SettlementManager(BaseComponent):
         self._state_store = state_store
         self._gamma_client = gamma_client
         self._polygon_client = polygon_client
+        self._metrics = metrics_emitter
 
         # Configuration
         self._check_interval = config.get_int(
@@ -541,6 +546,29 @@ class SettlementManager(BaseComponent):
 
         return proceeds, profit
 
+    def _categorize_error(self, error_msg: str) -> str:
+        """Categorize an error message for metrics.
+
+        Args:
+            error_msg: The error message to categorize.
+
+        Returns:
+            A category string for metrics labeling.
+        """
+        error_lower = error_msg.lower()
+        if "network" in error_lower or "connection" in error_lower or "timeout" in error_lower:
+            return "network"
+        elif "gas" in error_lower or "insufficient" in error_lower:
+            return "gas"
+        elif "revert" in error_lower or "contract" in error_lower:
+            return "contract"
+        elif "not resolved" in error_lower:
+            return "not_resolved"
+        elif "transaction" in error_lower:
+            return "transaction"
+        else:
+            return "unknown"
+
     async def _process_claim(self, entry: SettlementQueueEntry) -> SettlementResult:
         """Process a single claim from the queue.
 
@@ -589,17 +617,28 @@ class SettlementManager(BaseComponent):
             self._log.info("dry_run_claim", position_id=position_id)
             await self._state_store.mark_claimed(position_id, proceeds, profit)
 
-            await self._event_bus.publish("settlement.claimed", {
-                "position_id": position_id,
-                "market_id": entry.market_id,
-                "condition_id": condition_id,
-                "resolution": market_info.resolution,
-                "proceeds": str(proceeds),
-                "profit": str(profit),
-                "side": entry.side,
-                "dry_run": True,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            })
+            # Create typed event for settlement.claimed
+            claimed_event = SettlementClaimedEvent.create(
+                position_id=position_id,
+                market_id=entry.market_id,
+                condition_id=condition_id,
+                resolution=market_info.resolution or "UNKNOWN",
+                proceeds=proceeds,
+                profit=profit,
+                side=entry.side or "UNKNOWN",
+                dry_run=True,
+                attempts=entry.claim_attempts + 1,
+            )
+            await self._event_bus.publish("settlement.claimed", claimed_event.to_dict())
+
+            # Emit metrics for successful claim
+            if self._metrics:
+                self._metrics.record_settlement_claimed(
+                    resolution=market_info.resolution or "UNKNOWN",
+                    proceeds=proceeds,
+                    profit=profit,
+                    attempts=entry.claim_attempts + 1,
+                )
 
             return SettlementResult(
                 success=True,
@@ -617,18 +656,30 @@ class SettlementManager(BaseComponent):
             if receipt.status:
                 await self._state_store.mark_claimed(position_id, proceeds, profit)
 
-                await self._event_bus.publish("settlement.claimed", {
-                    "position_id": position_id,
-                    "market_id": entry.market_id,
-                    "condition_id": condition_id,
-                    "resolution": market_info.resolution,
-                    "proceeds": str(proceeds),
-                    "profit": str(profit),
-                    "side": entry.side,
-                    "tx_hash": receipt.tx_hash,
-                    "gas_used": receipt.gas_used,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                })
+                # Create typed event for settlement.claimed
+                claimed_event = SettlementClaimedEvent.create(
+                    position_id=position_id,
+                    market_id=entry.market_id,
+                    condition_id=condition_id,
+                    resolution=market_info.resolution or "UNKNOWN",
+                    proceeds=proceeds,
+                    profit=profit,
+                    side=entry.side or "UNKNOWN",
+                    tx_hash=receipt.tx_hash,
+                    gas_used=receipt.gas_used,
+                    dry_run=False,
+                    attempts=entry.claim_attempts + 1,
+                )
+                await self._event_bus.publish("settlement.claimed", claimed_event.to_dict())
+
+                # Emit metrics for successful claim
+                if self._metrics:
+                    self._metrics.record_settlement_claimed(
+                        resolution=market_info.resolution or "UNKNOWN",
+                        proceeds=proceeds,
+                        profit=profit,
+                        attempts=entry.claim_attempts + 1,
+                    )
 
                 self._log.info(
                     "claim_successful",
@@ -656,15 +707,25 @@ class SettlementManager(BaseComponent):
                     condition_id=condition_id,
                 )
 
-                await self._event_bus.publish("settlement.failed", {
-                    "position_id": position_id,
-                    "market_id": entry.market_id,
-                    "condition_id": condition_id,
-                    "error": error_msg,
-                    "attempt": new_attempts,
-                    "max_attempts": self._max_claim_attempts,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                })
+                # Create typed event for settlement.failed
+                is_permanent = new_attempts >= self._max_claim_attempts
+                failed_event = SettlementFailedEvent.create(
+                    position_id=position_id,
+                    reason=error_msg,
+                    attempt_count=new_attempts,
+                    market_id=entry.market_id,
+                    condition_id=condition_id,
+                    max_attempts=self._max_claim_attempts,
+                )
+                await self._event_bus.publish("settlement.failed", failed_event.to_dict())
+
+                # Emit metrics for failed claim
+                if self._metrics:
+                    self._metrics.record_settlement_failed(
+                        reason_type="transaction",
+                        attempt_count=new_attempts,
+                        is_permanent=is_permanent,
+                    )
 
                 return SettlementResult(
                     success=False,
@@ -683,15 +744,27 @@ class SettlementManager(BaseComponent):
                 condition_id=condition_id,
             )
 
-            await self._event_bus.publish("settlement.failed", {
-                "position_id": position_id,
-                "market_id": entry.market_id,
-                "condition_id": condition_id,
-                "error": error_msg,
-                "attempt": new_attempts,
-                "max_attempts": self._max_claim_attempts,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            })
+            # Create typed event for settlement.failed
+            is_permanent = new_attempts >= self._max_claim_attempts
+            failed_event = SettlementFailedEvent.create(
+                position_id=position_id,
+                reason=error_msg,
+                attempt_count=new_attempts,
+                market_id=entry.market_id,
+                condition_id=condition_id,
+                max_attempts=self._max_claim_attempts,
+            )
+            await self._event_bus.publish("settlement.failed", failed_event.to_dict())
+
+            # Emit metrics for failed claim
+            if self._metrics:
+                # Categorize the error type for metrics
+                reason_type = self._categorize_error(error_msg)
+                self._metrics.record_settlement_failed(
+                    reason_type=reason_type,
+                    attempt_count=new_attempts,
+                    is_permanent=is_permanent,
+                )
 
             return SettlementResult(
                 success=False,

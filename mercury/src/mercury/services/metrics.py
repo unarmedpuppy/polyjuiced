@@ -158,6 +158,47 @@ class MetricsEmitter:
             registry=self._registry,
         )
 
+        # Settlement metrics
+        self._settlements_total = Counter(
+            "mercury_settlements_total",
+            "Total settlement claims processed",
+            ["status", "resolution"],
+            registry=self._registry,
+        )
+
+        self._settlement_proceeds = Counter(
+            "mercury_settlement_proceeds_usd_total",
+            "Total settlement proceeds in USD",
+            registry=self._registry,
+        )
+
+        self._settlement_profit = Gauge(
+            "mercury_settlement_profit_usd_total",
+            "Total settlement profit/loss in USD (can be negative)",
+            registry=self._registry,
+        )
+
+        self._settlement_failures = Counter(
+            "mercury_settlement_failures_total",
+            "Total settlement claim failures",
+            ["reason_type"],
+            registry=self._registry,
+        )
+
+        self._settlement_queue_size = Gauge(
+            "mercury_settlement_queue_size",
+            "Current size of settlement queue",
+            ["status"],
+            registry=self._registry,
+        )
+
+        self._settlement_claim_attempts = Histogram(
+            "mercury_settlement_claim_attempts",
+            "Number of attempts before claim success/permanent failure",
+            buckets=[1, 2, 3, 4, 5],
+            registry=self._registry,
+        )
+
         # Execution latency breakdown histograms (target: sub-100ms total)
         # Buckets optimized for low-latency trading: 1ms to 500ms
         latency_buckets = [0.001, 0.005, 0.010, 0.025, 0.050, 0.075, 0.100, 0.150, 0.250, 0.500]
@@ -406,6 +447,66 @@ class MetricsEmitter:
             self.record_execution_fill_time(fill_time_ms)
         if total_time_ms is not None:
             self.record_execution_total_time(total_time_ms)
+
+    def record_settlement_claimed(
+        self,
+        resolution: str,
+        proceeds: Decimal,
+        profit: Decimal,
+        attempts: int = 1,
+    ) -> None:
+        """Record a successful settlement claim.
+
+        Args:
+            resolution: Market resolution ("YES" or "NO")
+            proceeds: Settlement proceeds in USD
+            profit: Settlement profit/loss in USD (can be negative)
+            attempts: Number of attempts before success
+        """
+        self._settlements_total.labels(status="claimed", resolution=resolution).inc()
+        self._settlement_proceeds.inc(float(proceeds))
+        # For profit, we need to track cumulative - use a counter for positive, gauge for net
+        # Since profit can be negative, we'll use the gauge to track running total
+        current = self._settlement_profit._value.get()
+        self._settlement_profit.set(current + float(profit))
+        self._settlement_claim_attempts.observe(attempts)
+
+    def record_settlement_failed(
+        self,
+        reason_type: str,
+        attempt_count: int,
+        is_permanent: bool = False,
+    ) -> None:
+        """Record a settlement claim failure.
+
+        Args:
+            reason_type: Type of failure (e.g., "network", "contract", "not_resolved")
+            attempt_count: Current attempt number
+            is_permanent: Whether this is a permanent failure (max attempts reached)
+        """
+        failure_type = f"{reason_type}_permanent" if is_permanent else reason_type
+        self._settlement_failures.labels(reason_type=failure_type).inc()
+
+        if is_permanent:
+            self._settlements_total.labels(status="failed", resolution="unknown").inc()
+            self._settlement_claim_attempts.observe(attempt_count)
+
+    def update_settlement_queue_size(
+        self,
+        pending: int,
+        claimed: int,
+        failed: int,
+    ) -> None:
+        """Update settlement queue size gauges.
+
+        Args:
+            pending: Number of pending settlements
+            claimed: Number of claimed settlements
+            failed: Number of permanently failed settlements
+        """
+        self._settlement_queue_size.labels(status="pending").set(pending)
+        self._settlement_queue_size.labels(status="claimed").set(claimed)
+        self._settlement_queue_size.labels(status="failed").set(failed)
 
     def get_metrics(self) -> str:
         """Get Prometheus metrics output.

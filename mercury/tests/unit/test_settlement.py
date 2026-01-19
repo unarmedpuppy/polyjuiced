@@ -1242,3 +1242,142 @@ class TestSettlementQueueEntryCanRetry:
             next_retry_at=None,
         )
         assert entry.can_retry is False
+
+
+class TestSettlementMetricsEmission:
+    """Test metrics emission for settlement events."""
+
+    @pytest.fixture
+    def mock_metrics_emitter(self):
+        """Create mock MetricsEmitter."""
+        metrics = MagicMock()
+        metrics.record_settlement_claimed = MagicMock()
+        metrics.record_settlement_failed = MagicMock()
+        metrics.update_settlement_queue_size = MagicMock()
+        return metrics
+
+    @pytest.fixture
+    def settlement_manager_with_metrics(
+        self, settlement_config, mock_event_bus, mock_state_store, mock_gamma_client, mock_metrics_emitter
+    ):
+        """Create SettlementManager with metrics emitter."""
+        return SettlementManager(
+            config=settlement_config,
+            event_bus=mock_event_bus,
+            state_store=mock_state_store,
+            gamma_client=mock_gamma_client,
+            metrics_emitter=mock_metrics_emitter,
+        )
+
+    @pytest.mark.asyncio
+    async def test_emits_metrics_on_successful_claim(
+        self,
+        settlement_manager_with_metrics,
+        mock_state_store,
+        mock_gamma_client,
+        mock_metrics_emitter,
+        sample_position,
+        sample_queue_entry,
+        resolved_market_info_yes,
+    ):
+        """Should emit metrics when claim succeeds."""
+        mock_state_store.get_claimable_positions.return_value = [sample_position]
+        mock_state_store.get_settlement_queue_entry.return_value = sample_queue_entry
+        mock_gamma_client.get_market_info.return_value = resolved_market_info_yes
+
+        await settlement_manager_with_metrics.check_settlements()
+
+        # Verify metrics were emitted
+        mock_metrics_emitter.record_settlement_claimed.assert_called_once()
+        call_args = mock_metrics_emitter.record_settlement_claimed.call_args
+        assert call_args[1]["resolution"] == "YES"
+        assert call_args[1]["proceeds"] == Decimal("10")  # 10 shares @ $1 each
+        assert call_args[1]["profit"] == Decimal("5.50")  # $10 - $4.50 entry cost
+        assert call_args[1]["attempts"] == 1
+
+    @pytest.mark.asyncio
+    async def test_emits_metrics_on_losing_claim(
+        self,
+        settlement_manager_with_metrics,
+        mock_state_store,
+        mock_gamma_client,
+        mock_metrics_emitter,
+        sample_position,
+        sample_queue_entry,
+        resolved_market_info_no,  # Market resolved to NO
+    ):
+        """Should emit metrics for losing position claim."""
+        mock_state_store.get_claimable_positions.return_value = [sample_position]
+        mock_state_store.get_settlement_queue_entry.return_value = sample_queue_entry
+        mock_gamma_client.get_market_info.return_value = resolved_market_info_no
+
+        await settlement_manager_with_metrics.check_settlements()
+
+        # Verify metrics were emitted with negative profit
+        mock_metrics_emitter.record_settlement_claimed.assert_called_once()
+        call_args = mock_metrics_emitter.record_settlement_claimed.call_args
+        assert call_args[1]["resolution"] == "NO"
+        assert call_args[1]["proceeds"] == Decimal("0")  # Loser gets $0
+        assert call_args[1]["profit"] == Decimal("-4.50")  # Lost entry cost
+
+    @pytest.mark.asyncio
+    async def test_no_metrics_without_emitter(
+        self,
+        settlement_manager,  # Uses manager without metrics emitter
+        mock_state_store,
+        mock_gamma_client,
+        sample_position,
+        sample_queue_entry,
+        resolved_market_info_yes,
+    ):
+        """Should work fine without metrics emitter configured."""
+        mock_state_store.get_claimable_positions.return_value = [sample_position]
+        mock_state_store.get_settlement_queue_entry.return_value = sample_queue_entry
+        mock_gamma_client.get_market_info.return_value = resolved_market_info_yes
+
+        # Should not raise even without metrics emitter
+        result = await settlement_manager.check_settlements()
+        assert result == 1
+
+
+class TestErrorCategorization:
+    """Test error categorization for metrics."""
+
+    @pytest.fixture
+    def manager(self, settlement_config, mock_event_bus, mock_state_store, mock_gamma_client):
+        """Create a manager for testing _categorize_error."""
+        return SettlementManager(
+            config=settlement_config,
+            event_bus=mock_event_bus,
+            state_store=mock_state_store,
+            gamma_client=mock_gamma_client,
+        )
+
+    def test_categorize_network_error(self, manager):
+        """Network errors should be categorized as network."""
+        assert manager._categorize_error("Network connection failed") == "network"
+        assert manager._categorize_error("Connection timeout") == "network"
+        assert manager._categorize_error("Request timeout exceeded") == "network"
+
+    def test_categorize_gas_error(self, manager):
+        """Gas errors should be categorized as gas."""
+        assert manager._categorize_error("Gas price too high") == "gas"
+        assert manager._categorize_error("Insufficient funds for gas") == "gas"
+
+    def test_categorize_contract_error(self, manager):
+        """Contract errors should be categorized as contract."""
+        assert manager._categorize_error("Contract execution reverted") == "contract"
+        assert manager._categorize_error("Revert: already claimed") == "contract"
+
+    def test_categorize_not_resolved(self, manager):
+        """Not resolved errors should be categorized appropriately."""
+        assert manager._categorize_error("Market not resolved yet") == "not_resolved"
+
+    def test_categorize_transaction_error(self, manager):
+        """Transaction errors should be categorized as transaction."""
+        assert manager._categorize_error("Transaction failed") == "transaction"
+
+    def test_categorize_unknown_error(self, manager):
+        """Unknown errors should be categorized as unknown."""
+        assert manager._categorize_error("Something unexpected happened") == "unknown"
+        assert manager._categorize_error("") == "unknown"

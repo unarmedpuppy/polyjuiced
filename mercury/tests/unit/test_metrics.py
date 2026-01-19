@@ -1,5 +1,6 @@
 """Unit tests for MetricsEmitter."""
 import pytest
+from decimal import Decimal
 from prometheus_client import CollectorRegistry, REGISTRY
 
 from mercury.services.metrics import MetricsEmitter
@@ -135,3 +136,145 @@ class TestExecutionLatencyMetrics:
         assert 'mercury_execution_total_time_seconds_bucket{le="0.001"}' in output
         assert 'mercury_execution_total_time_seconds_bucket{le="0.01"}' in output
         assert 'mercury_execution_total_time_seconds_bucket{le="0.1"}' in output
+
+
+class TestSettlementMetrics:
+    """Test settlement-related metrics."""
+
+    def test_settlement_metrics_exist(self, metrics_emitter):
+        """Verify all settlement metrics are created."""
+        output = metrics_emitter.get_metrics()
+
+        assert "mercury_settlements_total" in output
+        assert "mercury_settlement_proceeds_usd_total" in output
+        assert "mercury_settlement_profit_usd_total" in output
+        assert "mercury_settlement_failures_total" in output
+        assert "mercury_settlement_queue_size" in output
+        assert "mercury_settlement_claim_attempts" in output
+
+    def test_record_settlement_claimed(self, metrics_emitter):
+        """Verify successful claim is recorded."""
+        metrics_emitter.record_settlement_claimed(
+            resolution="YES",
+            proceeds=Decimal("10.00"),
+            profit=Decimal("5.50"),
+            attempts=1,
+        )
+
+        output = metrics_emitter.get_metrics()
+
+        # Check settlement counter
+        assert 'mercury_settlements_total{resolution="YES",status="claimed"}' in output
+
+        # Check proceeds counter
+        assert "mercury_settlement_proceeds_usd_total 10.0" in output
+
+        # Check profit gauge
+        assert "mercury_settlement_profit_usd_total 5.5" in output
+
+        # Check attempts histogram
+        assert "mercury_settlement_claim_attempts_count 1.0" in output
+
+    def test_record_settlement_claimed_negative_profit(self, metrics_emitter):
+        """Verify losing position profit is recorded correctly."""
+        metrics_emitter.record_settlement_claimed(
+            resolution="NO",
+            proceeds=Decimal("0.00"),
+            profit=Decimal("-4.50"),
+            attempts=1,
+        )
+
+        output = metrics_emitter.get_metrics()
+
+        # Check settlement counter for losing position
+        assert 'mercury_settlements_total{resolution="NO",status="claimed"}' in output
+
+        # Check profit gauge (negative)
+        assert "mercury_settlement_profit_usd_total -4.5" in output
+
+    def test_record_settlement_claimed_cumulative_profit(self, metrics_emitter):
+        """Verify profit accumulates across multiple claims."""
+        # First claim: +5.50
+        metrics_emitter.record_settlement_claimed(
+            resolution="YES",
+            proceeds=Decimal("10.00"),
+            profit=Decimal("5.50"),
+            attempts=1,
+        )
+
+        # Second claim: -3.00
+        metrics_emitter.record_settlement_claimed(
+            resolution="NO",
+            proceeds=Decimal("0.00"),
+            profit=Decimal("-3.00"),
+            attempts=1,
+        )
+
+        output = metrics_emitter.get_metrics()
+
+        # Net profit should be 5.50 - 3.00 = 2.50
+        assert "mercury_settlement_profit_usd_total 2.5" in output
+
+    def test_record_settlement_failed_transient(self, metrics_emitter):
+        """Verify transient failure is recorded."""
+        metrics_emitter.record_settlement_failed(
+            reason_type="network",
+            attempt_count=1,
+            is_permanent=False,
+        )
+
+        output = metrics_emitter.get_metrics()
+
+        # Check failure counter
+        assert 'mercury_settlement_failures_total{reason_type="network"}' in output
+
+        # Should NOT increment settlements_total for transient failures
+        assert 'mercury_settlements_total{resolution="unknown",status="failed"} 1.0' not in output
+
+    def test_record_settlement_failed_permanent(self, metrics_emitter):
+        """Verify permanent failure is recorded."""
+        metrics_emitter.record_settlement_failed(
+            reason_type="contract",
+            attempt_count=5,
+            is_permanent=True,
+        )
+
+        output = metrics_emitter.get_metrics()
+
+        # Check failure counter with _permanent suffix
+        assert 'mercury_settlement_failures_total{reason_type="contract_permanent"}' in output
+
+        # Should increment settlements_total for permanent failures
+        assert 'mercury_settlements_total{resolution="unknown",status="failed"} 1.0' in output
+
+        # Should record attempts histogram for permanent failures
+        assert "mercury_settlement_claim_attempts_count 1.0" in output
+
+    def test_update_settlement_queue_size(self, metrics_emitter):
+        """Verify queue size gauges are updated."""
+        metrics_emitter.update_settlement_queue_size(
+            pending=10,
+            claimed=5,
+            failed=2,
+        )
+
+        output = metrics_emitter.get_metrics()
+
+        assert 'mercury_settlement_queue_size{status="pending"} 10.0' in output
+        assert 'mercury_settlement_queue_size{status="claimed"} 5.0' in output
+        assert 'mercury_settlement_queue_size{status="failed"} 2.0' in output
+
+    def test_record_settlement_claimed_multiple_attempts(self, metrics_emitter):
+        """Verify multiple attempts before success is recorded."""
+        metrics_emitter.record_settlement_claimed(
+            resolution="YES",
+            proceeds=Decimal("10.00"),
+            profit=Decimal("5.50"),
+            attempts=3,
+        )
+
+        output = metrics_emitter.get_metrics()
+
+        # Check attempts histogram has a count of 1 with value 3
+        assert "mercury_settlement_claim_attempts_count 1.0" in output
+        assert "mercury_settlement_claim_attempts_sum 3.0" in output
