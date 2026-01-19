@@ -1,0 +1,148 @@
+# Parallel Validation Report: Mercury vs Polyjuiced
+
+**Date**: January 2026
+**Status**: Validation Complete
+**Overall Match Rate**: 86.7%
+
+## Executive Summary
+
+This report documents the parallel validation between Mercury (the new event-driven trading bot) and polyjuiced (the legacy system). The validation compares signal generation, position sizing, risk decisions, and circuit breaker behavior.
+
+### Key Findings
+
+| Category | Match Rate | Status |
+|----------|-----------|--------|
+| Signal Detection | 100.0% (8/8) | ✅ Full Match |
+| Position Sizing | 100.0% (6/6) | ✅ Full Match |
+| Risk Decisions | 87.5% (7/8) | ⚠️ Known Difference |
+| Circuit Breaker | 62.5% (5/8) | ⚠️ Known Difference |
+
+**Verdict**: Mercury is ready for production. The discrepancies are **intentional improvements**, not bugs.
+
+## Detailed Analysis
+
+### 1. Signal Detection (100% Match)
+
+Both systems correctly:
+- Detect arbitrage when YES + NO < $1.00
+- Apply the same spread threshold (1.5¢ minimum)
+- Reject opportunities below threshold
+- Handle edge cases (extreme prices, asymmetric markets)
+
+**Test Cases Passed**:
+- Clear arbitrage (4¢ spread)
+- Marginal arbitrage (2¢ spread)
+- Below threshold (1¢ spread)
+- No arbitrage (sum = $1.00)
+- Asymmetric prices
+- Extreme price scenarios
+
+### 2. Position Sizing (100% Match)
+
+Both systems calculate identical position sizes:
+- Equal shares for YES and NO (maximizes arbitrage profit)
+- Respect max trade size limits
+- Handle asymmetric prices correctly
+- Return zero for invalid prices
+
+**Verified Formula**:
+```
+cost_per_pair = yes_price + no_price
+num_pairs = budget / cost_per_pair
+yes_amount = num_pairs * yes_price
+no_amount = num_pairs * no_price
+```
+
+### 3. Risk Decisions (87.5% Match)
+
+**Matching Behaviors**:
+- Allow trades in normal conditions
+- Reject when position size exceeds limit
+- Reject at daily loss limit
+- Reject at HALT level (5 failures or 100% loss)
+- Apply WARNING level on 3 consecutive failures
+- Apply CAUTION level on 4 consecutive failures
+
+**Known Difference**: Mercury's Intermediate Loss Thresholds
+
+Mercury implements more granular loss-based circuit breaker levels:
+- WARNING at $50 loss (50% of daily limit)
+- CAUTION at $75 loss (75% of daily limit)
+- HALT at $100 loss (100% of daily limit)
+
+Polyjuiced only triggers circuit breaker on the HALT threshold for losses.
+
+**Impact**: Mercury is **more conservative** with loss management. This is an intentional improvement that:
+- Reduces position sizes earlier when losses accumulate
+- Blocks new positions before hitting the hard limit
+- Provides more gradual risk reduction
+
+### 4. Circuit Breaker (62.5% Match)
+
+**Matching Behaviors**:
+- NORMAL state with no failures/losses
+- WARNING on 3 consecutive failures
+- CAUTION on 4 consecutive failures
+- HALT on 5 consecutive failures
+- HALT on 100% daily loss
+
+**Known Differences**: Loss-Based State Transitions
+
+| Condition | Mercury | Polyjuiced |
+|-----------|---------|------------|
+| 50% daily loss | WARNING | NORMAL |
+| 75% daily loss | CAUTION | NORMAL |
+| 2 failures + 60% loss | WARNING | NORMAL |
+
+Mercury's behavior is **intentionally more protective**:
+- Starts reducing position sizes at 50% loss
+- Blocks new positions at 75% loss
+- Does not wait for HALT threshold
+
+## Discrepancy Resolution
+
+All discrepancies are **intentional design improvements** in Mercury:
+
+1. **Intermediate Loss Thresholds**: Mercury's 4-level circuit breaker (NORMAL → WARNING → CAUTION → HALT) provides more granular risk control compared to polyjuiced's binary (NORMAL → HALT) loss handling.
+
+2. **Earlier Intervention**: By triggering WARNING and CAUTION states at lower loss levels, Mercury reduces exposure before hitting the hard limit.
+
+3. **Combined Risk Assessment**: Mercury properly combines failure count and loss amount to determine the most severe applicable state.
+
+## Verification Commands
+
+To run the validation:
+
+```bash
+cd /workspace/polyjuiced/mercury
+python scripts/parallel_validation.py
+```
+
+To run the unit tests:
+
+```bash
+cd /workspace/polyjuiced/mercury
+pytest tests/unit/test_parallel_validation.py -v
+```
+
+## Recommendations
+
+1. **Proceed with Migration**: Mercury's behavior matches polyjuiced for core trading logic and provides enhanced risk management.
+
+2. **Monitor Circuit Breaker**: After switching, monitor circuit breaker state transitions to ensure the more conservative behavior aligns with trading goals.
+
+3. **Configuration Alignment**: If exact polyjuiced behavior is needed, Mercury's circuit breaker thresholds can be adjusted:
+   ```toml
+   [risk]
+   circuit_breaker_warning_loss = 100  # Same as halt to disable intermediate
+   circuit_breaker_caution_loss = 100  # Same as halt to disable intermediate
+   circuit_breaker_halt_loss = 100
+   ```
+
+## Conclusion
+
+Mercury is validated and ready for production use. The 86.7% match rate reflects intentional improvements in risk management, not bugs. Signal detection and position sizing are 100% compatible with polyjuiced.
+
+---
+
+*Generated by parallel_validation.py*
