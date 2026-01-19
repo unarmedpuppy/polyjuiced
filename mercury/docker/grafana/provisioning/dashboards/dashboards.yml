@@ -1,0 +1,13 @@
+apiVersion: 1
+
+providers:
+  - name: Mercury
+    orgId: 1
+    folder: Mercury
+    folderUid: mercury
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
