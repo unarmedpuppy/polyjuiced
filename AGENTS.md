@@ -1,32 +1,46 @@
-# Project Mercury - Agent Instructions
+# Mercury - Polymarket Trading Bot
 
-**Status**: Clean-slate rebuild in progress
-**Replaces**: polyjuiced (legacy code in `legacy/` directory)
+**Status**: Production-ready
+**Replaces**: polyjuiced (legacy code in `legacy/` directory - reference only)
 
-## Executive Summary
+## Quick Start
 
-Mercury is a complete rebuild of the Polymarket trading bot. The previous codebase (polyjuiced) suffered from:
-- 3,400-line god class (`gabagool.py`)
-- Tight coupling between dashboard, strategies, and data feeds
-- Brittle WebSocket connections without proper health monitoring
-- Metrics system with global mutable state
-- No ability to run strategies independently
+```bash
+# Development (dry-run mode)
+cd mercury
+pip install -e .[dev]
+python -m mercury --dry-run
 
-**Mercury's Core Principles:**
-1. **Event-driven architecture** - Components communicate via Redis pub/sub, never direct calls
+# Run tests
+pytest tests/ -v
+
+# Check health
+python -m mercury health
+
+# Production (Docker)
+cd mercury/docker
+docker compose -f docker-compose.prod.yml up -d
+```
+
+## Overview
+
+Mercury is an event-driven Polymarket trading bot built on clean architecture principles. It replaces the legacy polyjuiced codebase which suffered from tight coupling and a 3,400-line god class.
+
+**Core Principles:**
+1. **Event-driven architecture** - Components communicate via Redis pub/sub
 2. **Single responsibility** - Each service does ONE thing well
-3. **Strategy as plugins** - Strategies are isolated, can be enabled/disabled at runtime
-4. **Observability via metrics** - Dashboard consumes metrics, never couples to trading engine
-5. **Fail gracefully** - Circuit breakers, retries, graceful degradation
+3. **Strategy as plugins** - Strategies are isolated, discovered automatically
+4. **Observability** - Prometheus metrics, structured logging, health endpoints
+5. **Fail gracefully** - Circuit breakers, retries, graceful shutdown
 
-## Architecture Overview
+## Architecture
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │                    OBSERVABILITY (Emit Only)                     │
 │              Prometheus Metrics → Grafana Dashboards             │
 └──────────────────────────────────────────────────────────────────┘
-                                ▲ emit only (no reading)
+                                ▲ emit only
 ┌──────────────────────────────────────────────────────────────────┐
 │                         REDIS EVENT BUS                          │
 │  market.* │ signal.* │ order.* │ position.* │ risk.* │ system.*  │
@@ -44,244 +58,513 @@ Mercury is a complete rebuild of the Polymarket trading bot. The previous codeba
                  └─────────────┘       └─────────────┘
 ```
 
-## Critical Design Patterns
+### Service Responsibilities
 
-### 1. Event Bus Communication (MANDATORY)
-
-**NEVER** do this:
-```python
-# BAD - Direct coupling
-class Strategy:
-    def __init__(self, dashboard, metrics, persistence):
-        self.dashboard = dashboard  # NO!
-
-    def on_signal(self, signal):
-        self.dashboard.update(signal)  # NO - direct call
-        self.metrics.record(signal)    # NO - direct call
-```
-
-**ALWAYS** do this:
-```python
-# GOOD - Event-driven
-class Strategy:
-    def __init__(self, event_bus: EventBus):
-        self.event_bus = event_bus
-
-    async def on_signal(self, signal):
-        await self.event_bus.publish(f"signal.{self.name}", signal)
-        # Dashboard, metrics, persistence subscribe independently
-```
-
-### 2. Single Responsibility Services
-
-Each service has ONE job:
-
-| Service | Responsibility | NOT Responsible For |
-|---------|---------------|---------------------|
-| MarketDataService | Stream market data, maintain order books | Trading decisions, persistence |
-| StrategyEngine | Load strategies, route data, collect signals | Order execution, risk checks |
-| RiskManager | Validate signals against limits | Executing trades, persistence |
-| ExecutionEngine | Submit orders, track lifecycle | Signal generation, risk decisions |
-| StateStore | Persist data, query history | Business logic, event publishing |
-| SettlementManager | Claim resolved positions | Trading, market monitoring |
-
-### 3. Strategy Plugin Pattern
-
-Strategies implement the `BaseStrategy` protocol:
-
-```python
-class BaseStrategy(Protocol):
-    @property
-    def name(self) -> str: ...
-
-    @property
-    def enabled(self) -> bool: ...
-
-    async def on_market_data(self, market_id: str, book: OrderBook) -> AsyncIterator[TradingSignal]:
-        """Yield 0, 1, or many signals per market update."""
-        ...
-
-    def get_subscribed_markets(self) -> list[str]: ...
-```
-
-**Key constraints:**
-- Strategies receive market data, emit signals - nothing else
-- No direct database access (use events)
-- No direct metrics calls (use events)
-- No dashboard coupling (use events)
-- Configuration via TOML, not hardcoded
-
-### 4. Error Handling Pattern
-
-```python
-# Use tenacity for retries on external calls
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=10),
-    retry=retry_if_exception_type(TransientError)
-)
-async def call_external_api(self):
-    ...
-
-# Emit failures as events for circuit breaker
-try:
-    result = await self.execute_order(order)
-except OrderRejected as e:
-    await self.event_bus.publish("order.rejected", {"order_id": order.id, "reason": str(e)})
-    raise
-```
+| Service | Responsibility |
+|---------|----------------|
+| **MarketDataService** | Stream market data, maintain order books |
+| **StrategyEngine** | Load strategies, route data, collect signals |
+| **RiskManager** | Validate signals, enforce limits, circuit breaker |
+| **ExecutionEngine** | Submit orders, track lifecycle |
+| **StateStore** | Persist positions, trades, daily stats |
+| **SettlementManager** | Claim resolved positions on-chain |
+| **MetricsEmitter** | Emit Prometheus metrics |
+| **HealthService** | Health check endpoint at `:9090/health` |
 
 ## Project Structure
 
 ```
 polyjuiced/
-├── AGENTS.md                 # This file
+├── AGENTS.md                 # This file (agent instructions)
 ├── legacy/                   # OLD polyjuiced code (reference only)
-│   ├── src/                  # Do NOT modify - reference for porting
-│   ├── tests/
+│   ├── src/                  # Do NOT modify
 │   └── docs/
 │
-├── mercury/                  # NEW clean-slate implementation
-│   ├── pyproject.toml
-│   ├── config/
-│   │   ├── default.toml
-│   │   ├── production.toml
-│   │   └── development.toml
+├── mercury/                  # Current implementation
+│   ├── pyproject.toml        # Project metadata and dependencies
+│   ├── README.md             # Quick reference
 │   │
-│   └── src/mercury/
-│       ├── __init__.py
-│       ├── __main__.py       # Entry: python -m mercury
-│       ├── app.py            # Application wiring
-│       │
-│       ├── core/             # Framework (no business logic)
-│       │   ├── config.py     # ConfigManager
-│       │   ├── events.py     # EventBus (Redis pub/sub)
-│       │   ├── logging.py    # Structured logging
-│       │   └── lifecycle.py  # Start/stop protocols
-│       │
-│       ├── domain/           # Pure models (no I/O)
-│       │   ├── market.py     # Market, OrderBook
-│       │   ├── order.py      # Order, Position, Fill
-│       │   ├── signal.py     # TradingSignal
-│       │   └── risk.py       # RiskLimits, CircuitBreakerState
-│       │
-│       ├── services/         # Business logic (single responsibility)
-│       │   ├── market_data.py
-│       │   ├── strategy_engine.py
-│       │   ├── risk_manager.py
-│       │   ├── execution.py
-│       │   ├── state_store.py
-│       │   ├── settlement.py
-│       │   └── metrics.py
-│       │
-│       ├── strategies/       # Strategy plugins
-│       │   ├── base.py       # BaseStrategy protocol
-│       │   ├── registry.py   # Discovery/loading
-│       │   └── gabagool/     # Ported strategy
-│       │
-│       └── integrations/     # External adapters
-│           ├── polymarket/   # CLOB, Gamma, WebSocket
-│           ├── price_feeds/  # Binance, etc.
-│           └── chain/        # Polygon/Web3
+│   ├── config/
+│   │   ├── default.toml      # Base configuration
+│   │   └── production.toml   # Production overrides
+│   │
+│   ├── docker/
+│   │   ├── Dockerfile        # Multi-stage build
+│   │   ├── docker-compose.yml         # Local development
+│   │   └── docker-compose.prod.yml    # Production deployment
+│   │
+│   ├── src/mercury/
+│   │   ├── __init__.py
+│   │   ├── __main__.py       # CLI entry point
+│   │   ├── app.py            # Application lifecycle
+│   │   │
+│   │   ├── core/             # Framework (no business logic)
+│   │   │   ├── config.py     # TOML config + env vars
+│   │   │   ├── events.py     # EventBus (Redis pub/sub)
+│   │   │   ├── logging.py    # Structured logging (structlog)
+│   │   │   ├── lifecycle.py  # Start/stop protocols
+│   │   │   ├── retry.py      # Tenacity retry utilities
+│   │   │   └── shutdown.py   # Graceful shutdown manager
+│   │   │
+│   │   ├── domain/           # Pure models (no I/O)
+│   │   │   ├── market.py     # Market metadata
+│   │   │   ├── orderbook.py  # OrderBook (sorted containers)
+│   │   │   ├── order.py      # Order, Position, Fill
+│   │   │   ├── signal.py     # TradingSignal
+│   │   │   ├── risk.py       # RiskLimits, CircuitBreakerState
+│   │   │   └── events.py     # Domain event types
+│   │   │
+│   │   ├── services/         # Business logic services
+│   │   │   ├── market_data.py
+│   │   │   ├── strategy_engine.py
+│   │   │   ├── risk_manager.py
+│   │   │   ├── execution.py
+│   │   │   ├── state_store.py
+│   │   │   ├── settlement.py
+│   │   │   ├── metrics.py
+│   │   │   ├── health.py
+│   │   │   └── migrations/   # Database migrations
+│   │   │
+│   │   ├── strategies/       # Strategy plugins
+│   │   │   ├── base.py       # BaseStrategy protocol
+│   │   │   ├── registry.py   # Auto-discovery
+│   │   │   └── gabagool/     # Arbitrage strategy
+│   │   │       ├── __init__.py
+│   │   │       ├── config.py
+│   │   │       └── strategy.py
+│   │   │
+│   │   ├── integrations/     # External service adapters
+│   │   │   ├── polymarket/
+│   │   │   │   ├── clob.py        # CLOB API client
+│   │   │   │   ├── gamma.py       # Gamma API client
+│   │   │   │   ├── websocket.py   # Real-time market data
+│   │   │   │   ├── market_finder.py
+│   │   │   │   └── types.py
+│   │   │   ├── price_feeds/
+│   │   │   │   ├── base.py
+│   │   │   │   └── binance.py
+│   │   │   └── chain/
+│   │   │       ├── client.py      # Polygon RPC client
+│   │   │       └── ctf.py         # CTF contract interactions
+│   │   │
+│   │   ├── validation/       # Parallel validation framework
+│   │   │   └── parallel_validator.py
+│   │   │
+│   │   └── cli/              # CLI commands
+│   │
+│   ├── scripts/
+│   │   ├── migrate_from_polyjuiced.py  # Legacy migration
+│   │   └── parallel_validation.py      # Validation runner
+│   │
+│   └── tests/
+│       ├── conftest.py       # Shared fixtures
+│       ├── unit/             # Unit tests
+│       ├── integration/      # Integration tests
+│       ├── smoke/            # Phase smoke tests
+│       └── performance/      # Load tests
 │
-├── agents/
-│   └── plans/
-│       └── clean-slate-rebuild-plan.md  # Full architecture doc
-│
-└── docker/
-    ├── Dockerfile
-    └── docker-compose.yml
+└── agents/
+    └── plans/
+        └── clean-slate-rebuild-plan.md  # Original architecture doc
 ```
 
-## Task Execution Guidelines
+## How to Run
 
-### Beads Workflow
-
-All Mercury tasks are tracked as beads. The beads database lives in `../home-server/.beads/` (centralized for all projects), but implementation happens here in `polyjuiced/`.
+### Local Development
 
 ```bash
-# BEADS COMMANDS - run from home-server (sibling directory)
-cd ../home-server
+cd mercury
 
-bd list --label mercury              # All Mercury tasks
-bd ready --label mercury             # Unblocked tasks
-bd show home-server-rspl             # Master epic details
-bd update <id> --status in_progress  # Claim a task
-bd close <id> --reason "Implemented" # Complete a task
+# Install in development mode
+pip install -e .[dev]
 
-# IMPLEMENTATION - run from polyjuiced (this repo)
-cd ../polyjuiced
-# ... write code, run tests, commit
+# Run with dry-run (no real trades)
+python -m mercury --dry-run
+
+# Run with custom config
+python -m mercury --config config/development.toml
+
+# Run with debug logging
+python -m mercury --log-level DEBUG
+
+# Check health
+python -m mercury health
+
+# Show version
+python -m mercury version
 ```
 
-### Phase Dependencies
+### Docker Development
 
-Phases are sequential - do NOT skip ahead:
+```bash
+cd mercury/docker
 
-```
-Phase 1 (Core Infrastructure)
-    ↓ blocks
-Phase 2 (Integration Layer)
-    ↓ blocks
-Phase 3 (Market Data Service)
-    ↓ blocks
-Phase 4 (State Store)
-    ↓ blocks
-Phase 5 (Execution Engine)
-    ↓ blocks
-Phase 6 (Strategy Engine)
-    ↓ blocks
-Phase 7 (Risk Manager)
-    ↓ blocks
-Phase 8 (Settlement Manager)
-    ↓ blocks
-Phase 9 (Polish & Production)
+# Start all services (Mercury, Redis, Prometheus, Grafana)
+docker compose up -d
+
+# View logs
+docker compose logs -f mercury
+
+# Stop
+docker compose down
 ```
 
-### Task Execution Protocol
+### Production Deployment
 
-1. **Before starting a task:**
-   ```bash
-   bd show <task-id>                    # Read full description
-   bd dep tree <task-id>                # Check dependencies are done
-   bd update <task-id> --status in_progress
-   ```
+```bash
+cd mercury/docker
 
-2. **While working:**
-   - Follow the design patterns in this document
-   - Reference `legacy/` for logic to port, NOT patterns to copy
-   - Write tests alongside implementation
-   - Commit frequently with clear messages
+# Create external network (once)
+docker network create my-network
 
-3. **After completing:**
-   ```bash
-   # Run tests
-   cd mercury && pytest tests/ -v
+# Set up credentials in .env
+cat > .env << 'EOF'
+MERCURY_POLYMARKET_PRIVATE_KEY=your_key_here
+MERCURY_POLYMARKET_API_KEY=your_key_here
+MERCURY_POLYMARKET_API_SECRET=your_secret_here
+MERCURY_POLYMARKET_API_PASSPHRASE=your_passphrase_here
+MERCURY_POLYGON_PRIVATE_KEY=your_polygon_key  # Optional
+GRAFANA_ADMIN_PASSWORD=secure_password
+EOF
 
-   # Close the bead
-   bd close <task-id> --reason "Implemented with tests"
+# Deploy
+docker compose -f docker-compose.prod.yml up -d
+```
 
-   # Commit
-   git add . && git commit -m "mercury: <task description>"
-   ```
+**Production URLs:**
+- `https://mercury.server.unarmedpuppy.com/health` - Health check
+- `https://mercury-grafana.server.unarmedpuppy.com` - Dashboards
+- `https://mercury-prometheus.server.unarmedpuppy.com` - Metrics
 
-### What to Port vs Rewrite
+## Configuration
 
-| Port (extract logic) | Rewrite (new implementation) |
-|---------------------|------------------------------|
-| `legacy/src/client/gamma.py` | Main orchestration |
-| `legacy/src/client/websocket.py` message parsing | Strategy framework |
-| `legacy/src/monitoring/market_finder.py` filters | Dashboard (eliminated) |
-| `legacy/src/risk/circuit_breaker.py` state machine | Metrics system |
-| `legacy/src/persistence.py` schema | Configuration |
-| Gabagool signal detection logic | All event publishing |
+Configuration uses TOML files with environment variable overrides.
 
-**When porting:**
-- Extract the LOGIC, not the structure
-- Remove all dashboard/metrics coupling
-- Add proper type hints
-- Add async where appropriate
-- Add tenacity retries for external calls
+### Config Priority (highest to lowest)
+
+1. Command-line arguments (`--dry-run`, `--log-level`)
+2. Environment variables (`MERCURY_*`)
+3. Custom config file (`--config path/to/config.toml`)
+4. Production config (`config/production.toml`)
+5. Default config (`config/default.toml`)
+
+### Key Configuration Sections
+
+```toml
+[mercury]
+log_level = "INFO"
+log_json = false
+dry_run = true  # ALWAYS default to dry run
+
+[redis]
+url = "redis://localhost:6379"
+
+[database]
+path = "./data/mercury.db"
+
+[polymarket]
+clob_url = "https://clob.polymarket.com/"
+gamma_url = "https://gamma-api.polymarket.com"
+ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+# Credentials from env: MERCURY_POLYMARKET_*
+
+[metrics]
+enabled = true
+port = 9090
+
+[risk]
+max_daily_loss_usd = 100.0
+max_position_size_usd = 25.0
+max_daily_trades = 100
+circuit_breaker_cooldown_minutes = 5
+
+[strategies.gabagool]
+enabled = true
+markets = ["BTC", "ETH", "SOL"]
+min_spread_threshold = 0.015
+max_trade_size_usd = 25.0
+```
+
+### Environment Variables
+
+All config values can be overridden via environment:
+
+```bash
+# Pattern: MERCURY_SECTION_KEY
+MERCURY_DRY_RUN=true
+MERCURY_LOG_LEVEL=DEBUG
+MERCURY_REDIS_URL=redis://localhost:6379
+MERCURY_RISK_MAX_DAILY_LOSS_USD=50.0
+
+# Credentials (always via env, never in config files)
+MERCURY_POLYMARKET_PRIVATE_KEY=0x...
+MERCURY_POLYMARKET_API_KEY=...
+MERCURY_POLYMARKET_API_SECRET=...
+MERCURY_POLYMARKET_API_PASSPHRASE=...
+MERCURY_POLYGON_PRIVATE_KEY=0x...
+```
+
+## Adding New Strategies
+
+### 1. Create Strategy Directory
+
+```bash
+mkdir -p mercury/src/mercury/strategies/my_strategy
+touch mercury/src/mercury/strategies/my_strategy/__init__.py
+```
+
+### 2. Implement Strategy Class
+
+Create `mercury/src/mercury/strategies/my_strategy/strategy.py`:
+
+```python
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from typing import AsyncIterator
+
+import structlog
+
+from mercury.core.config import ConfigManager
+from mercury.domain.market import OrderBook
+from mercury.domain.signal import SignalPriority, SignalType, TradingSignal
+
+log = structlog.get_logger()
+
+
+class MyStrategy:
+    """My custom trading strategy.
+
+    Implements the BaseStrategy protocol for automatic discovery.
+    """
+
+    def __init__(self, config: ConfigManager) -> None:
+        self._config = config
+        self._enabled = config.get_bool("strategies.my_strategy.enabled", False)
+        self._log = log.bind(strategy="my_strategy")
+        self._subscribed_markets: list[str] = []
+
+    @property
+    def name(self) -> str:
+        """Unique strategy identifier."""
+        return "my_strategy"
+
+    @property
+    def enabled(self) -> bool:
+        """Whether strategy is enabled."""
+        return self._enabled
+
+    async def start(self) -> None:
+        """Initialize strategy resources."""
+        self._log.info("strategy_started")
+
+    async def stop(self) -> None:
+        """Cleanup strategy resources."""
+        self._log.info("strategy_stopped")
+
+    def enable(self) -> None:
+        self._enabled = True
+
+    def disable(self) -> None:
+        self._enabled = False
+
+    def get_subscribed_markets(self) -> list[str]:
+        """Markets this strategy wants data for."""
+        return self._subscribed_markets
+
+    async def on_market_data(
+        self,
+        market_id: str,
+        book: OrderBook,
+    ) -> AsyncIterator[TradingSignal]:
+        """Process market data and yield signals.
+
+        This is an async generator - yield 0, 1, or many signals.
+        """
+        if not self._enabled:
+            return
+
+        # Your signal detection logic here
+        opportunity = self._detect_opportunity(book)
+        if opportunity:
+            yield TradingSignal(
+                strategy_name=self.name,
+                market_id=market_id,
+                signal_type=SignalType.DIRECTIONAL,
+                confidence=0.75,
+                priority=SignalPriority.MEDIUM,
+                target_size_usd=Decimal("10.0"),
+                yes_price=book.yes_best_ask,
+                no_price=book.no_best_ask,
+                expected_pnl=Decimal("0.50"),
+                max_slippage=Decimal("0.01"),
+                expires_at=datetime.now(timezone.utc) + timedelta(seconds=30),
+            )
+
+    def _detect_opportunity(self, book: OrderBook) -> bool:
+        """Your custom detection logic."""
+        # Implement your strategy logic
+        return False
+```
+
+### 3. Export in `__init__.py`
+
+```python
+# mercury/src/mercury/strategies/my_strategy/__init__.py
+from .strategy import MyStrategy
+
+__all__ = ["MyStrategy"]
+```
+
+### 4. Add Configuration
+
+Add to `config/default.toml`:
+
+```toml
+[strategies.my_strategy]
+enabled = false  # Disable by default
+# Your strategy-specific config
+my_param = 0.05
+```
+
+### 5. Add Tests
+
+Create `mercury/tests/unit/test_my_strategy.py`:
+
+```python
+import pytest
+from decimal import Decimal
+from mercury.strategies.my_strategy import MyStrategy
+from mercury.domain.market import OrderBook
+
+
+@pytest.fixture
+def strategy(mock_config):
+    return MyStrategy(mock_config)
+
+
+async def test_strategy_name(strategy):
+    assert strategy.name == "my_strategy"
+
+
+async def test_disabled_yields_nothing(strategy):
+    strategy._enabled = False
+    book = OrderBook(market_id="test", yes_token_id="1", no_token_id="2")
+
+    signals = [s async for s in strategy.on_market_data("test", book)]
+
+    assert len(signals) == 0
+```
+
+### 6. Enable in Config
+
+To use the strategy, enable it in your config:
+
+```toml
+[strategies.my_strategy]
+enabled = true
+```
+
+The strategy will be auto-discovered on startup.
+
+## Testing
+
+```bash
+cd mercury
+
+# Run all tests
+pytest tests/ -v
+
+# Run unit tests only
+pytest tests/unit/ -v
+
+# Run with coverage
+pytest tests/ --cov=mercury --cov-report=html
+
+# Run specific test file
+pytest tests/unit/test_risk_manager.py -v
+
+# Run smoke tests
+pytest tests/smoke/ -v
+```
+
+### Test Categories
+
+| Directory | Purpose |
+|-----------|---------|
+| `tests/unit/` | Unit tests (mocked dependencies) |
+| `tests/integration/` | Integration tests (real Redis, etc.) |
+| `tests/smoke/` | Phase smoke tests (end-to-end per phase) |
+| `tests/performance/` | Load and performance tests |
+
+## Deployment
+
+### Tag-Based Deployment
+
+Mercury uses Gitea Actions for CI/CD. Tag a release to trigger build and deploy:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+This will:
+1. Build Docker image
+2. Push to Harbor registry
+3. Deploy via Watchtower (auto-updates)
+
+### Manual Deployment
+
+```bash
+cd mercury/docker
+
+# Build image
+docker build -t harbor.server.unarmedpuppy.com/library/mercury:latest -f Dockerfile ..
+
+# Push to registry
+docker push harbor.server.unarmedpuppy.com/library/mercury:latest
+
+# Deploy
+docker compose -f docker-compose.prod.yml up -d
+```
+
+## Monitoring
+
+### Health Check
+
+```bash
+curl http://localhost:9090/health
+```
+
+Returns:
+```json
+{
+  "status": "healthy",
+  "uptime_seconds": 3600,
+  "components": {
+    "redis": {"status": "connected"},
+    "market_data": {"status": "healthy"}
+  }
+}
+```
+
+### Metrics
+
+Prometheus metrics available at `:9090/metrics`:
+
+- `mercury_uptime_seconds` - Application uptime
+- `mercury_signals_generated_total` - Trading signals by strategy
+- `mercury_orders_executed_total` - Orders by status
+- `mercury_daily_pnl_usd` - Daily P&L
+- `mercury_circuit_breaker_state` - Circuit breaker status
+
+### Grafana Dashboards
+
+Pre-configured dashboards at `https://mercury-grafana.server.unarmedpuppy.com`:
+
+- **Trading Overview** - P&L, trades, signals
+- **Market Data** - Order book health, latency
+- **Risk** - Position exposure, circuit breaker
+- **System** - CPU, memory, Redis
 
 ## Coding Standards
 
@@ -313,132 +596,52 @@ results = await asyncio.gather(
 )
 ```
 
-### Logging
+### Structured Logging
 
 ```python
 import structlog
 log = structlog.get_logger()
 
-# Always use structured logging with context
 log.info("order_executed",
     order_id=order.id,
     market_id=order.market_id,
     size=str(order.size),
-    latency_ms=latency
+    latency_ms=latency,
 )
 ```
 
-### Configuration Access
+### Event Bus Communication
 
 ```python
-# Via ConfigManager, never hardcoded
-spread_threshold = self.config.get("strategies.gabagool.min_spread_threshold")
-
-# With defaults
-max_size = self.config.get("strategies.gabagool.max_trade_size_usd", Decimal("25.0"))
+# Always publish events, never call services directly
+await self.event_bus.publish(f"signal.{self.name}", signal.to_dict())
 ```
 
-## Testing & Verification Requirements
+## Task Tracking
 
-### Task-Level Verification (MANDATORY)
-
-Every task MUST include tests that verify completion. This enables automated verification loops.
-
-**Convention:** For a task that creates `services/foo.py`, there must be a corresponding `tests/unit/test_foo.py` that:
-1. Imports the module successfully
-2. Tests the core functionality described in the bead
-
-```python
-# tests/unit/test_risk_manager.py
-import pytest
-from mercury.services.risk_manager import RiskManager
-
-@pytest.fixture
-def risk_manager(mock_config, mock_event_bus):
-    return RiskManager(mock_config, mock_event_bus)
-
-async def test_rejects_when_daily_loss_exceeded(risk_manager):
-    risk_manager._daily_pnl = Decimal("-100.0")  # At limit
-
-    signal = TradingSignal(target_size_usd=Decimal("10.0"), ...)
-    allowed, reason = await risk_manager.check_pre_trade(signal)
-
-    assert not allowed
-    assert "daily loss" in reason.lower()
-```
-
-### Verification Command
-
-After completing ANY task, run:
-```bash
-cd ../polyjuiced/mercury
-pytest tests/ -v --tb=short
-```
-
-**A task is NOT complete until tests pass.**
-
-### Phase-Level Smoke Tests
-
-Each phase has a smoke test that verifies the phase deliverables work together:
-
-| Phase | Smoke Test | What It Verifies |
-|-------|------------|------------------|
-| 1 | `pytest tests/smoke/test_phase1_core.py` | Config loads, EventBus connects to Redis, metrics endpoint responds |
-| 2 | `pytest tests/smoke/test_phase2_integrations.py` | Can connect to Polymarket, fetch markets, subscribe to WebSocket |
-| 3 | `pytest tests/smoke/test_phase3_market_data.py` | MarketDataService streams data, publishes to EventBus |
-| 4 | `pytest tests/smoke/test_phase4_persistence.py` | StateStore CRUD operations work, schema is correct |
-| 5 | `pytest tests/smoke/test_phase5_execution.py` | ExecutionEngine can submit orders (dry-run), emit events |
-| 6 | `pytest tests/smoke/test_phase6_strategy.py` | Gabagool strategy loads, generates signals from mock data |
-| 7 | `pytest tests/smoke/test_phase7_risk.py` | RiskManager validates signals, circuit breaker works |
-| 8 | `pytest tests/smoke/test_phase8_settlement.py` | SettlementManager processes queue, emits events |
-| 9 | `pytest tests/smoke/test_phase9_e2e.py` | Full trading flow works end-to-end |
-
-### Automated Verification Loop Protocol
-
-For Ralph Wiggum or similar automated loops:
+All Mercury tasks are tracked centrally in the beads database:
 
 ```bash
-# 1. Before starting a task
-cd ../home-server && bd update <id> --status in_progress
+# From home-server directory
+cd ../home-server
 
-# 2. After implementation, verify task
-cd ../polyjuiced/mercury
-pytest tests/unit/test_<component>.py -v
-# Must exit 0
-
-# 3. Verify phase smoke test still passes
-pytest tests/smoke/test_phase<N>_*.py -v
-# Must exit 0
-
-# 4. Only then close the bead
-cd ../home-server && bd close <id> --reason "Verified: tests pass"
+bd list --label mercury              # All Mercury tasks
+bd ready --label mercury             # Unblocked tasks
+bd show <task-id>                    # Task details
 ```
 
-### Test File Naming Convention
+## Legacy Code Reference
 
-| Component | Test File |
-|-----------|-----------|
-| `core/config.py` | `tests/unit/test_config.py` |
-| `core/events.py` | `tests/unit/test_events.py` |
-| `services/market_data.py` | `tests/unit/test_market_data.py` |
-| `services/execution.py` | `tests/unit/test_execution.py` |
-| `strategies/gabagool/strategy.py` | `tests/unit/test_gabagool.py` |
-| `integrations/polymarket/clob.py` | `tests/integration/test_clob.py` |
+The `legacy/` directory contains the original polyjuiced implementation. Use it as reference for:
 
-## Definition of Done
+- **Port**: Signal detection logic, API client implementations, market filtering
+- **Don't port**: Architecture patterns, dashboard coupling, global state
 
-A Mercury task is complete when:
-
-- [ ] Implementation follows event-driven patterns (no direct coupling)
-- [ ] Single responsibility maintained (service does ONE thing)
-- [ ] Type hints on all public interfaces
-- [ ] Unit tests for core logic
-- [ ] Integration test if touching external services
-- [ ] Structured logging added
-- [ ] Metrics emitted (where applicable)
-- [ ] No hardcoded configuration
-- [ ] Code reviewed against this AGENTS.md
-- [ ] Bead closed with reason
+When porting logic:
+1. Extract the LOGIC, not the structure
+2. Remove dashboard/metrics coupling
+3. Add type hints and async
+4. Add tenacity retries for external calls
 
 ## Boundaries
 
@@ -448,82 +651,23 @@ A Mercury task is complete when:
 - Add retries for external calls
 - Emit metrics for observability
 - Write tests alongside code
-- Follow the phase order
+- Use structured logging
 
 ### Ask First
-- Changing the event schema
+- Changing event schemas
 - Adding new dependencies
 - Modifying core/ components
-- Deviating from the plan
+- Cross-service refactoring
 
 ### Never Do
 - Direct coupling between services
 - Synchronous blocking calls in hot path
 - Hardcoded configuration values
-- Skipping tests
-- Porting polyjuiced patterns (only logic)
-- Working on blocked tasks
-
-## Coordination for Parallel Work
-
-**Current recommendation: Sequential execution within phases**
-
-If multiple agents must work in parallel:
-
-1. **Claim tasks explicitly** - Update bead status before starting
-2. **File ownership** - Each task owns specific files (see task descriptions)
-3. **Commit frequently** - Small commits reduce merge conflicts
-4. **Pull before push** - Always pull latest before committing
-
-### File Ownership by Phase
-
-| Phase | Primary Files |
-|-------|---------------|
-| 1 | `core/*`, `domain/*`, `pyproject.toml` |
-| 2 | `integrations/*` |
-| 3 | `services/market_data.py` |
-| 4 | `services/state_store.py` |
-| 5 | `services/execution.py` |
-| 6 | `services/strategy_engine.py`, `strategies/*` |
-| 7 | `services/risk_manager.py` |
-| 8 | `services/settlement.py` |
-| 9 | `docker/*`, `docs/*`, tests |
+- Skip writing tests
+- Pull Docker images directly from Docker Hub (use Harbor)
 
 ## Reference Documents
 
-- [Clean-Slate Rebuild Plan](agents/plans/clean-slate-rebuild-plan.md) - Full architecture
-- [Legacy Code](legacy/) - Reference for porting logic
-- [Beads Reference](../beads-viewer/agents/reference/beads.md) - Task tracking
-
-## Quick Reference
-
-```bash
-# ============================================
-# BEADS COMMANDS (run from home-server)
-# Beads source of truth: ../home-server/.beads/
-# ============================================
-cd ../home-server
-
-bd ready --label mercury              # Find unblocked task
-bd show <id>                          # View task details
-bd update <id> --status in_progress   # Claim task
-bd close <id> --reason "Done"         # Complete task
-
-# ============================================
-# IMPLEMENTATION WORK (run from polyjuiced)
-# Code lives here: ./mercury/
-# ============================================
-cd ../polyjuiced
-
-# During work
-cd mercury
-pytest tests/ -v                   # Run tests
-python -m mercury health           # Check if it runs
-
-# Commit work (from polyjuiced root)
-cd ..  # back to polyjuiced root
-git add . && git commit -m "mercury: <description>"
-git push
-```
-
-**Remember:** Beads tracks tasks across ALL projects from `../home-server`. The code for Mercury lives here in `polyjuiced/mercury/`.
+- [Clean-Slate Rebuild Plan](agents/plans/clean-slate-rebuild-plan.md)
+- [Beads Task Tracking](../home-server/AGENTS.md)
+- [Homelab Deployment Patterns](../home-server/agents/reference/)
