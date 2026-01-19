@@ -1404,6 +1404,163 @@ class TestSettlementMetricsEmission:
         mock_metrics_emitter.record_settlement_claimed.assert_called_once()
 
 
+class TestQueueMetricsUpdate:
+    """Test queue metrics update functionality."""
+
+    @pytest.fixture
+    def mock_metrics_emitter(self):
+        """Create mock MetricsEmitter."""
+        metrics = MagicMock()
+        metrics.record_settlement_claimed = MagicMock()
+        metrics.record_settlement_failed = MagicMock()
+        metrics.update_settlement_queue_size = MagicMock()
+        metrics.update_settlement_queue_depth = MagicMock()
+        metrics.record_settlement_latency = MagicMock()
+        return metrics
+
+    @pytest.fixture
+    def settlement_manager_with_metrics(
+        self, settlement_config, mock_event_bus, mock_state_store, mock_gamma_client, mock_metrics_emitter
+    ):
+        """Create SettlementManager with metrics emitter."""
+        return SettlementManager(
+            config=settlement_config,
+            event_bus=mock_event_bus,
+            state_store=mock_state_store,
+            gamma_client=mock_gamma_client,
+            metrics_emitter=mock_metrics_emitter,
+        )
+
+    @pytest.mark.asyncio
+    async def test_update_queue_metrics_updates_depth(
+        self,
+        settlement_manager_with_metrics,
+        mock_state_store,
+        mock_metrics_emitter,
+    ):
+        """Should update queue depth metric with unclaimed count."""
+        mock_state_store.get_settlement_stats.return_value = {
+            "total_positions": 20,
+            "unclaimed": 15,
+            "claimed_count": 5,
+            "failed_count": 2,
+        }
+
+        await settlement_manager_with_metrics._update_queue_metrics()
+
+        mock_metrics_emitter.update_settlement_queue_depth.assert_called_once_with(15)
+
+    @pytest.mark.asyncio
+    async def test_update_queue_metrics_updates_size(
+        self,
+        settlement_manager_with_metrics,
+        mock_state_store,
+        mock_metrics_emitter,
+    ):
+        """Should update queue size metrics with status breakdown."""
+        mock_state_store.get_settlement_stats.return_value = {
+            "total_positions": 20,
+            "unclaimed": 15,
+            "claimed_count": 5,
+            "failed_count": 2,
+        }
+
+        await settlement_manager_with_metrics._update_queue_metrics()
+
+        mock_metrics_emitter.update_settlement_queue_size.assert_called_once_with(
+            pending=15,
+            claimed=5,
+            failed=2,
+        )
+
+    @pytest.mark.asyncio
+    async def test_update_queue_metrics_handles_missing_failed_count(
+        self,
+        settlement_manager_with_metrics,
+        mock_state_store,
+        mock_metrics_emitter,
+    ):
+        """Should default failed count to 0 if not in stats."""
+        mock_state_store.get_settlement_stats.return_value = {
+            "total_positions": 20,
+            "unclaimed": 15,
+            "claimed_count": 5,
+            # failed_count intentionally missing
+        }
+
+        await settlement_manager_with_metrics._update_queue_metrics()
+
+        mock_metrics_emitter.update_settlement_queue_size.assert_called_once_with(
+            pending=15,
+            claimed=5,
+            failed=0,
+        )
+
+    @pytest.mark.asyncio
+    async def test_update_queue_metrics_handles_empty_stats(
+        self,
+        settlement_manager_with_metrics,
+        mock_state_store,
+        mock_metrics_emitter,
+    ):
+        """Should not update metrics if stats are empty."""
+        mock_state_store.get_settlement_stats.return_value = {}
+
+        await settlement_manager_with_metrics._update_queue_metrics()
+
+        mock_metrics_emitter.update_settlement_queue_depth.assert_not_called()
+        mock_metrics_emitter.update_settlement_queue_size.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_update_queue_metrics_handles_exception(
+        self,
+        settlement_manager_with_metrics,
+        mock_state_store,
+        mock_metrics_emitter,
+    ):
+        """Should handle exceptions gracefully."""
+        mock_state_store.get_settlement_stats.side_effect = Exception("DB error")
+
+        # Should not raise
+        await settlement_manager_with_metrics._update_queue_metrics()
+
+        mock_metrics_emitter.update_settlement_queue_depth.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_update_queue_metrics_skipped_without_metrics_emitter(
+        self,
+        settlement_manager,  # Manager without metrics emitter
+        mock_state_store,
+    ):
+        """Should skip updates if no metrics emitter configured."""
+        # Should not raise or call state_store.get_settlement_stats
+        await settlement_manager._update_queue_metrics()
+
+        # The stats should still be fetched if state_store exists but metrics is None
+        # Actually, the method returns early if metrics is None
+        mock_state_store.get_settlement_stats.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_check_settlements_updates_queue_metrics(
+        self,
+        settlement_manager_with_metrics,
+        mock_state_store,
+        mock_metrics_emitter,
+    ):
+        """check_settlements should update queue metrics."""
+        mock_state_store.get_claimable_positions.return_value = []
+        mock_state_store.get_settlement_stats.return_value = {
+            "total_positions": 10,
+            "unclaimed": 8,
+            "claimed_count": 2,
+            "failed_count": 0,
+        }
+
+        await settlement_manager_with_metrics.check_settlements()
+
+        mock_metrics_emitter.update_settlement_queue_depth.assert_called_once_with(8)
+
+
 class TestErrorCategorization:
     """Test error categorization for metrics."""
 

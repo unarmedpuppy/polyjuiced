@@ -297,6 +297,7 @@ class SettlementManager(BaseComponent):
         3. Processes claims for resolved markets
         4. Updates queue state based on results
         5. Does NOT block on single failures - continues processing other claims
+        6. Updates queue depth metrics
 
         Returns:
             Number of claims processed.
@@ -311,6 +312,9 @@ class SettlementManager(BaseComponent):
             max_attempts=self._max_claim_attempts,
             min_time_since_end_seconds=self._resolution_wait,
         )
+
+        # Update queue depth metrics
+        await self._update_queue_metrics()
 
         if not queue:
             return 0
@@ -1002,3 +1006,42 @@ class SettlementManager(BaseComponent):
         count = len(self._resolution_cache)
         self._resolution_cache.clear()
         return count
+
+    async def _update_queue_metrics(self) -> None:
+        """Update queue depth and size metrics.
+
+        Fetches current queue statistics from state store and updates
+        the metrics emitter gauges.
+        """
+        if self._state_store is None or self._metrics is None:
+            return
+
+        try:
+            stats = await self._state_store.get_settlement_stats()
+            if not stats:
+                return
+
+            # Update the simple queue depth metric (total unclaimed)
+            unclaimed = stats.get("unclaimed", 0)
+            self._metrics.update_settlement_queue_depth(unclaimed)
+
+            # Also update the detailed queue size metrics by status
+            pending = stats.get("unclaimed", 0)  # unclaimed = pending
+            claimed = stats.get("claimed_count", 0)
+            # Get failed count from state store if available, default to 0
+            failed = stats.get("failed_count", 0)
+            self._metrics.update_settlement_queue_size(
+                pending=pending,
+                claimed=claimed,
+                failed=failed,
+            )
+
+            self._log.debug(
+                "queue_metrics_updated",
+                queue_depth=unclaimed,
+                pending=pending,
+                claimed=claimed,
+                failed=failed,
+            )
+        except Exception as e:
+            self._log.warning("failed_to_update_queue_metrics", error=str(e))

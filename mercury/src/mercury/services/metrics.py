@@ -192,6 +192,13 @@ class MetricsEmitter:
             registry=self._registry,
         )
 
+        # Simple queue depth gauge (total unclaimed items)
+        self._settlement_queue_depth = Gauge(
+            "mercury_settlement_queue_depth",
+            "Total number of positions pending settlement",
+            registry=self._registry,
+        )
+
         self._settlement_claim_attempts = Histogram(
             "mercury_settlement_claim_attempts",
             "Number of attempts before claim success/permanent failure",
@@ -520,6 +527,17 @@ class MetricsEmitter:
         self._settlement_queue_size.labels(status="pending").set(pending)
         self._settlement_queue_size.labels(status="claimed").set(claimed)
         self._settlement_queue_size.labels(status="failed").set(failed)
+
+    def update_settlement_queue_depth(self, depth: int) -> None:
+        """Update settlement queue depth gauge.
+
+        This is a simple gauge tracking total unclaimed positions
+        pending settlement.
+
+        Args:
+            depth: Total number of positions waiting to be claimed.
+        """
+        self._settlement_queue_depth.set(depth)
 
     def record_settlement_latency(self, latency_seconds: float) -> None:
         """Record settlement latency.

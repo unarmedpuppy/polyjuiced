@@ -310,3 +310,23 @@ class TestSettlementMetrics:
         """Verify settlement latency metric is created at init."""
         output = metrics_emitter.get_metrics()
         assert "mercury_settlement_latency_seconds" in output
+
+    def test_settlement_queue_depth_metric_exists(self, metrics_emitter):
+        """Verify settlement queue depth metric is created at init."""
+        output = metrics_emitter.get_metrics()
+        assert "mercury_settlement_queue_depth" in output
+
+    def test_update_settlement_queue_depth(self, metrics_emitter):
+        """Verify queue depth is updated correctly."""
+        metrics_emitter.update_settlement_queue_depth(15)
+
+        output = metrics_emitter.get_metrics()
+        assert "mercury_settlement_queue_depth 15.0" in output
+
+    def test_update_settlement_queue_depth_zero(self, metrics_emitter):
+        """Verify queue depth can be set to zero."""
+        metrics_emitter.update_settlement_queue_depth(10)
+        metrics_emitter.update_settlement_queue_depth(0)
+
+        output = metrics_emitter.get_metrics()
+        assert "mercury_settlement_queue_depth 0.0" in output
