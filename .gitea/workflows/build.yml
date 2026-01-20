@@ -4,9 +4,6 @@ on:
   push:
     branches: [main, master]
     tags: ['v*']
-    paths:
-      - 'mercury/**'
-      - '.gitea/workflows/build.yml'
   workflow_dispatch:
     inputs:
       deploy:
