@@ -670,4 +670,4 @@ When porting logic:
 
 - [Clean-Slate Rebuild Plan](agents/plans/clean-slate-rebuild-plan.md)
 - [Beads Task Tracking](../home-server/AGENTS.md)
-- [Homelab Deployment Patterns](../home-server/agents/reference/)
+- [Homelab Deployment Patterns](../home-server/.agents/reference/)

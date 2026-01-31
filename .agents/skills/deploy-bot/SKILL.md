@@ -26,13 +26,13 @@ The bot executes real-money arbitrage trades on Polymarket. Deploying broken cod
 
 ```bash
 # From the polyjuiced repo root
-./agents/skills/deploy-bot/deploy.sh
+./.agents/skills/deploy-bot/deploy.sh
 
 # Skip tests only (still checks active trades)
-./agents/skills/deploy-bot/deploy.sh --skip-tests
+./.agents/skills/deploy-bot/deploy.sh --skip-tests
 
 # Force deploy (DANGEROUS - skips ALL safety checks)
-./agents/skills/deploy-bot/deploy.sh --force
+./.agents/skills/deploy-bot/deploy.sh --force
 ```
 
 ## What the Script Does

@@ -6,9 +6,9 @@
 # deploying to prevent bugs and interrupting trades.
 #
 # Usage:
-#   ./agents/skills/deploy-bot/deploy.sh              # Normal deploy
-#   ./agents/skills/deploy-bot/deploy.sh --force      # Skip all safety checks
-#   ./agents/skills/deploy-bot/deploy.sh --skip-tests # Skip tests only
+#   ./.agents/skills/deploy-bot/deploy.sh              # Normal deploy
+#   ./.agents/skills/deploy-bot/deploy.sh --force      # Skip all safety checks
+#   ./.agents/skills/deploy-bot/deploy.sh --skip-tests # Skip tests only
 #
 # Exit codes:
 #   0 - Deployment successful
