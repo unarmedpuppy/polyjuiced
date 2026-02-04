@@ -179,6 +179,53 @@ enabled = true
 - **Prometheus metrics**: `GET :9090/metrics`
 - **Grafana dashboards**: Trading overview, risk, market data, system
 
+## Deployment Next Steps
+
+### Pre-Deployment Checklist
+
+- [ ] **Credentials configured** - Set up `.env` file with Polymarket API keys and private key
+- [ ] **Risk limits tuned** - Review `config/production.toml` risk parameters for your tolerance
+- [ ] **Strategy enabled** - Enable at least one strategy in config (gabagool is available)
+- [ ] **Dry-run validation** - Run locally with `--dry-run` to verify signal generation
+
+### Initial Production Deployment
+
+1. **Create external network** (one-time):
+   ```bash
+   docker network create my-network
+   ```
+
+2. **Deploy stack**:
+   ```bash
+   cd docker
+   docker compose -f docker-compose.prod.yml up -d
+   ```
+
+3. **Verify health**:
+   ```bash
+   curl https://mercury.server.unarmedpuppy.com/health
+   ```
+
+### Enabling Live Trading
+
+Once dry-run validation looks good:
+
+1. Set `MERCURY_DRY_RUN=false` in `.env`
+2. Start with conservative risk limits (low `max_daily_loss_usd`, small `max_position_size_usd`)
+3. Monitor via Grafana dashboards at `https://mercury-grafana.server.unarmedpuppy.com`
+4. Watch logs: `docker compose -f docker-compose.prod.yml logs -f mercury`
+
+### CI/CD Pipeline
+
+Tag a release to trigger automated build and deploy:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+Watchtower handles rolling updates automatically.
+
 ## Documentation
 
 See [`../AGENTS.md`](../AGENTS.md) for complete documentation including:
