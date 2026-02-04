@@ -619,16 +619,14 @@ await self.event_bus.publish(f"signal.{self.name}", signal.to_dict())
 
 ## Task Tracking
 
-All Mercury tasks are tracked centrally in the beads database:
+Mercury tasks are tracked using the built-in Tasks API available in Claude Code:
 
-```bash
-# From home-server directory
-cd ../home-server
+- **TaskCreate** - Create new tasks with subject, description, and activeForm
+- **TaskList** - View all tasks and their status
+- **TaskGet** - Get full details of a specific task
+- **TaskUpdate** - Update task status (pending → in_progress → completed)
 
-bd list --label mercury              # All Mercury tasks
-bd ready --label mercury             # Unblocked tasks
-bd show <task-id>                    # Task details
-```
+Use tasks to track multi-step work, coordinate parallel efforts, and maintain progress visibility.
 
 ## Legacy Code Reference
 
@@ -668,6 +666,5 @@ When porting logic:
 
 ## Reference Documents
 
-- [Clean-Slate Rebuild Plan](agents/plans/clean-slate-rebuild-plan.md)
-- [Beads Task Tracking](../home-server/AGENTS.md)
+- [Clean-Slate Rebuild Plan](.agents/plans/clean-slate-rebuild-plan.md)
 - [Homelab Deployment Patterns](../home-server/.agents/reference/)
